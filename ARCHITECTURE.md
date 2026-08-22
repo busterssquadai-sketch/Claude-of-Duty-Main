@@ -90,6 +90,19 @@ Emit and listen via `ctx.events`. Payloads are plain objects. The canonical set:
 | `player:state` | `{ stance, sprinting, sliding, ads }` | player |
 | `explosion` | `{ position, radius, damage }` | any |
 | `resize` | `{ width, height }` | engine |
+| `raid:start` | `{ mapId, faction, night, seed }` | raid |
+| `raid:end` | `{ kind, summary }` | raid |
+| `raid:extract` | `{ exit, transfer }` | raid |
+| `loot:opened` | `{ point }` | raid |
+| `loot:taken` | `{ itemId, count, fir }` | inventory |
+| `inv:changed` | `{ reason }` | inventory |
+| `health:changed` | `{ part, hp, dead }` | health |
+| `health:effect` | `{ kind, part, on }` | health |
+| `weapon:malfunction` | `{ weapon, kind }` | weapons |
+| `weapon:magcheck` | `{ weapon, rounds, cap }` | weapons |
+| `karma:scav` | `{ delta, reason }` | ai |
+| `quest:progress` | `{ questId, index, value, done }` | meta |
+| `trader:deal` | `{ traderId, kind, sum, currency }` | meta |
 
 If you need an event that is not listed, add a row here in the same commit.
 
