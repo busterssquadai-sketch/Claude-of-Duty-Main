@@ -72,9 +72,14 @@ import { StaticWorld } from './bvh.js';
 import { CharacterController } from './character.js';
 import { RigidBody, RigidBodyWorld } from './rigidbody.js';
 import { Ragdoll, humanoidSpec, specFromSkeleton } from './ragdoll.js';
-import { Ballistics } from './penetration.js';
 import { PhysicsDebugView } from './debug.js';
-import { createPenetrator } from './penetration.js';
+import {
+  PenetrationSolver,
+  Ballistics,
+  AMMO,
+  ammoIndex,
+  createPenetrationSolver,
+} from "./penetration.js";
 import {
   LAYER, MASK, SURFACE, SURFACE_NAMES, SURFACE_PROPS,
   surfaceIndex, surfaceName,
@@ -85,6 +90,9 @@ import {
 
 const HIT_POOL = 64;
 const IMPACT_POOL = 48;
+export const MASK_WORLD = 1;
+export const MASK_ACTOR = 2;
+export const MASK_ALL = 3;
 
 function makePublicHit() {
   return {
@@ -175,7 +183,7 @@ const SKIP_NAME =
   /(sky|skybox|light|helper|gizmo|particle|decal|tracer|muzzle|viewmodel|hud|billboard|sprite|volumetric|godray|impostor)/i;
 
 export class PhysicsSystem {
-  static id = 'physics';
+  static id = "physics";
   static deps = [];
 
   constructor() {
@@ -207,7 +215,7 @@ export class PhysicsSystem {
         point: new THREE.Vector3(),
         normal: new THREE.Vector3(),
         incident: new THREE.Vector3(),
-        surface: 'concrete',
+        surface: "concrete",
         surfaceIndex: 0,
         damage: 0,
         exit: false,
@@ -219,6 +227,19 @@ export class PhysicsSystem {
     }
     this._impactCursor = 0;
     this._impactResult = [];
+
+    this._solver = null;
+    this._losHit = {
+      hit: false,
+      distance: 0,
+      point: new THREE.Vector3(),
+      normal: new THREE.Vector3(),
+      surface: 0,
+      actor: null,
+      partIndex: -1,
+      object: null,
+    };
+    this._losDir = new THREE.Vector3();
 
     this._raw = makeHitRecord();
     this._raw2 = makeHitRecord();
@@ -233,9 +254,17 @@ export class PhysicsSystem {
     this.debug = null;
     this._loggedTris = -1;
     this.stats = {
-      triangles: 0, nodes: 0, objects: 0, buildMs: 0,
-      bodies: 0, awake: 0, ragdolls: 0, characters: 0, colliders: 0,
-      raycasts: 0, stepMs: 0,
+      triangles: 0,
+      nodes: 0,
+      objects: 0,
+      buildMs: 0,
+      bodies: 0,
+      awake: 0,
+      ragdolls: 0,
+      characters: 0,
+      colliders: 0,
+      raycasts: 0,
+      stepMs: 0,
     };
     this._rayCount = 0;
   }
@@ -246,16 +275,16 @@ export class PhysicsSystem {
     this.ballistics.rng = this.rng;
     this.debug = new PhysicsDebugView(ctx.scene);
 
-    this.MASK_WORLD = 1; 
-    this.MASK_ACTOR = 2; 
+    this.MASK_WORLD = 1;
+    this.MASK_ACTOR = 2;
     this.MASK_ALL = 3;
-    this._pen = createPenetrator(ctx, this);
+    this._pen = createPenetrationSolver(this, ctx);
     this.penetrate = this._pen.penetrate;
 
     this._onExplosion = (e) => this.explode(e);
     this._onDeath = (e) => this._handleDeath(e);
-    ctx.events.on('explosion', this._onExplosion);
-    ctx.events.on('actor:death', this._onDeath);
+    ctx.events.on("explosion", this._onExplosion);
+    ctx.events.on("actor:death", this._onDeath);
 
     // The level may not exist yet — `world` builds during its own init and can
     // stream more in later. We rescan until something shows up; any explicit
@@ -265,13 +294,14 @@ export class PhysicsSystem {
     // Dev escape hatch: ?physdebug=1 turns the collision wireframe on from the
     // URL, and ?physdemo=1 also drops a ragdoll and some debris. Neither is
     // reachable in normal play.
-    if (typeof location !== 'undefined') {
+    if (typeof location !== "undefined") {
       const q = new URLSearchParams(location.search);
-      if (q.get('physdebug') === '1') this.setDebugDraw(true, { triangles: true, radius: 30 });
-      if (q.get('physdemo') === '1') {
+      if (q.get("physdebug") === "1")
+        this.setDebugDraw(true, { triangles: true, radius: 30 });
+      if (q.get("physdemo") === "1") {
         this._pendingDemo = true;
         // Shots re-pose the camera after boot; respawn in front of the new view.
-        ctx.events.on('shot:applied', () => {
+        ctx.events.on("shot:applied", () => {
           this.bodies.clear();
           for (const rd of this.ragdolls) rd.dispose();
           this.ragdolls.length = 0;
@@ -279,6 +309,41 @@ export class PhysicsSystem {
         });
       }
     }
+    this._solver = new PenetrationSolver(this, ctx);
+  }
+
+  // === ВОТ СЮДА ВСТАВЛЯЮТСЯ ТРИ МЕТОДА КЛАССА ===
+  penetrate(origin, dir, ammoIdx, shooter) {
+    if (!this._solver) return null;
+    return this._solver.solve(origin, dir, ammoIdx, shooter);
+  }
+
+  lineOfSight(a, b, mask) {
+    const dx = b.x - a.x;
+    const dy = b.y - a.y;
+    const dz = b.z - a.z;
+    const len = Math.sqrt(dx * dx + dy * dy + dz * dz);
+    if (len < 0.001) return true;
+    const inv = 1 / len;
+    this._losDir.set(dx * inv, dy * inv, dz * inv);
+    this._losHit.hit = false;
+    this.raycastInto(
+      a,
+      this._losDir,
+      len - 0.05,
+      this._losHit,
+      mask === undefined ? MASK_WORLD : mask,
+    );
+    return !this._losHit.hit;
+  }
+
+  surfaceOf(mesh) {
+    if (!mesh || !mesh.userData) return 0;
+    if (typeof mesh.userData.surfaceIndex === "number")
+      return mesh.userData.surfaceIndex;
+    if (typeof mesh.userData.surface === "string")
+      return surfaceIndex(mesh.userData.surface);
+    return 0;
   }
 
   /* ================================================================== */
@@ -315,7 +380,8 @@ export class PhysicsSystem {
   }
 
   removeStatic(handle) {
-    if (typeof handle === 'number') return this.staticWorld.removeObject(handle);
+    if (typeof handle === "number")
+      return this.staticWorld.removeObject(handle);
     const id = this.staticWorld.findByMesh(handle);
     return id >= 0 ? this.staticWorld.removeObject(id) : false;
   }
@@ -357,7 +423,12 @@ export class PhysicsSystem {
         if (o.userData?.owProbe) return;
         if (o.name && SKIP_NAME.test(o.name)) return;
         const m = o.material;
-        if (m && !Array.isArray(m) && (m.isSpriteMaterial || m.isPointsMaterial)) return;
+        if (
+          m &&
+          !Array.isArray(m) &&
+          (m.isSpriteMaterial || m.isPointsMaterial)
+        )
+          return;
         const id = this.staticWorld.addMesh(o, undefined, LAYER.STATIC);
         if (id >= 0) {
           this._autoIds.push(id);
@@ -385,10 +456,32 @@ export class PhysicsSystem {
   _addFallbackGround() {
     const S = 300;
     const tris = new Float32Array([
-      -S, 0, -S, -S, 0, S, S, 0, S,
-      -S, 0, -S, S, 0, S, S, 0, -S,
+      -S,
+      0,
+      -S,
+      -S,
+      0,
+      S,
+      S,
+      0,
+      S,
+      -S,
+      0,
+      -S,
+      S,
+      0,
+      S,
+      S,
+      0,
+      -S,
     ]);
-    return this.staticWorld.addTriangles(tris, 2, 'concrete', LAYER.STATIC, 'physics:fallback-ground');
+    return this.staticWorld.addTriangles(
+      tris,
+      2,
+      "concrete",
+      LAYER.STATIC,
+      "physics:fallback-ground",
+    );
   }
 
   /* ================================================================== */
@@ -440,15 +533,26 @@ export class PhysicsSystem {
    * Always returns a Hit record — test `.hit`.
    */
 
-
   raycast(a, b, c, d, e, f, g, h) {
     let ox, oy, oz, dx, dy, dz, maxDist, mask;
-    if (typeof a === 'number') {
-      ox = a; oy = b; oz = c; dx = d; dy = e; dz = f; maxDist = g; mask = h;
+    if (typeof a === "number") {
+      ox = a;
+      oy = b;
+      oz = c;
+      dx = d;
+      dy = e;
+      dz = f;
+      maxDist = g;
+      mask = h;
     } else {
-      ox = a.x; oy = a.y; oz = a.z;
-      dx = b.x; dy = b.y; dz = b.z;
-      maxDist = c; mask = d;
+      ox = a.x;
+      oy = a.y;
+      oz = a.z;
+      dx = b.x;
+      dy = b.y;
+      dz = b.z;
+      maxDist = c;
+      mask = d;
     }
     if (maxDist === undefined) maxDist = 1000;
     if (mask === undefined) mask = MASK.ALL;
@@ -459,7 +563,9 @@ export class PhysicsSystem {
       out.distance = 0;
       return out;
     }
-    dx /= l; dy /= l; dz /= l;
+    dx /= l;
+    dy /= l;
+    dz /= l;
     this._rayCount++;
     let best = maxDist;
 
@@ -487,7 +593,7 @@ export class PhysicsSystem {
       out.point.set(ox + dx * maxDist, oy + dy * maxDist, oz + dz * maxDist);
       out.normal.set(-dx, -dy, -dz);
       out.distance = maxDist;
-      out.surface = 'concrete';
+      out.surface = "concrete";
     }
     if (this.debug?.enabled) {
       this.debug.logRay(ox, oy, oz, out.point.x, out.point.y, out.point.z);
@@ -499,9 +605,37 @@ export class PhysicsSystem {
     for (let i = 0; i < this.colliders.length; i++) {
       const c = this.colliders[i];
       if (!c.enabled || (c.layer & mask) === 0) continue;
-      const t = c.shape === 'box'
-        ? rayObb(ox, oy, oz, dx, dy, dz, c.inverse.elements, c.hx, c.hy, c.hz, best)
-        : rayCapsule(ox, oy, oz, dx, dy, dz, c.ax, c.ay, c.az, c.bx, c.by, c.bz, c.radius, best);
+      const t =
+        c.shape === "box"
+          ? rayObb(
+              ox,
+              oy,
+              oz,
+              dx,
+              dy,
+              dz,
+              c.inverse.elements,
+              c.hx,
+              c.hy,
+              c.hz,
+              best,
+            )
+          : rayCapsule(
+              ox,
+              oy,
+              oz,
+              dx,
+              dy,
+              dz,
+              c.ax,
+              c.ay,
+              c.az,
+              c.bx,
+              c.by,
+              c.bz,
+              c.radius,
+              best,
+            );
       if (t < 0 || t >= best) continue;
       best = t;
       out.hit = true;
@@ -522,7 +656,7 @@ export class PhysicsSystem {
   }
 
   _colliderNormal(c, point, outN, dx, dy, dz) {
-    if (c.shape === 'box') {
+    if (c.shape === "box") {
       _v.copy(point).applyMatrix4(c.inverse);
       const ax = Math.abs(_v.x) / c.hx;
       const ay = Math.abs(_v.y) / c.hy;
@@ -533,10 +667,25 @@ export class PhysicsSystem {
       outN.transformDirection(c.matrix);
     } else {
       closestPtSegSeg(
-        point.x, point.y, point.z, point.x, point.y, point.z,
-        c.ax, c.ay, c.az, c.bx, c.by, c.bz, this._cl
+        point.x,
+        point.y,
+        point.z,
+        point.x,
+        point.y,
+        point.z,
+        c.ax,
+        c.ay,
+        c.az,
+        c.bx,
+        c.by,
+        c.bz,
+        this._cl,
       );
-      outN.set(point.x - this._cl.bx, point.y - this._cl.by, point.z - this._cl.bz);
+      outN.set(
+        point.x - this._cl.bx,
+        point.y - this._cl.by,
+        point.z - this._cl.bz,
+      );
       if (outN.lengthSq() < 1e-12) outN.set(-dx, -dy, -dz);
       else outN.normalize();
     }
@@ -549,14 +698,51 @@ export class PhysicsSystem {
     for (let i = 0; i < list.length; i++) {
       const b = list[i];
       let t;
-      if (b.shape === 'sphere') {
-        t = raySphere(ox, oy, oz, dx, dy, dz, b.position.x, b.position.y, b.position.z, b.radius, best);
+      if (b.shape === "sphere") {
+        t = raySphere(
+          ox,
+          oy,
+          oz,
+          dx,
+          dy,
+          dz,
+          b.position.x,
+          b.position.y,
+          b.position.z,
+          b.radius,
+          best,
+        );
       } else {
         _m4.compose(b.position, b.quaternion, _one);
         _m4i.copy(_m4).invert();
-        t = b.shape === 'capsule'
-          ? rayObb(ox, oy, oz, dx, dy, dz, _m4i.elements, b.radius, b.halfHeight + b.radius, b.radius, best)
-          : rayObb(ox, oy, oz, dx, dy, dz, _m4i.elements, b.hx, b.hy, b.hz, best);
+        t =
+          b.shape === "capsule"
+            ? rayObb(
+                ox,
+                oy,
+                oz,
+                dx,
+                dy,
+                dz,
+                _m4i.elements,
+                b.radius,
+                b.halfHeight + b.radius,
+                b.radius,
+                best,
+              )
+            : rayObb(
+                ox,
+                oy,
+                oz,
+                dx,
+                dy,
+                dz,
+                _m4i.elements,
+                b.hx,
+                b.hy,
+                b.hz,
+                best,
+              );
       }
       if (t < 0 || t >= best) continue;
       best = t;
@@ -566,7 +752,7 @@ export class PhysicsSystem {
       out.normal.set(
         out.point.x - b.position.x,
         out.point.y - b.position.y,
-        out.point.z - b.position.z
+        out.point.z - b.position.z,
       );
       if (out.normal.lengthSq() < 1e-12) out.normal.set(-dx, -dy, -dz);
       else out.normal.normalize();
@@ -584,14 +770,26 @@ export class PhysicsSystem {
     if ((mask & LAYER.RAGDOLL) === 0) return best;
     for (let r = 0; r < this.ragdolls.length; r++) {
       const rd = this.ragdolls[r];
-      if (!segmentHitsAabb(ox, oy, oz, dx, dy, dz, best, rd.aabb, 0.2)) continue;
+      if (!segmentHitsAabb(ox, oy, oz, dx, dy, dz, best, rd.aabb, 0.2))
+        continue;
       for (let i = 0; i < rd.boneCount; i++) {
-        const a = rd.boneHead[i], c = rd.boneTail[i];
+        const a = rd.boneHead[i],
+          c = rd.boneTail[i];
         const t = rayCapsule(
-          ox, oy, oz, dx, dy, dz,
-          rd.px[a], rd.py[a], rd.pz[a],
-          rd.px[c], rd.py[c], rd.pz[c],
-          rd.boneRadius[i], best
+          ox,
+          oy,
+          oz,
+          dx,
+          dy,
+          dz,
+          rd.px[a],
+          rd.py[a],
+          rd.pz[a],
+          rd.px[c],
+          rd.py[c],
+          rd.pz[c],
+          rd.boneRadius[i],
+          best,
         );
         if (t < 0 || t >= best) continue;
         best = t;
@@ -599,13 +797,24 @@ export class PhysicsSystem {
         out.distance = t;
         out.point.set(ox + dx * t, oy + dy * t, oz + dz * t);
         closestPtSegSeg(
-          out.point.x, out.point.y, out.point.z, out.point.x, out.point.y, out.point.z,
-          rd.px[a], rd.py[a], rd.pz[a], rd.px[c], rd.py[c], rd.pz[c], this._cl
+          out.point.x,
+          out.point.y,
+          out.point.z,
+          out.point.x,
+          out.point.y,
+          out.point.z,
+          rd.px[a],
+          rd.py[a],
+          rd.pz[a],
+          rd.px[c],
+          rd.py[c],
+          rd.pz[c],
+          this._cl,
         );
         out.normal.set(
           out.point.x - this._cl.bx,
           out.point.y - this._cl.by,
-          out.point.z - this._cl.bz
+          out.point.z - this._cl.bz,
         );
         if (out.normal.lengthSq() < 1e-12) out.normal.set(-dx, -dy, -dz);
         else out.normal.normalize();
@@ -625,29 +834,56 @@ export class PhysicsSystem {
   /** Cheap occlusion test — statics only, no ordering, no record. */
   raycastAny(a, b, c, d, e, f, g, h) {
     let ox, oy, oz, dx, dy, dz, maxDist, mask;
-    if (typeof a === 'number') {
-      ox = a; oy = b; oz = c; dx = d; dy = e; dz = f; maxDist = g; mask = h;
+    if (typeof a === "number") {
+      ox = a;
+      oy = b;
+      oz = c;
+      dx = d;
+      dy = e;
+      dz = f;
+      maxDist = g;
+      mask = h;
     } else {
-      ox = a.x; oy = a.y; oz = a.z;
-      dx = b.x; dy = b.y; dz = b.z;
-      maxDist = c; mask = d;
+      ox = a.x;
+      oy = a.y;
+      oz = a.z;
+      dx = b.x;
+      dy = b.y;
+      dz = b.z;
+      maxDist = c;
+      mask = d;
     }
     const l = Math.hypot(dx, dy, dz);
     if (l < 1e-9) return false;
     this._rayCount++;
     return this.staticWorld.raycastAny(
-      ox, oy, oz, dx / l, dy / l, dz / l,
-      maxDist ?? 1000, mask ?? MASK.SIGHT
+      ox,
+      oy,
+      oz,
+      dx / l,
+      dy / l,
+      dz / l,
+      maxDist ?? 1000,
+      mask ?? MASK.SIGHT,
     );
   }
 
   /** Быстрая проверка видимости без заполнения out — для ИИ. */
   lineOfSight(from, to, mask = this.MASK_WORLD) {
-    const dx = to.x - from.x, dy = to.y - from.y, dz = to.z - from.z;
+    const dx = to.x - from.x,
+      dy = to.y - from.y,
+      dz = to.z - from.z;
     const d = Math.hypot(dx, dy, dz);
     if (d < 1e-6) return true;
     return !this.staticWorld.raycastAny(
-      from.x, from.y, from.z, dx / d, dy / d, dz / d, d - 1e-3, mask
+      from.x,
+      from.y,
+      from.z,
+      dx / d,
+      dy / d,
+      dz / d,
+      d - 1e-3,
+      mask,
     );
   }
 
@@ -657,15 +893,33 @@ export class PhysicsSystem {
 
   capsuleCast(p0, p1, radius, dir, maxDist = 100, mask = MASK.CHARACTER) {
     const out = this._nextHit();
-    let dx = dir.x, dy = dir.y, dz = dir.z;
+    let dx = dir.x,
+      dy = dir.y,
+      dz = dir.z;
     const l = Math.hypot(dx, dy, dz);
     if (l < 1e-9) return out;
-    dx /= l; dy /= l; dz /= l;
+    dx /= l;
+    dy /= l;
+    dz /= l;
     this._rayCount++;
     const raw = this._raw2;
-    if (this.staticWorld.sweepCapsule(
-      p0.x, p0.y, p0.z, p1.x, p1.y, p1.z, radius, dx, dy, dz, maxDist, mask, raw
-    )) {
+    if (
+      this.staticWorld.sweepCapsule(
+        p0.x,
+        p0.y,
+        p0.z,
+        p1.x,
+        p1.y,
+        p1.z,
+        radius,
+        dx,
+        dy,
+        dz,
+        maxDist,
+        mask,
+        raw,
+      )
+    ) {
       out.hit = true;
       out.distance = raw.t;
       out.fraction = raw.t / maxDist;
@@ -677,7 +931,11 @@ export class PhysicsSystem {
       out.object = this.staticWorld.objects[raw.object]?.mesh ?? null;
     } else {
       out.distance = maxDist;
-      out.point.set(p0.x + dx * maxDist, p0.y + dy * maxDist, p0.z + dz * maxDist);
+      out.point.set(
+        p0.x + dx * maxDist,
+        p0.y + dy * maxDist,
+        p0.z + dz * maxDist,
+      );
       out.normal.set(-dx, -dy, -dz);
     }
     return out;
@@ -686,7 +944,15 @@ export class PhysicsSystem {
   /** Contact count; details live in `physics.staticWorld.contacts`. */
   overlapCapsule(p0, p1, radius, mask = MASK.CHARACTER) {
     return this.staticWorld.overlapCapsule(
-      p0.x, p0.y, p0.z, p1.x, p1.y, p1.z, radius, mask, 0
+      p0.x,
+      p0.y,
+      p0.z,
+      p1.x,
+      p1.y,
+      p1.z,
+      radius,
+      mask,
+      0,
     );
   }
 
@@ -696,7 +962,15 @@ export class PhysicsSystem {
 
   overlapSphere(center, radius, mask = MASK.CHARACTER) {
     return this.staticWorld.overlapCapsule(
-      center.x, center.y, center.z, center.x, center.y, center.z, radius, mask, 0
+      center.x,
+      center.y,
+      center.z,
+      center.x,
+      center.y,
+      center.z,
+      radius,
+      mask,
+      0,
     );
   }
 
@@ -756,13 +1030,13 @@ export class PhysicsSystem {
     p.body = hit?.body ?? null;
     p.actor = hit?.actor ?? null;
     p.part = hit?.part ?? null;
-    this.ctx.events.emit('bullet:impact', p);
+    this.ctx.events.emit("bullet:impact", p);
 
     if (p.actor && !exit) {
-      this.ctx.events.emit('damage:dealt', {
+      this.ctx.events.emit("damage:dealt", {
         target: p.actor,
         amount: damage * (hit?.collider?.damageScale ?? 1),
-        headshot: hit?.part === 'head',
+        headshot: hit?.part === "head",
         killed: false,
         point: p.point,
       });
@@ -778,19 +1052,35 @@ export class PhysicsSystem {
     const pos = e.position ?? e;
     const radius = e.radius ?? 5;
     const strength = e.impulse ?? (e.damage ?? 100) * 0.9;
-    this.bodies.applyRadialImpulse(pos.x, pos.y, pos.z, radius, strength * 0.06);
+    this.bodies.applyRadialImpulse(
+      pos.x,
+      pos.y,
+      pos.z,
+      radius,
+      strength * 0.06,
+    );
     for (const rd of this.ragdolls) {
       const cx = (rd.aabb.minx + rd.aabb.maxx) * 0.5;
       const cy = (rd.aabb.miny + rd.aabb.maxy) * 0.5;
       const cz = (rd.aabb.minz + rd.aabb.maxz) * 0.5;
-      const dx = cx - pos.x, dy = cy - pos.y, dz = cz - pos.z;
+      const dx = cx - pos.x,
+        dy = cy - pos.y,
+        dz = cz - pos.z;
       const d = Math.hypot(dx, dy, dz);
       if (d > radius) continue;
       _v.set(cx, cy, cz);
       if (!this.lineOfSight(pos, _v, MASK.EXPLOSION)) continue;
       const f = (1 - d / radius) * strength * 0.5;
       const inv = 1 / (d || 1e-4);
-      rd.applyImpulse(pos.x, pos.y, pos.z, dx * inv * f, dy * inv * f + f * 0.4, dz * inv * f, radius);
+      rd.applyImpulse(
+        pos.x,
+        pos.y,
+        pos.z,
+        dx * inv * f,
+        dy * inv * f + f * 0.4,
+        dz * inv * f,
+        radius,
+      );
     }
   }
 
@@ -812,12 +1102,14 @@ export class PhysicsSystem {
   /** Convenience for fx: a tumbling chunk with sensible defaults. */
   spawnDebris(position, velocity, opts = {}) {
     const s = opts.size ?? 0.08;
-    const si = surfaceIndex(opts.surface ?? 'concrete');
+    const si = surfaceIndex(opts.surface ?? "concrete");
     const b = this.addRigidBody({
-      shape: opts.shape ?? 'box',
+      shape: opts.shape ?? "box",
       halfExtents: { x: s, y: s * 0.7, z: s * 0.85 },
       radius: s,
-      mass: opts.mass ?? Math.max(0.01, s * s * s * 4 * (SURFACE_PROPS[si]?.density ?? 2000)),
+      mass:
+        opts.mass ??
+        Math.max(0.01, s * s * s * 4 * (SURFACE_PROPS[si]?.density ?? 2000)),
       position,
       velocity,
       restitution: opts.restitution ?? SURFACE_PROPS[si].restitution,
@@ -840,13 +1132,21 @@ export class PhysicsSystem {
     while (this.ragdolls.length >= this.maxRagdolls) {
       this.ragdolls.shift()?.dispose();
     }
-    const rd = new Ragdoll(this.staticWorld, { gravity: this.gravity, ...opts });
-    if (opts.velocity) rd.setVelocity(opts.velocity.x, opts.velocity.y, opts.velocity.z);
+    const rd = new Ragdoll(this.staticWorld, {
+      gravity: this.gravity,
+      ...opts,
+    });
+    if (opts.velocity)
+      rd.setVelocity(opts.velocity.x, opts.velocity.y, opts.velocity.z);
     if (opts.impulse && opts.point) {
       rd.applyImpulse(
-        opts.point.x, opts.point.y, opts.point.z,
-        opts.impulse.x, opts.impulse.y, opts.impulse.z,
-        opts.impulseRadius ?? 0.45
+        opts.point.x,
+        opts.point.y,
+        opts.point.z,
+        opts.impulse.x,
+        opts.impulse.y,
+        opts.impulse.z,
+        opts.impulseRadius ?? 0.45,
       );
     }
     this.ragdolls.push(rd);
@@ -878,7 +1178,9 @@ export class PhysicsSystem {
     if (this.ignoreDeathEvents || !e) return;
     const actor = e.actor;
     if (!actor || actor.__ragdoll) return;
-    const skinned = actor.isSkinnedMesh ? actor : (actor.skinnedMesh ?? actor.mesh ?? null);
+    const skinned = actor.isSkinnedMesh
+      ? actor
+      : (actor.skinnedMesh ?? actor.mesh ?? null);
     const skeleton = actor.skeleton ?? skinned?.skeleton ?? null;
     if (!skeleton || actor.ragdoll === false) return;
     const rd = this.createRagdollFromSkeleton(skinned ?? { skeleton }, {
@@ -888,7 +1190,15 @@ export class PhysicsSystem {
     if (rd) {
       actor.__ragdoll = rd;
       if (e.impulse && e.point) {
-        rd.applyImpulse(e.point.x, e.point.y, e.point.z, e.impulse.x, e.impulse.y, e.impulse.z, 0.4);
+        rd.applyImpulse(
+          e.point.x,
+          e.point.y,
+          e.point.z,
+          e.impulse.x,
+          e.impulse.y,
+          e.impulse.z,
+          0.4,
+        );
       }
     }
   }
@@ -983,14 +1293,15 @@ export class PhysicsSystem {
     // log, whether their geometry actually reached the collision world.
     if (this.stats.triangles !== this._loggedTris) {
       this._loggedTris = this.stats.triangles;
-      const src = this._explicitStatics > 0
-        ? `${this._explicitStatics} registered`
-        : this._autoIds.length
-          ? `${this._autoIds.length} auto-scanned`
-          : 'fallback ground';
+      const src =
+        this._explicitStatics > 0
+          ? `${this._explicitStatics} registered`
+          : this._autoIds.length
+            ? `${this._autoIds.length} auto-scanned`
+            : "fallback ground";
       console.info(
         `[physics] ${this.stats.triangles} tris / ${this.stats.nodes} nodes · ` +
-        `${this.staticWorld.buildMs.toFixed(1)}ms · ${src}`
+          `${this.staticWorld.buildMs.toFixed(1)}ms · ${src}`,
       );
     }
   }
@@ -1020,10 +1331,12 @@ export class PhysicsSystem {
 
   /** Named states for dev overlays / the capture harness. */
   debugState(name) {
-    if (name === 'collision') this.setDebugDraw(true, { triangles: true, nodes: false });
-    else if (name === 'bvh') this.setDebugDraw(true, { triangles: false, nodes: true });
-    else if (name === 'demo') this._spawnDemo();
-    else if (name === 'off') this.setDebugDraw(false);
+    if (name === "collision")
+      this.setDebugDraw(true, { triangles: true, nodes: false });
+    else if (name === "bvh")
+      this.setDebugDraw(true, { triangles: false, nodes: true });
+    else if (name === "demo") this._spawnDemo();
+    else if (name === "off") this.setDebugDraw(false);
     return this.stats;
   }
 
@@ -1043,9 +1356,17 @@ export class PhysicsSystem {
     const r = this.rng;
     for (let i = 0; i < 14; i++) {
       this.spawnDebris(
-        { x: cx + r.signed() * 1.6, y: base + 1.2 + i * 0.22, z: cz + r.signed() * 1.6 },
+        {
+          x: cx + r.signed() * 1.6,
+          y: base + 1.2 + i * 0.22,
+          z: cz + r.signed() * 1.6,
+        },
         { x: r.signed() * 2, y: 0, z: r.signed() * 2 },
-        { size: 0.09 + r.float() * 0.06, surface: r.pick(['concrete', 'wood', 'metal']), lifetime: 1e9 }
+        {
+          size: 0.09 + r.float() * 0.06,
+          surface: r.pick(["concrete", "wood", "metal"]),
+          lifetime: 1e9,
+        },
       );
     }
     const m = _m4.makeTranslation(cx + 1.5, base + 1.15, cz);
@@ -1055,8 +1376,8 @@ export class PhysicsSystem {
   }
 
   dispose() {
-    this.ctx?.events.off('explosion', this._onExplosion);
-    this.ctx?.events.off('actor:death', this._onDeath);
+    this.ctx?.events.off("explosion", this._onExplosion);
+    this.ctx?.events.off("actor:death", this._onDeath);
     this.debug?.dispose();
     this.debug = null;
     this.bodies.clear();
