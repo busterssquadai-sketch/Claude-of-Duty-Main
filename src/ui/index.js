@@ -5,6 +5,7 @@ import { Crosshair } from './crosshair.js';
 import { Hitmarkers } from './hitmarkers.js';
 import { DamageArcs } from './damage.js';
 import { HealthFx } from './health.js';
+import { HealthHud } from './healthHud.js';
 import { AmmoPanel } from './ammo.js';
 import { Killfeed } from './killfeed.js';
 import { Compass, MatchBar } from './compass.js';
@@ -79,11 +80,13 @@ export class UiSystem {
     this.chromeLayer = el('div', 'ow-layer', this.root);
 
     this.health = new HealthFx(this.hurtLayer, this.chromeLayer);
+    this.healthHud = new HealthHud(this.chromeLayer, ctx);
     this.markers = new WorldMarkers(this.worldLayer, this.rng.fork());
     this.arcs = new DamageArcs(this.centreLayer);
     this.crosshair = new Crosshair(this.centreLayer);
     this.hit = new Hitmarkers(this.centreLayer);
     this.minimap = new Minimap(this.chromeLayer, this.rng.fork());
+    setStyle(this.minimap.root, 'display', 'none');
     this.compass = new Compass(this.chromeLayer);
     this.matchBar = new MatchBar(this.chromeLayer);
     this.killfeed = new Killfeed(this.chromeLayer);
@@ -507,6 +510,7 @@ export class UiSystem {
     this.hit.update(dt);
     this.arcs.update(dt, rx, rz, fx, fz);
     this.health.update(dt, s);
+    this.healthHud.update(dt, ctx);
     this.ammo.update(dt, s);
     this.killfeed.update(dt);
     this.matchBar.update(s);
@@ -520,29 +524,7 @@ export class UiSystem {
     this.markers.updateGrenades(dt, ctx.camera, this.vw, this.vh, this.k);
     this.markers.updateDamage(dt, ctx.camera, this.vw, this.vh, this.k);
 
-    // ---- minimap ---------------------------------------------------------
-    if (!this.minimap.bakeDone && ++this._bakeFrame > 6 && this._bakeFrame % 20 === 0) {
-      this.minimap.tryBake(ctx);
-    }
-    this._blipView.length = this._blipCount;
-    for (let i = 0; i < this._blipCount; i++) this._blipView[i] = this._blips[i];
-    this._mmState = this._mmState ?? { x: 0, z: 0, heading: 0, fov: 80, blips: null, objectives: null };
-    this._mmState.x = pos.x;
-    this._mmState.z = pos.z;
-    this._mmState.heading = heading;
-    this._mmState.fov = ctx.camera.fov;
-    this._mmState.blips = this._blipView;
-    this._mmState.objectives = this._mmObjs ?? (this._mmObjs = []);
-    this._mmObjs.length = 0;
-    for (const o of this._objectives) {
-      if (!o.position) continue;
-      this._mmObjs.push(o._mm ?? (o._mm = { x: 0, z: 0, label: o.label }));
-      const last = this._mmObjs[this._mmObjs.length - 1];
-      last.x = o.position.x;
-      last.z = o.position.z;
-      last.label = o.label;
-    }
-    this.minimap.draw(this._mmState);
+    // ---- minimap intentionally hidden for Tarkov-style top-left HUD ----
   }
 
   _collectBlips() {
@@ -598,6 +580,7 @@ export class UiSystem {
     this.hit.dispose();
     this.arcs.dispose();
     this.health.dispose();
+    this.healthHud.dispose();
     this.ammo.dispose();
     this.killfeed.dispose();
     this.compass.dispose();

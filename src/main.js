@@ -20,6 +20,7 @@ import { HealthSystem } from './health/index.js';
 import { MetaSystem } from './meta/index.js';
 import { RaidSystem } from './raid/index.js';
 import { NetSystem } from './net/index.js';
+import { applyTarkovBootstrap } from './core/tarkovBootstrap.js';
 
 import { installShotApi } from './dev/shots.js';
 import { prewarm } from './core/prewarm.js';
@@ -27,6 +28,8 @@ import { prewarm } from './core/prewarm.js';
 const params = new URLSearchParams(location.search);
 const capture = params.get('capture') === '1';
 const lockstep = capture && params.get('lockstep') === '1';
+
+applyTarkovBootstrap();
 
 const config = createConfig({
   quality: params.get('q') ?? 'high',   // EFL: интерьеры дешевле улицы, high — рабочий дефолт

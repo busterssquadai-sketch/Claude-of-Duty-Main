@@ -1,5 +1,11 @@
 import * as THREE from "three";
 import { ammoIndex, ammoForCaliber, AMMO } from "../physics/penetration.js";
+import { WeaponMaterials } from "./materials.js";
+import { Viewmodel } from "./viewmodel.js";
+import { WEAPON_DEFS } from "./defs.js";
+import { buildRifle } from "./models/rifle.js";
+import { buildSmg } from "./models/smg.js";
+import { buildPistol } from "./models/pistol.js";
 
 /*
  * Escape from Larpov - weapon subsystem.
@@ -250,6 +256,26 @@ export const WEAPONS = {
 
 export const WEAPON_IDS = Object.keys(WEAPONS);
 
+const VIEWMODEL_KIND = {
+  ak74m: "rifle",
+  aks74u: "rifle",
+  ak101: "rifle",
+  m4a1: "rifle",
+  saiga12: "rifle",
+  mp133: "rifle",
+  sv98: "rifle",
+  svd: "rifle",
+  mp5: "smg",
+  pp19: "smg",
+  pm: "pistol",
+  glock17: "pistol",
+};
+
+const WEAPON_ALIAS = {
+  ak74n: "ak74m",
+  glock: "glock17",
+};
+
 /* Патрон по умолчанию для каждого калибра берётся из penetration.js. */
 
 const JAM_BASE = 0.0016;
@@ -330,7 +356,7 @@ export class WeaponInstance {
 
 export class WeaponSystem {
   static id = "weapons";
-  static deps = [];
+  static deps = ["inventory", "materials", "render"];
 
   constructor() {
     this.ctx = null;
@@ -387,16 +413,20 @@ export class WeaponSystem {
     this._jamEvent = { weapon: null, kind: "jam", position: this._origin };
 
     this._handlers = null;
+    this.viewmodel = null;
+    this._weaponStateEvent = null;
   }
 
   init(ctx) {
     this.ctx = ctx;
     this.rng = makeRng(ctx, "weapons");
-    this.setWeapon("primary", "ak74m", null);
+    this._initViewmodel(ctx);
+    this.setWeapon("primary", "m4a1", null);
     this.setWeapon("holster", "pm", null);
     this.equip("primary");
-    this.reserve["545_bp"] = 120;
+    this.reserve["556m855"] = 120;
     this.reserve["9x18_pst"] = 48;
+    this.reserve["545_bp"] = 90;
 
     const ev = ctx && ctx.events;
     if (ev && typeof ev.on === "function") {
@@ -411,6 +441,7 @@ export class WeaponSystem {
             self.recoilPitch = 0;
             self.recoilYaw = 0;
             self.bloom = 0;
+            self._emitState();
           },
         ],
         [
@@ -418,12 +449,109 @@ export class WeaponSystem {
           function onEnd() {
             self.enabled = false;
             self.triggerDown = false;
+            self._emitState();
+          },
+        ],
+        [
+          "inv:changed",
+          function onInventory() {
+            self._syncFromInventory();
           },
         ],
       ];
       for (let i = 0; i < this._handlers.length; i++)
         ev.on(this._handlers[i][0], this._handlers[i][1]);
     }
+    this._syncFromInventory();
+    this._emitState();
+  }
+
+  _normalizeWeaponId(id) {
+    return WEAPON_ALIAS[id] || id;
+  }
+
+  _viewmodelKindFor(id) {
+    return VIEWMODEL_KIND[this._normalizeWeaponId(id)] || "rifle";
+  }
+
+  _initViewmodel(ctx) {
+    if (!ctx?.viewScene || !ctx?.peek?.("materials")) return;
+    const mats = new WeaponMaterials(ctx);
+    const vm = new Viewmodel(ctx, mats);
+    vm.trackCamera = true;
+    vm.addWeapon(buildRifle(), WEAPON_DEFS.rifle);
+    vm.addWeapon(buildSmg(), WEAPON_DEFS.smg);
+    vm.addWeapon(buildPistol(), WEAPON_DEFS.pistol);
+    this.viewmodel = vm;
+  }
+
+  _syncFromInventory() {
+    const inv = this.ctx?.peek?.("inventory");
+    if (!inv || typeof inv.slotItem !== "function") return;
+    for (const slot of ["primary", "secondary", "holster"]) {
+      const item = inv.slotItem(slot);
+      this.setWeapon(slot, item ? item.id : null, null);
+    }
+    if (!this.weapon) {
+      for (const slot of this.slotOrder) {
+        if (this.slots[slot]) {
+          this.equip(slot);
+          break;
+        }
+      }
+    }
+  }
+
+  _emitState() {
+    const o =
+      this._weaponStateEvent ||
+      (this._weaponStateEvent = {
+        empty: true,
+        name: "",
+        inMag: 0,
+        chamber: false,
+        capacity: 0,
+        ammoName: "",
+        modeShort: "",
+        heat: 0,
+        dur: 100,
+        malfunction: false,
+        malfunctionName: "",
+        busy: "",
+        reloading: false,
+      });
+    const w = this.weapon;
+    if (!w) {
+      o.empty = true;
+      o.name = "";
+      o.inMag = 0;
+      o.chamber = false;
+      o.capacity = 0;
+      o.ammoName = "";
+      o.modeShort = "";
+      o.heat = 0;
+      o.dur = 100;
+      o.malfunction = false;
+      o.malfunctionName = "";
+      o.busy = "";
+      o.reloading = false;
+      this._emit("weapon:state", o);
+      return;
+    }
+    o.empty = false;
+    o.name = w.def.name;
+    o.inMag = w.magCount;
+    o.chamber = w.chambered;
+    o.capacity = w.def.mag;
+    o.ammoName = AMMO.id[w.ammoIdx] || w.def.cal;
+    o.modeShort = String(w.mode || "").toUpperCase();
+    o.heat = Math.round((w.heat / MAX_HEAT) * 100);
+    o.dur = Math.round(w.durability * 100);
+    o.malfunction = !!w.jammed;
+    o.malfunctionName = w.jammed ? "JAM" : "";
+    o.busy = this.reloading ? "RELOADING" : "";
+    o.reloading = this.reloading;
+    this._emit("weapon:state", o);
   }
 
   /* --- Снаряжение --- */
@@ -432,11 +560,13 @@ export class WeaponSystem {
     if (weaponId === null) {
       this.slots[slot] = null;
       if (this.slot === slot) this.weapon = null;
+      this._emitState();
       return null;
     }
-    const inst = new WeaponInstance(weaponId, ammoId);
+    const inst = new WeaponInstance(this._normalizeWeaponId(weaponId), ammoId);
     this.slots[slot] = inst;
     if (this.slot === slot) this.weapon = inst;
+    this._emitState();
     return inst;
   }
 
@@ -451,7 +581,11 @@ export class WeaponSystem {
       const t = clamp(1.1 - inst.def.ergo * 0.008, 0.32, 1.1);
       this.swapEndsAt = this.time + t;
       this.nextShotAt = this.swapEndsAt;
+      const vmId = this._viewmodelKindFor(inst.id);
+      this.viewmodel?.setActive?.(vmId);
+      this.viewmodel?.play?.("draw");
     }
+    this._emitState();
     return true;
   }
 
@@ -470,6 +604,7 @@ export class WeaponSystem {
     w.modeIndex = (w.modeIndex + 1) % w.def.modes.length;
     w.mode = w.def.modes[w.modeIndex];
     w.burstLeft = 0;
+    this._emitState();
     return w.mode;
   }
 
@@ -556,6 +691,10 @@ export class WeaponSystem {
     const move = 1 + this.moving * 1.4;
     const stance = this.stance === 0 ? 0.55 : this.stance === 2 ? 0.78 : 1;
     return (base + this.bloom) * move * stance;
+  }
+
+  getHudState(out) {
+    return this.hudState(out);
   }
 
   /*
@@ -752,6 +891,7 @@ export class WeaponSystem {
     fe.cal = def.cal;
     fe.mode = w.mode;
     this._emit("weapon:fire", fe);
+    this.viewmodel?.addRecoil?.(def.rv * DEG * 0.1, this.recoilYaw * DEG * 0.1, this.shotsFired <= 1);
 
     this._shellPos.set(
       this._origin.x + rx * 0.28,
@@ -760,6 +900,7 @@ export class WeaponSystem {
     );
     this._shellEvent.cal = def.cal;
     this._emit("weapon:shell", this._shellEvent);
+    this._emitState();
   }
 
   /* --- Перезарядка и обслуживание --- */
@@ -781,6 +922,9 @@ export class WeaponSystem {
     this._reloadEvent.phase = "start";
     this._reloadEvent.duration = dur;
     this._emit("weapon:reload", this._reloadEvent);
+    this._emit("weapon:reload:start", this._reloadEvent);
+    this.viewmodel?.play?.(w.ammoLeft <= 1 ? "reloadEmpty" : "reloadTac");
+    this._emitState();
     return true;
   }
 
@@ -801,6 +945,8 @@ export class WeaponSystem {
     this._reloadEvent.phase = "end";
     this._reloadEvent.duration = 0;
     this._emit("weapon:reload", this._reloadEvent);
+    this._emit("weapon:reload:end", this._reloadEvent);
+    this._emitState();
   }
 
   checkMag() {
@@ -809,6 +955,7 @@ export class WeaponSystem {
     this._magEvent.weapon = w.id;
     this._magEvent.left = w.ammoLeft;
     this._emit("weapon:magcheck", this._magEvent);
+    this._emitState();
     return w.ammoLeft;
   }
 
@@ -822,7 +969,28 @@ export class WeaponSystem {
     this._reloadEvent.phase = "clear";
     this._reloadEvent.duration = w.def.chamber;
     this._emit("weapon:reload", this._reloadEvent);
+    this._emit("weapon:reload:clear", this._reloadEvent);
+    this._emitState();
     return true;
+  }
+
+  inspect() {
+    this.viewmodel?.play?.("inspect");
+    return true;
+  }
+
+  equipSlot(slot) {
+    return this.equip(slot);
+  }
+
+  nextSlot(dir = 1) {
+    if (dir > 0) return this.equipNext();
+    const i = this.slotOrder.indexOf(this.slot);
+    for (let k = 1; k <= this.slotOrder.length; k++) {
+      const s = this.slotOrder[(i - k + this.slotOrder.length * 2) % this.slotOrder.length];
+      if (this.slots[s]) return this.equip(s);
+    }
+    return false;
   }
 
   /* Игрок забирает накопленную отдачу раз в кадр и обнуляет её. */
@@ -852,12 +1020,26 @@ export class WeaponSystem {
 
     if (this.reloading && this.time >= this.reloadEndsAt) this._finishReload();
 
+    if (this.viewmodel && this.weapon) {
+      this.viewmodel.update(dt, {
+        ads: this.ads,
+        sprint: this.moving > 0.7 && !this.ads,
+        lowReady: false,
+        speed: this.moving * 6,
+        crouch: this.stance === 0,
+        airborne: false,
+        trigger: this.triggerDown,
+        empty: this.weapon.ammoLeft <= 0,
+      });
+    }
+
     if (!this.enabled || !w || this.reloading) return;
     if (w.burstLeft > 0) {
       this.tryFire();
       return;
     }
     if (this.triggerDown) this.tryFire();
+    this._emitState();
   }
 
   /* Снимок для HUD. Объект переиспользуется, в кадре не аллоцирует. */
@@ -868,36 +1050,60 @@ export class WeaponSystem {
       (this._hud = {
         name: "",
         mode: "",
+        weapon: "",
         mag: 0,
+        ammo: 0,
+        magSize: 0,
         chambered: false,
         reserve: 0,
         jammed: false,
         reloading: false,
+        reloadProgress: 0,
         heat: 0,
         cal: null,
+        ads: false,
+        spread: 0,
+        lethalCount: 0,
+        tacticalCount: 0,
       });
     const w = this.weapon;
     if (!w) {
       o.name = "";
       o.mode = "";
+      o.weapon = "";
       o.mag = 0;
+      o.ammo = 0;
+      o.magSize = 0;
       o.chambered = false;
       o.reserve = 0;
       o.jammed = false;
       o.reloading = false;
+      o.reloadProgress = 0;
       o.heat = 0;
       o.cal = null;
+      o.ads = this.ads;
+      o.spread = 0;
+      o.lethalCount = 0;
+      o.tacticalCount = 0;
       return o;
     }
     o.name = w.def.name;
     o.mode = w.mode;
+    o.weapon = w.id;
     o.mag = w.magCount;
+    o.ammo = w.ammoLeft;
+    o.magSize = w.def.mag;
     o.chambered = w.chambered;
     o.reserve = this._reserveFor(w.ammoIdx);
     o.jammed = w.jammed;
     o.reloading = this.reloading;
+    o.reloadProgress = this.reloading ? 1 - Math.max(0, (this.reloadEndsAt - this.time) / Math.max(0.001, this._reloadEvent.duration || 1)) : 0;
     o.heat = w.heat / MAX_HEAT;
     o.cal = w.def.cal;
+    o.ads = this.ads;
+    o.spread = this._spreadDeg(w);
+    o.lethalCount = 0;
+    o.tacticalCount = 0;
     return o;
   }
 
@@ -913,6 +1119,8 @@ export class WeaponSystem {
     this.slots.holster = null;
     this.weapon = null;
     this._phys = null;
+    this.viewmodel?.dispose?.();
+    this.viewmodel = null;
     this.ctx = null;
   }
 }
