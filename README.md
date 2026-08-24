@@ -1,4 +1,4 @@
-# Escape From Larpov
+# Claude of Duty
 
 Get updates [here](https://shumer.dev/newsletter).
 

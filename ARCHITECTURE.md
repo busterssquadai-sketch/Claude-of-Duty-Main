@@ -66,13 +66,6 @@ export class MySystem {
 | `ai` | `src/ai/` | enemy characters, navigation, perception, cover selection, combat behaviour |
 | `ui` | `src/ui/` | HUD, crosshair, hitmarkers, damage indicators, ammo, killfeed, menus |
 | `audio` | `src/audio/` | synthesized weapon/foley audio, spatialisation, reverb, occlusion, mix |
-| `items` | `src/items/` | base item classes, weapon parts, modding system, base stats, data tables, master database |
-| `inventory` | `src/inventory/` | grid-based inventory, stash, equipment slots, weight calculation, drag & drop, move/rotate logic |
-| `health` | `src/health/` | medical damage model, limb health states, bleeding, fractures, pain effects, medkit application |
-| `raid` | `src/raid/` | raid instances, instance lifecycle, extraction zones, countdown timers, loot spawns, dynamic loading |
-| `meta` | `src/meta/` | persistent profile, traders, economy, quest progression, hideout upgrades, level rewards |
-| `net` | `src/net/` | client-server replication, state synchronization, input prediction, lag compensation, server browser |
-
 
 Shared, owned by the lead (do not edit): `src/core/`, `src/main.js`,
 `src/dev/`, `tools/`, `vite.config.js`.
@@ -97,19 +90,6 @@ Emit and listen via `ctx.events`. Payloads are plain objects. The canonical set:
 | `player:state` | `{ stance, sprinting, sliding, ads }` | player |
 | `explosion` | `{ position, radius, damage }` | any |
 | `resize` | `{ width, height }` | engine |
-| `raid:start` | `{ mapId, faction, night, seed }` | raid |
-| `raid:end` | `{ kind, summary }` | raid |
-| `raid:extract` | `{ exit, transfer }` | raid |
-| `loot:opened` | `{ point }` | raid |
-| `loot:taken` | `{ itemId, count, fir }` | inventory |
-| `inv:changed` | `{ reason }` | inventory |
-| `health:changed` | `{ part, hp, dead }` | health |
-| `health:effect` | `{ kind, part, on }` | health |
-| `weapon:malfunction` | `{ weapon, kind }` | weapons |
-| `weapon:magcheck` | `{ weapon, rounds, cap }` | weapons |
-| `karma:scav` | `{ delta, reason }` | ai |
-| `quest:progress` | `{ questId, index, value, done }` | meta |
-| `trader:deal` | `{ traderId, kind, sum, currency }` | meta |
 
 If you need an event that is not listed, add a row here in the same commit.
 
