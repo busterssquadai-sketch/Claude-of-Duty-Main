@@ -1,6 +1,6 @@
 import * as THREE from 'three';
 import { installStyles, removeStyles } from './style.js';
-import { el, clamp, clamp01, damp, setStyle } from './util.js';
+import { el, clamp, clamp01, damp, mmss, shortNum, setStyle, setText } from './util.js';
 import { Crosshair } from './crosshair.js';
 import { Hitmarkers } from './hitmarkers.js';
 import { DamageArcs } from './damage.js';
@@ -16,6 +16,77 @@ import { PauseMenu } from './menu.js';
 import { CombatDemo } from './demo.js';
 
 const MAX_BLIPS = 48;
+
+class RaidResultsPanel {
+  constructor(parent, ctx) {
+    this.ctx = ctx;
+    this.open = false;
+    this.t = 0;
+    this.summary = {};
+
+    this.root = el('div', 'ow-results', parent);
+    this.card = el('div', 'ow-results-card', this.root);
+    const head = el('div', 'ow-results-head', this.card);
+    this.status = el('div', 'ow-results-status', head, 'RESULTS');
+    this.kind = el('div', 'ow-results-kind', head, '');
+    this.title = el('div', 'ow-results-title', this.card, 'RAID SUMMARY');
+    this.sub = el('div', 'ow-results-sub', this.card, '');
+    this.grid = el('div', 'ow-results-grid', this.card);
+
+    this.rows = {};
+    for (const key of ['mapId', 'faction', 'night', 'time', 'kills', 'xp', 'value', 'exit']) {
+      const row = el('div', 'ow-results-row', this.grid);
+      el('div', 'ow-results-label', row, key.toUpperCase());
+      this.rows[key] = el('div', 'ow-results-value', row, '');
+    }
+
+    this.actions = el('div', 'ow-results-actions', this.card);
+    this.btn = el('button', 'ow-results-btn', this.actions, 'RETURN TO MENU');
+    this.btn.type = 'button';
+    this.btn.addEventListener('click', () => this.ctx.engine?.returnToMenu?.());
+
+    this.hint = el('div', 'ow-results-hint', this.card, 'ENTER TO CONTINUE');
+    setStyle(this.root, 'display', 'none');
+  }
+
+  show(summary = {}) {
+    this.summary = { ...summary };
+    const kind = String(summary.kind || 'survived').toUpperCase();
+    setText(this.kind, kind);
+    setText(this.sub, `${String(summary.mapId || '').toUpperCase()} · ${String(summary.faction || '').toUpperCase()} · ${summary.night ? 'NIGHT' : 'DAY'}`);
+    setText(this.rows.mapId, String(summary.mapId || '').toUpperCase());
+    setText(this.rows.faction, String(summary.faction || '').toUpperCase());
+    setText(this.rows.night, summary.night ? 'YES' : 'NO');
+    setText(this.rows.time, mmss(summary.time || 0));
+    setText(this.rows.kills, String(summary.kills ?? 0));
+    setText(this.rows.xp, shortNum(summary.xp ?? 0));
+    setText(this.rows.value, shortNum(summary.value ?? 0));
+    setText(this.rows.exit, String(summary.exit || 'NONE').toUpperCase());
+    this.open = true;
+    this.t = 0;
+  }
+
+  hide() {
+    this.open = false;
+  }
+
+  update(dt) {
+    this.t = damp(this.t, this.open ? 1 : 0, 12, dt);
+    const vis = this.t;
+    if (vis < 0.005) {
+      setStyle(this.root, 'display', 'none');
+      return;
+    }
+    setStyle(this.root, 'display', '');
+    setStyle(this.root, 'opacity', vis.toFixed(3));
+    setStyle(this.root, 'pointer-events', this.open ? 'auto' : 'none');
+    setStyle(this.root, 'transform', `translateZ(0) scale(${(0.985 + vis * 0.015).toFixed(4)})`);
+  }
+
+  dispose() {
+    this.root.remove();
+  }
+}
 
 /**
  * ===========================================================================
@@ -94,6 +165,7 @@ export class UiSystem {
     this.prompt = new Prompt(this.chromeLayer);
     this.banner = new Banner(this.chromeLayer);
     this.menu = new PauseMenu(this.root, ctx);
+    this.results = new RaidResultsPanel(this.root, ctx);
 
     this.health.onBeat = (i) => this.sfx('heartbeat', 0.35 + i * 0.5);
 
@@ -371,6 +443,16 @@ export class UiSystem {
     this.menu.close();
   }
 
+  showRaidResults(summary) {
+    this.menu.close();
+    this.setHudVisible(false);
+    this.results.show(summary);
+  }
+
+  hideRaidResults() {
+    this.results.hide();
+  }
+
   /* --------------------------------------------------------------- debug -- */
 
   /**
@@ -516,6 +598,7 @@ export class UiSystem {
     this.matchBar.update(s);
     this.prompt.update(dt);
     this.banner.update(dt);
+    this.results.update(rawDt);
 
     this._buildCompassObjectives(pos);
     this.compass.update(heading, this._compassObjs);
@@ -590,6 +673,7 @@ export class UiSystem {
     this.prompt.dispose();
     this.banner.dispose();
     this.menu.dispose();
+    this.results.dispose();
     this.root.remove();
     removeStyles();
   }

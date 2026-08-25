@@ -137,11 +137,6 @@ export function resolveMaterial(ctx, key, cache) {
 		if (!mat && mats.surfaces && mats.surfaces[key] && mats.surfaces[key].isMaterial) mat = mats.surfaces[key];
 	}
 
-	if (mat && mat.userData && mat.userData.surface && mat.userData.surface !== surf) {
-		mat = mat.clone();
-		mat.userData.owCloned = true;
-	}
-
 	if (!mat) {
 		const p = FALLBACK_PBR[key] || FALLBACK_PBR.concrete;
 		mat = new THREE.MeshStandardMaterial({

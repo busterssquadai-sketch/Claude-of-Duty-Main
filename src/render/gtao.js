@@ -98,8 +98,8 @@ void main() {
       // +dir
       vec2 uv1 = vUv + duv;
       if ( uv1.x > 0.0 && uv1.x < 1.0 && uv1.y > 0.0 && uv1.y < 1.0 ) {
-        float d1 = texture2D( tDepth, uv1 ).r;
-        float cov1 = texture2D( tNormal, uv1 ).z;
+        float d1 = textureLod( tDepth, uv1, 0.0 ).r;
+        float cov1 = textureLod( tNormal, uv1, 0.0 ).z;
         if ( cov1 > 0.5 ) {
           vec3 ds = owViewPos( uv1, d1, uProjInv ) - P;
           float len2 = dot( ds, ds );
@@ -116,8 +116,8 @@ void main() {
       // -dir
       vec2 uv2 = vUv - duv;
       if ( uv2.x > 0.0 && uv2.x < 1.0 && uv2.y > 0.0 && uv2.y < 1.0 ) {
-        float d2 = texture2D( tDepth, uv2 ).r;
-        float cov2 = texture2D( tNormal, uv2 ).z;
+        float d2 = textureLod( tDepth, uv2, 0.0 ).r;
+        float cov2 = textureLod( tNormal, uv2, 0.0 ).z;
         if ( cov2 > 0.5 ) {
           vec3 ds = owViewPos( uv2, d2, uProjInv ) - P;
           float len2 = dot( ds, ds );

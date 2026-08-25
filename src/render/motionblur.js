@@ -24,7 +24,7 @@ void main() {
   for ( int y = 0; y < 8; y ++ ) {
     for ( int x = 0; x < 8; x ++ ) {
       vec2 o = ( vec2( float( x ), float( y ) ) - 3.5 ) * 2.0 * uTexel;
-      vec2 v = texture2D( tVelocity, vUv + o ).rg;
+      vec2 v = textureLod( tVelocity, vUv + o, 0.0 ).rg;
       float l = dot( v, v );
       if ( l > bestLen ) { bestLen = l; best = v; }
     }
@@ -49,9 +49,9 @@ varying vec2 vUv;
 #define OW_MB_TAPS 12
 
 void main() {
-  vec4 centre = texture2D( tColor, vUv );
-  vec2 tileVel = texture2D( tTile, vUv ).rg;
-  vec2 ownVel = texture2D( tVelocity, vUv ).rg;
+  vec4 centre = textureLod( tColor, vUv, 0.0 );
+  vec2 tileVel = textureLod( tTile, vUv, 0.0 ).rg;
+  vec2 ownVel = textureLod( tVelocity, vUv, 0.0 ).rg;
 
   vec2 vel = length( tileVel ) > length( ownVel ) ? tileVel : ownVel;
   vel *= uParams.x;
@@ -62,8 +62,8 @@ void main() {
   float maxPx = uParams.y;
   if ( pixels > maxPx ) vel *= maxPx / pixels;
 
-  float centreDepth = texture2D( tDepth, vUv ).r;
-  float cov = texture2D( tNormal, vUv ).z;
+  float centreDepth = textureLod( tDepth, vUv, 0.0 ).r;
+  float cov = textureLod( tNormal, vUv, 0.0 ).z;
   if ( cov < 0.5 ) centreDepth = 1e5;
 
   float jitter = owIGN( gl_FragCoord.xy + uParams.z * 2.717 ) - 0.5;
@@ -76,14 +76,14 @@ void main() {
     for ( int s = 0; s < 2; s ++ ) {
       vec2 uv = vUv + ( s == 0 ? o : -o );
       if ( uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0 ) continue;
-      float d = texture2D( tDepth, uv ).r;
-      float c = texture2D( tNormal, uv ).z;
+      float d = textureLod( tDepth, uv, 0.0 ).r;
+      float c = textureLod( tNormal, uv, 0.0 ).z;
       if ( c < 0.5 ) d = 1e5;
       // a sample that is much further away than the centre is background
       // leaking in — down-weight it
       float w = 1.0 - smoothstep( 0.0, 1.5, ( d - centreDepth ) / max( 1.0, centreDepth ) );
       w = mix( 0.15, 1.0, clamp( w, 0.0, 1.0 ) ) * ( 1.0 - t * 0.35 );
-      sum += texture2D( tColor, uv ).rgb * w;
+      sum += textureLod( tColor, uv, 0.0 ).rgb * w;
       wsum += w;
     }
   }

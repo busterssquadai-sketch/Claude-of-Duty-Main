@@ -26,7 +26,18 @@ export class RaidSystem {
     this._activeExit = null;
     this._bag = [];            // переиспользуемый буфер ролла лута
     this._v = new THREE.Vector3();
-    this.summary = { kind: '', kills: 0, xp: 0, value: 0, time: 0, exit: '' };
+    this._startElapsed = 0;
+    this.summary = {
+      kind: '',
+      kills: 0,
+      xp: 0,
+      value: 0,
+      time: 0,
+      exit: '',
+      mapId: '',
+      faction: '',
+      night: false,
+    };
 
     ctx.events.on('damage:dealt', this._onKill = (e) => { if (e.killed) { this.kills++; this.summary.xp += e.xp ?? 0; } });
     ctx.events.on('actor:death', this._onDeath = (e) => { if (e.isPlayer) this.end('killed'); });
@@ -34,16 +45,27 @@ export class RaidSystem {
 
   /* ---------- старт ---------- */
   async start(mapId, faction, night) {
-    const seed = this.ctx.rng.uint32();
+    const seed = this.ctx.rng.u32();
     this.rng = this.ctx.rng.fork('raid:' + seed);
     this.mapId = mapId; this.faction = faction; this.night = !!night;
     this.kills = 0;
-    this.summary.xp = 0;
+    this.summary = {
+      kind: '',
+      kills: 0,
+      xp: 0,
+      value: 0,
+      time: 0,
+      exit: '',
+      mapId,
+      faction,
+      night: !!night,
+    };
 
     // строим мир по требованию — вот ради чего world.buildMap асинхронный
     const map = await this.world.buildMap(mapId, { night: this.night, seed });
     this.exits = map.exits;
     this.timeLeft = map.duration;
+    this._startElapsed = this.ctx.time.elapsed;
 
     this._scatterLoot(map);
     if (faction === 'scav') this.meta.equipScavKit(this.rng);
@@ -226,7 +248,13 @@ exitStatus(exit, player) {
     this.active = false;
 
     const s = this.summary;
-    s.kind = kind; s.kills = this.kills; s.exit = exit?.name ?? '';
+    s.kind = kind;
+    s.kills = this.kills;
+    s.exit = exit?.name ?? '';
+    s.mapId = this.mapId;
+    s.faction = this.faction;
+    s.night = this.night;
+    s.time = Math.max(0, this.ctx.time.elapsed - this._startElapsed);
     s.value = 0;
     for (const it of this.inv.all) if (this.inv.onBody(it)) s.value += this.items.price(it.id) * it.n;
 
@@ -235,7 +263,7 @@ exitStatus(exit, player) {
 
     this.world.teardown();                         // ГЛАВНОЕ: освобождаем всю геометрию и RT
     this.corpses.length = 0;
-    this.ctx.events.emit('raid:end', { kind, summary: s });
+    this.ctx.events.emit('raid:end', { kind, summary: { ...s } });
   }
 
   dispose() {

@@ -632,15 +632,10 @@ export class RenderSystem {
       this._patchLikeFrame(ctx.scene, false);
       this._patchLikeFrame(ctx.viewScene, true);
 
-      // 2. Forward lit programs. compileAsync uses KHR_parallel_shader_compile
-      //    where the driver has it, so this does not block the main thread.
-      try {
-        await renderer.compileAsync(ctx.scene, ctx.camera);
-        await renderer.compileAsync(ctx.viewScene, ctx.viewCamera);
-      } catch {
-        renderer.compile(ctx.scene, ctx.camera);
-        renderer.compile(ctx.viewScene, ctx.viewCamera);
-      }
+      // 2. Forward lit programs. We use the sync path here because Three's
+      //    compileAsync readiness polling can throw on some material sets.
+      renderer.compile(ctx.scene, ctx.camera);
+      renderer.compile(ctx.viewScene, ctx.viewCamera);
 
       // 3. Depth-only variants. There is no compile-time API for an override
       //    material, so the only way to reach them is to actually run the two

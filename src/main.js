@@ -1,5 +1,6 @@
-import { Engine } from './core/engine.js';
+import { Engine, STATE } from './core/engine.js';
 import { createConfig } from './core/config.js';
+import { MainMenuSystem } from './ui/mainMenu.js';
 
 import { RenderSystem } from './render/index.js';
 import { MaterialSystem } from './materials/index.js';
@@ -32,31 +33,33 @@ const lockstep = capture && params.get('lockstep') === '1';
 applyTarkovBootstrap();
 
 const config = createConfig({
-  quality: params.get('q') ?? 'high',   // EFL: интерьеры дешевле улицы, high — рабочий дефолт
+  quality: params.get('q') ?? 'high',
   deterministic: capture,
 });
 
 const engine = new Engine({ canvas: document.getElementById('game'), config });
 
+const ALL_STATES = [STATE.MENU, STATE.LOADING, STATE.GAMEPLAY, STATE.PAUSED, STATE.RESULTS];
+const GAMEPLAY = [STATE.GAMEPLAY];
+
 engine
-  .add(RenderSystem)
-  .add(MaterialSystem)
-  .add(SkySystem)
-  .add(WorldSystem)
-  .add(PhysicsSystem)
-  .add(PlayerSystem)
-  .add(WeaponSystem)
-  .add(FxSystem)
-  .add(AiSystem)
-  .add(UiSystem)
-  .add(AudioSystem)
-  // порядок ниже не важен — решают static deps
-  .add(ItemsSystem)
-  .add(InventorySystem)
-  .add(HealthSystem)
-  .add(MetaSystem)
-  .add(RaidSystem)
-  .add(NetSystem);
+  .add(RenderSystem, { states: ALL_STATES })
+  .add(MaterialSystem, { states: ALL_STATES })
+  .add(SkySystem, { states: ALL_STATES })
+  .add(WorldSystem, { states: GAMEPLAY })
+  .add(PhysicsSystem, { states: GAMEPLAY })
+  .add(PlayerSystem, { states: GAMEPLAY })
+  .add(WeaponSystem, { states: GAMEPLAY })
+  .add(FxSystem, { states: GAMEPLAY })
+  .add(AiSystem, { states: GAMEPLAY })
+  .add(UiSystem, { states: ALL_STATES })
+  .add(AudioSystem, { states: ALL_STATES })
+  .add(ItemsSystem, { states: ALL_STATES })
+  .add(InventorySystem, { states: GAMEPLAY })
+  .add(HealthSystem, { states: GAMEPLAY })
+  .add(MetaSystem, { states: ALL_STATES })
+  .add(RaidSystem, { states: GAMEPLAY })
+  .add(NetSystem, { states: GAMEPLAY });
 
 try {
   await engine.init();
@@ -65,15 +68,30 @@ try {
   throw err;
 }
 
+const mainMenu = new MainMenuSystem({
+  engine,
+  ctx: engine.ctx,
+  mount: document.body,
+  theme: 'default',
+  buildVersion: '1.1.0.1.46777 | PvE',
+  level: 100,
+  nickname: 'Larpov',
+  zone: 'PVE ZONE',
+  expansionsLabel: 'EXPANSIONS',
+  showSeasonBanner: true,
+  showThemeChip: true,
+});
+engine.mainMenu = mainMenu;
+mainMenu.mount();
+
 const shotApi = installShotApi(engine, { capture, lockstep });
 
-// Прогрев шейдеров обязателен: у EFL добавились варианты материалов лута,
-// трупов и оружейных модов — без него они компилируются в бою.
 const warmup = params.get('prewarm') === '0'
   ? { ok: false, reason: 'disabled' }
   : await prewarm(engine);
 console.info('[boot] prewarm', warmup);
 
+engine.enterMenu();
 engine.start();
 
 const BOOT_FRAMES = 3;

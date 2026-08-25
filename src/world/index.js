@@ -31,6 +31,8 @@ export class WorldSystem {
     this._lights = [];              // ФИКСИРОВАННЫЙ пул point-light
     this._instanced = new Map();    // ключ кита → InstancedMesh
     this._actorPool = [];
+    this._actors = new Set();
+    this._colliders = [];
     this._matrix = new THREE.Matrix4();
     this._q = new THREE.Quaternion();
     this._s = new THREE.Vector3(1, 1, 1);
@@ -72,7 +74,8 @@ export class WorldSystem {
     this.root.add(built.group);
     this.current = { ...built, id: mapId, duration: def.duration, night };
     this.navGrid = built.navGrid;
-    this.ctx.get('physics').rebuild(built.group);       // один раз на рейд, не покадрово
+    this.buildings = (built.rooms || []).map((spec) => ({ spec }));
+    this.ctx.get('physics').rebuildStatic();            // один раз на рейд, не покадрово
     await this.ctx.get('render').prewarmMaterials(this.ctx);
     return this.current;
   }
@@ -100,8 +103,156 @@ export class WorldSystem {
     this._owned.materials.clear();
     for (const l of this._lights) l.intensity = 0;        // гасим, но не удаляем
     this._instanced.clear();
+    this._actors.clear();
+    this._colliders.length = 0;
+    this.buildings = [];
     this.current = null;
     this.navGrid = null;
+  }
+
+  levelToWorld(x, y, z, out = new THREE.Vector3()) {
+    return out.set(x, y, z);
+  }
+
+  isOpen(x, z, m = 0.3) {
+    const nav = this.navGrid;
+    if (!nav) return true;
+    if (typeof nav.freeWorld !== 'function') return true;
+    if (m <= 0) return nav.freeWorld(x, z);
+    return (
+      nav.freeWorld(x, z) &&
+      nav.freeWorld(x + m, z) &&
+      nav.freeWorld(x - m, z) &&
+      nav.freeWorld(x, z + m) &&
+      nav.freeWorld(x, z - m)
+    );
+  }
+
+  spawnZones(kind) {
+    return this.current?.spawnZones?.[kind] || [];
+  }
+
+  groundAt(x, z, fromY = 20) {
+    const phys = this.ctx?.peek('physics');
+    const y = phys?.groundHeight?.(x, z, fromY, phys.MASK_WORLD ?? 1);
+    return Number.isFinite(y) ? y : 0;
+  }
+
+  randomPatrolPoint(rng) {
+    const rand = typeof rng === 'function'
+      ? rng
+      : rng && typeof rng.float === 'function'
+        ? () => rng.float()
+        : () => this.ctx.rng.float();
+    const nav = this.navGrid;
+    const p = new THREE.Vector3();
+    if (nav && typeof nav.randomFree === 'function' && nav.randomFree(rand, p)) {
+      p.y = this.groundAt(p.x, p.z, p.y + 4);
+      return p;
+    }
+    const zones = this.spawnZones('bot');
+    if (zones.length) {
+      const p = zones[(rand() * zones.length) | 0].clone();
+      p.y = this.groundAt(p.x, p.z, p.y + 4);
+      return p;
+    }
+    return p.set(0, this.groundAt(0, 0, 20), 0);
+  }
+
+  findPath(from, to) {
+    const nav = this.navGrid;
+    if (!nav || typeof nav.findPath !== 'function') return [];
+    const out = [];
+    const n = nav.findPath(from, to, out);
+    if (!n) return [];
+    for (let i = 0; i < out.length; i++) {
+      const p = out[i];
+      p.y = this.groundAt(p.x, p.z, p.y + 4);
+    }
+    return out;
+  }
+
+  findCover(pos, threat, rng) {
+    const nav = this.navGrid;
+    const phys = this.ctx?.peek('physics');
+    if (!nav || !phys) return null;
+    const rand = typeof rng === 'function'
+      ? rng
+      : rng && typeof rng.float === 'function'
+        ? () => rng.float()
+        : () => this.ctx.rng.float();
+    const mask = phys.MASK_WORLD ?? 1;
+    const baseX = pos.x - threat.x;
+    const baseZ = pos.z - threat.z;
+    const baseLen = Math.hypot(baseX, baseZ) || 1;
+    const awayX = baseX / baseLen;
+    const awayZ = baseZ / baseLen;
+    let best = null;
+    let bestScore = -Infinity;
+    for (let i = 0; i < 28; i++) {
+      const wiggle = (rand() - 0.5) * 1.4;
+      const ang = Math.atan2(awayZ, awayX) + wiggle;
+      const dist = 6 + rand() * 16;
+      const x = pos.x + Math.cos(ang) * dist;
+      const z = pos.z + Math.sin(ang) * dist;
+      if (typeof nav.freeWorld === 'function' && !nav.freeWorld(x, z)) continue;
+      const y = phys.groundHeight(x, z, pos.y + 6, mask);
+      if (!Number.isFinite(y)) continue;
+      const p = new THREE.Vector3(x, y, z);
+      if (phys.lineOfSight?.(threat, p, mask)) continue;
+      const path = nav.findPath(pos, p, []);
+      if (!path || path.length === 0) continue;
+      const dBot = p.distanceTo(pos);
+      const dThreat = p.distanceTo(threat);
+      let score = dThreat * 2.1 - dBot * 0.6;
+      score += ((x - pos.x) * awayX + (z - pos.z) * awayZ) / Math.max(1, dBot) * 2.4;
+      if (score > bestScore) {
+        bestScore = score;
+        best = p;
+      }
+    }
+    return best;
+  }
+
+  addActor(actor) {
+    if (!actor) return null;
+    const node = actor.isObject3D ? actor : actor.root || null;
+    if (node && node.parent !== this.root) this.root.add(node);
+    if (actor.collider) actor.collider.enabled = true;
+    if (Array.isArray(actor.colliders)) for (const c of actor.colliders) if (c) c.enabled = true;
+    this._actors.add(actor);
+    return actor;
+  }
+
+  removeActor(actor) {
+    if (!actor) return null;
+    const node = actor.isObject3D ? actor : actor.root || null;
+    node?.parent?.remove(node);
+    if (actor.collider) actor.collider.enabled = false;
+    if (Array.isArray(actor.colliders)) for (const c of actor.colliders) if (c) c.enabled = false;
+    this._actors.delete(actor);
+    return actor;
+  }
+
+  disposeActor(actor) {
+    if (!actor) return null;
+    this.removeActor(actor);
+    const phys = this.ctx?.peek('physics');
+    if (actor.collider && phys?.removeCollider) phys.removeCollider(actor.collider);
+    if (Array.isArray(actor.colliders) && phys?.removeCollider) {
+      for (const c of actor.colliders) phys.removeCollider(c);
+      actor.colliders.length = 0;
+    }
+    actor.dispose?.();
+    return actor;
+  }
+
+  recycleCorpseMesh(actor) {
+    return this.removeActor(actor);
+  }
+
+  recycleGhost(actor) {
+    return this.removeActor(actor);
   }
 
   dispose() { this.teardown(); for (const l of this._lights) l.parent?.remove(l); this._lights.length = 0; }

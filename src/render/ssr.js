@@ -66,8 +66,8 @@ void main() {
     vec2 suv = clip.xy / clip.w * 0.5 + 0.5;
     if ( suv.x <= 0.0 || suv.x >= 1.0 || suv.y <= 0.0 || suv.y >= 1.0 ) break;
 
-    float sceneDepth = texture2D( tDepth, suv ).r;
-    float cov = texture2D( tNormal, suv ).z;
+    float sceneDepth = textureLod( tDepth, suv, 0.0 ).r;
+    float cov = textureLod( tNormal, suv, 0.0 ).z;
     float diff = -sp.z - sceneDepth;
 
     if ( cov > 0.5 && diff > 0.0 && diff < uParams.y + t * 0.06 ) {
@@ -78,7 +78,7 @@ void main() {
         vec3 mp = start + R * mid;
         vec4 mc = uProj * vec4( mp, 1.0 );
         vec2 muv = mc.xy / mc.w * 0.5 + 0.5;
-        float md = texture2D( tDepth, muv ).r;
+        float md = textureLod( tDepth, muv, 0.0 ).r;
         if ( -mp.z - md > 0.0 ) hi = mid; else lo = mid;
       }
       vec3 fp = start + R * hi;
@@ -96,9 +96,9 @@ void main() {
   if ( !hit ) { gl_FragColor = vec4( 0.0 ); return; }
 
   // Reproject the hit into the previous frame so the colour lines up.
-  vec2 vel = texture2D( tVelocity, hitUv ).rg;
+  vec2 vel = textureLod( tVelocity, hitUv, 0.0 ).rg;
   vec2 srcUv = clamp( hitUv - vel, vec2( 0.001 ), vec2( 0.999 ) );
-  vec3 color = texture2D( tColor, srcUv ).rgb;
+  vec3 color = textureLod( tColor, srcUv, 0.0 ).rgb;
 
   // Confidence: fade at screen borders, at grazing back-facing rays, and with
   // how far the ray had to travel.

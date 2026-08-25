@@ -52,8 +52,8 @@ void main() {
     vec2 suv = clip.xy / clip.w * 0.5 + 0.5;
     if ( suv.x <= 0.0 || suv.x >= 1.0 || suv.y <= 0.0 || suv.y >= 1.0 ) break;
 
-    float sceneDepth = texture2D( tDepth, suv ).r;
-    float cov = texture2D( tNormal, suv ).z;
+    float sceneDepth = textureLod( tDepth, suv, 0.0 ).r;
+    float cov = textureLod( tNormal, suv, 0.0 ).z;
     if ( cov < 0.5 ) continue;
 
     float diff = -sp.z - sceneDepth;
