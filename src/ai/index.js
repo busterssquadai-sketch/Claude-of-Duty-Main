@@ -26,11 +26,16 @@ export class AiSystem {
     this.rng = ctx.rng.fork('ai');
 
     this.bots = [];
+    this.actors = this.bots;
     this.free = [];                      // пул выведенных из игры ботов
     this.cursor = 0;                     // курсор тайм-слайсинга
     this.pathQueue = [];                 // кольцевая очередь запросов пути
     this.scavKarmaHostile = false;       // стал ли игрок-Дикий врагом для Диких
     this.playerFaction = FACTION.PMC;
+    this._botSeq = 1;
+    this._botBodyGeo = new THREE.CylinderGeometry(0.34, 0.39, 1.52, 8, 1);
+    this._botHeadGeo = new THREE.SphereGeometry(0.21, 8, 6);
+    this._botMat = new THREE.MeshStandardMaterial({ color: 0x6c7862, roughness: 0.96, metalness: 0.02 });
 
     // преаллокация
     this._v = new THREE.Vector3();
@@ -66,16 +71,161 @@ export class AiSystem {
     bot.state = S_PATROL;
     bot.alive = true;
     bot.target = null;
+    bot.suspicion = 0;
+    bot.path = [];
+    bot.pathI = 0;
+    bot.pathPending = false;
+    bot.coverPoint = null;
+    bot.burst = 0;
     bot.aimT = 0; bot.fireT = 0; bot.thinkT = 0; bot.lastSeen = -99;
     bot.wepId = d.wep[this.rng.int(0, d.wep.length - 1)];
     bot.ammoIdx = this.items.ammoSlot(this._pickAmmo(bot.wepId));
     bot.mag = this.items.get(bot.wepId).cap;
     bot.view = d.view * (night ? 0.45 : 1);
     bot.root.position.copy(at);
+    const gy = this.physics.groundHeight(bot.root.position.x, bot.root.position.z, bot.root.position.y + 6, this.physics.MASK_WORLD ?? 1);
+    if (Number.isFinite(gy)) bot.root.position.y = gy;
+    bot.noiseAt.copy(bot.root.position);
+    bot.lastPos.copy(bot.root.position);
+    bot.yaw = 0;
     bot.root.visible = true;
     this.world.addActor(bot);              // в BVH как MASK_ACTOR
+    this._syncBot(bot);
     this.bots.push(bot);
     return bot;
+  }
+
+  _createBot() {
+    const root = new THREE.Group();
+    root.name = `bot:${this._botSeq}`;
+    root.visible = false;
+    const body = new THREE.Mesh(this._botBodyGeo, this._botMat);
+    body.position.y = 0.78;
+    body.castShadow = true;
+    body.receiveShadow = true;
+    const head = new THREE.Mesh(this._botHeadGeo, this._botMat);
+    head.position.y = 1.6;
+    head.castShadow = true;
+    head.receiveShadow = true;
+    root.add(body);
+    root.add(head);
+
+    const collider = this.physics.addCollider({
+      shape: 'capsule',
+      layer: this.physics.LAYER.ACTOR,
+      surface: 'flesh',
+      owner: null,
+      part: 'torso',
+      radius: 0.33,
+      damageScale: 1,
+      enabled: false,
+    });
+
+    const bot = {
+      id: this._botSeq++,
+      root,
+      body,
+      head,
+      collider,
+      kind: FACTION.SCAV,
+      hp: 0,
+      state: S_IDLE,
+      alive: false,
+      target: null,
+      yaw: 0,
+      aimT: 0,
+      fireT: 0,
+      thinkT: 0,
+      lastSeen: -99,
+      suspicion: 0,
+      ammoIdx: 0,
+      mag: 0,
+      view: 0,
+      burst: 0,
+      path: [],
+      pathI: 0,
+      pathPending: false,
+      coverPoint: null,
+      noiseAt: new THREE.Vector3(),
+      lastPos: new THREE.Vector3(),
+    };
+    collider.owner = bot;
+    root.userData.bot = bot;
+    return bot;
+  }
+
+  _syncBot(bot) {
+    if (!bot || !bot.root) return;
+    bot.root.rotation.y = bot.yaw || 0;
+    if (bot.collider) {
+      const p = bot.root.position;
+      bot.collider.enabled = bot.alive;
+      bot.collider.setSegment(p.x, p.y + 0.11, p.z, p.x, p.y + 1.62, p.z);
+    }
+  }
+
+  _faceTo(bot, targetPos, dt, rate) {
+    const p = bot.root.position;
+    const desired = Math.atan2(targetPos.x - p.x, targetPos.z - p.z);
+    let dy = desired - bot.yaw;
+    while (dy > Math.PI) dy -= Math.PI * 2;
+    while (dy < -Math.PI) dy += Math.PI * 2;
+    const turn = Math.max(0.001, rate || 1) * dt;
+    bot.yaw += Math.max(-turn, Math.min(turn, dy));
+    this._syncBot(bot);
+  }
+
+  _moveTo(bot, dest, dt, speed) {
+    if (!dest || !bot || !bot.root) return false;
+    const p = bot.root.position;
+    const dx = dest.x - p.x;
+    const dz = dest.z - p.z;
+    const dist = Math.hypot(dx, dz);
+    if (dist < 0.08) {
+      p.x = dest.x;
+      p.z = dest.z;
+      const gy = this.physics.groundHeight(p.x, p.z, p.y + 4, this.physics.MASK_WORLD ?? 1);
+      if (Number.isFinite(gy)) p.y = gy;
+      this._syncBot(bot);
+      return true;
+    }
+    const step = Math.min(dist, Math.max(0.1, speed || 1) * dt * 5);
+    p.x += (dx / dist) * step;
+    p.z += (dz / dist) * step;
+    const gy = this.physics.groundHeight(p.x, p.z, p.y + 4, this.physics.MASK_WORLD ?? 1);
+    if (Number.isFinite(gy)) p.y = gy;
+    bot.yaw = Math.atan2(dx, dz);
+    this._syncBot(bot);
+    return dist <= step + 0.001;
+  }
+
+  _followPath(bot, dt, speed) {
+    if (!bot.path || bot.pathI >= bot.path.length) {
+      bot.path = [];
+      bot.pathI = 0;
+      bot.pathPending = false;
+      return false;
+    }
+    const wp = bot.path[bot.pathI];
+    if (!wp) {
+      bot.path = [];
+      bot.pathI = 0;
+      bot.pathPending = false;
+      return false;
+    }
+    if (this._moveTo(bot, wp, dt, speed)) {
+      bot.pathI++;
+      if (bot.pathI >= bot.path.length) {
+        bot.path = [];
+        bot.pathI = 0;
+        bot.pathPending = false;
+      }
+    }
+    return true;
+  }
+
+  _animate(bot, dt) {
+    this._syncBot(bot);
   }
 
   _pickAmmo(wepId) {
@@ -238,6 +388,7 @@ export class AiSystem {
       if (!req.bot.alive) continue;
       req.bot.path = this.world.findPath(req.bot.root.position, req.to);
       req.bot.pathI = 0;
+      req.bot.pathPending = false;
     }
   }
 
@@ -273,6 +424,9 @@ export class AiSystem {
     this.clear();
     for (const b of this.free) this.world.disposeActor(b);
     this.free.length = 0;
+    this._botBodyGeo.dispose();
+    this._botHeadGeo.dispose();
+    this._botMat.dispose();
     const e = this.ctx.events;
     e.off('weapon:fire', this._onFire); e.off('explosion', this._onBoom);
     e.off('raid:start', this._onRaid);  e.off('raid:end', this._onEnd);

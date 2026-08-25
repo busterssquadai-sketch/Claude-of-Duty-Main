@@ -89,6 +89,7 @@ export class Input {
   }
 
   requestPointerLock() {
+    if (!this.enabled) return;
     // Chrome returns a promise that rejects if the document is not eligible
     // (headless capture, an iframe, a lock request too soon after an exit).
     // An unhandled rejection there shows up as a page error in the harness, so

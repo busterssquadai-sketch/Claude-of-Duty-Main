@@ -85,6 +85,7 @@ attribute vec4 aExtra;
 
 uniform float uTime;
 uniform vec2 uAtlas;   // cols, 1/cols
+uniform vec2 uSpriteTexel;
 
 varying vec2 vUv;
 varying vec4 vCol;
@@ -196,7 +197,14 @@ void main() {
   vec3 nrm = vec3( vQ, sqrt( max( 0.03, 1.0 - rr ) ) );
   // Bend the fake sphere normal by the sprite's own density gradient: this is
   // what turns a soft blob into something with legible internal form.
-  nrm = normalize( nrm - vec3( dFdx( tex.r ), dFdy( tex.r ), 0.0 ) * 7.0 );
+  vec2 dx = vec2( uSpriteTexel.x, 0.0 );
+  vec2 dy = vec2( 0.0, uSpriteTexel.y );
+  vec3 grad = vec3(
+    texture2D( uSprite, vUv + dx ).r - texture2D( uSprite, vUv - dx ).r,
+    texture2D( uSprite, vUv + dy ).r - texture2D( uSprite, vUv - dy ).r,
+    0.0
+  );
+  nrm = normalize( nrm - grad * 7.0 );
   float ndl = dot( nrm, uSunDir );
   float wrap = max( 0.0, ( ndl + 0.42 ) / 1.42 );
   float back = max( 0.0, -ndl );
@@ -293,6 +301,12 @@ export class ParticleLayer {
     this.uniforms = {
       uTime: { value: 0 },
       uAtlas: { value: new THREE.Vector2(o.cols, 1 / o.cols) },
+      uSpriteTexel: {
+        value: new THREE.Vector2(
+          1 / Math.max(1, o.atlas.image?.width ?? o.atlas.image?.height ?? 1),
+          1 / Math.max(1, o.atlas.image?.height ?? o.atlas.image?.width ?? 1)
+        ),
+      },
       uSprite: { value: o.atlas },
       uDepth: { value: null },
       uRes: { value: new THREE.Vector2(1920, 1080) },

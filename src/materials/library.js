@@ -389,6 +389,8 @@ export const ALIASES = {
   metal: 'metal_painted',
   steel: 'metal_brushed',
   rust: 'metal_rust',
+  tent: 'fabric',
+  plastic: 'rubber',
   sandbag: 'burlap',
   ground: 'dirt',
   road: 'asphalt',

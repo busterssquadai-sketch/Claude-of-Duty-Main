@@ -89,7 +89,20 @@ export class Rng {
 
   /** Independent stream derived from this one — lets a subsystem randomise
    *  without perturbing another subsystem's sequence. */
-  fork() {
-    return new Rng(this.u32());
+  fork(salt = null) {
+    let seed = this.u32();
+    if (salt !== null && salt !== undefined) {
+      if (typeof salt === 'string') {
+        let h = 2166136261;
+        for (let i = 0; i < salt.length; i++) {
+          h ^= salt.charCodeAt(i);
+          h = Math.imul(h, 16777619);
+        }
+        seed ^= h >>> 0;
+      } else {
+        seed ^= salt >>> 0;
+      }
+    }
+    return new Rng(seed >>> 0);
   }
 }

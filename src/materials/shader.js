@@ -218,19 +218,22 @@ vec2 owPOM( vec2 uv, vec3 vt, vec2 ddx, vec2 ddy, float depth, float fade ){
   float layer = 1.0 / nl;
   vec2 P = ( vt.xy / max( abs( vt.z ), 0.30 ) ) * depth * fade;
   vec2 dUv = P * layer;
+  vec2 texSize = vec2( textureSize( map, 0 ) );
+  float rho = max( length( ddx * texSize ), length( ddy * texSize ) );
+  float lod = clamp( log2( max( rho, 1e-4 ) ), 0.0, 12.0 );
 
   float cur = 0.0;
   vec2 c = uv;
-  float d = 1.0 - OW_TEX( map, c, ddx, ddy ).a;
+  float d = 1.0 - textureLod( map, c, lod ).a;
   for ( int i = 0; i < 48; i ++ ){
     if ( cur >= d || float( i ) >= nl ) break;
     c -= dUv;
-    d = 1.0 - OW_TEX( map, c, ddx, ddy ).a;
+    d = 1.0 - textureLod( map, c, lod ).a;
     cur += layer;
   }
   vec2 prev = c + dUv;
   float after = d - cur;
-  float before = ( 1.0 - OW_TEX( map, prev, ddx, ddy ).a ) - cur + layer;
+  float before = ( 1.0 - textureLod( map, prev, lod ).a ) - cur + layer;
   float w = clamp( after / max( after - before, 1e-4 ), 0.0, 1.0 );
   return mix( c, prev, w );
 }

@@ -4,6 +4,17 @@ import { FIXED_DT, MAX_SUBSTEPS } from './config.js';
 import { Input } from './input.js';
 import { Rng } from './rng.js';
 
+export const STATE = Object.freeze({
+  BOOT: 'boot',
+  MENU: 'menu',
+  LOADING: 'loading',
+  GAMEPLAY: 'gameplay',
+  PAUSED: 'paused',
+  RESULTS: 'results',
+});
+
+const ALL_STATES = new Set(Object.values(STATE));
+
 /**
  * The Engine owns the frame loop and the shared context handed to every
  * subsystem. It does NOT know what any subsystem does — it only sequences them.
@@ -64,11 +75,21 @@ export class Engine {
     this._accum = 0;
     this._last = 0;
     this._running = false;
+    this.state = STATE.BOOT;
+    this.prevState = null;
+    this.mainMenu = null;
+    this._systemStates = new Map();
+    this._transitioning = false;
     this._onResize = () => this.resize();
+    this.events.on('raid:end', (payload) => this.showResults(payload));
   }
 
-  add(SystemClass, opts) {
-    this.registry.add(new SystemClass(opts));
+  add(SystemClass, opts = {}) {
+    const sys = new SystemClass(opts);
+    this.registry.add(sys);
+    if (Array.isArray(opts.states) && opts.states.length) {
+      this._systemStates.set(sys.constructor.id, new Set(opts.states));
+    }
     return this;
   }
 
@@ -132,20 +153,139 @@ export class Engine {
     let steps = 0;
     const fixedSystems = this.registry.with('fixedUpdate');
     while (this._accum >= FIXED_DT && steps < MAX_SUBSTEPS) {
-      for (const sys of fixedSystems) sys.fixedUpdate(FIXED_DT, this.ctx);
+      for (const sys of fixedSystems) {
+        if (!this._canRun(sys)) continue;
+        sys.fixedUpdate(FIXED_DT, this.ctx);
+      }
       this._accum -= FIXED_DT;
       steps++;
     }
     if (steps === MAX_SUBSTEPS) this._accum = 0; // shed backlog rather than spiral
     t.alpha = this._accum / FIXED_DT;
 
-    for (const sys of this.registry.with('update')) sys.update(t.dt, this.ctx);
-    for (const sys of this.registry.with('lateUpdate')) sys.lateUpdate(t.dt, this.ctx);
+    for (const sys of this.registry.with('update')) {
+      if (!this._canRun(sys)) continue;
+      sys.update(t.dt, this.ctx);
+    }
+    for (const sys of this.registry.with('lateUpdate')) {
+      if (!this._canRun(sys)) continue;
+      sys.lateUpdate(t.dt, this.ctx);
+    }
 
     const renderSystem = this.registry.peek('render');
     if (typeof renderSystem?.render === 'function') renderSystem.render(this.ctx);
 
     this.input.endFrame();
+  }
+
+  _canRun(sys) {
+    if (!sys || sys.enabled === false) return false;
+    const allowed = this._systemStates.get(sys.constructor.id);
+    if (!allowed || allowed === ALL_STATES) return true;
+    return allowed.has(this.state);
+  }
+
+  _setInputActive(active) {
+    this.input.enabled = !!active;
+    this.input.frozen = !active;
+    if (!active) {
+      try { document.exitPointerLock?.(); } catch {}
+      this.input.pointerLocked = false;
+    }
+  }
+
+  requestPointerLock() {
+    if (!this.input.enabled) return;
+    this.input.requestPointerLock();
+  }
+
+  setState(next) {
+    if (this.state === next) return this.state;
+    this.prevState = this.state;
+    this.state = next;
+    document.documentElement.setAttribute('data-game-state', next);
+    this.events.emit('state', { from: this.prevState, to: next });
+    return this.state;
+  }
+
+  enterMenu() {
+    this.setState(STATE.MENU);
+    this._setInputActive(false);
+    const ui = this.ctx.peek('ui');
+    ui?.menu?.close?.();
+    ui?.setHudVisible?.(false);
+    ui?.hideRaidResults?.();
+    if (this.mainMenu) this.mainMenu.show();
+    return this;
+  }
+
+  enterLoading() {
+    this.setState(STATE.LOADING);
+    this._setInputActive(false);
+    const ui = this.ctx.peek('ui');
+    ui?.menu?.close?.();
+    ui?.setHudVisible?.(false);
+    ui?.hideRaidResults?.();
+    return this;
+  }
+
+  enterGameplay() {
+    this.setState(STATE.GAMEPLAY);
+    this._setInputActive(true);
+    const ui = this.ctx.peek('ui');
+    ui?.hideRaidResults?.();
+    ui?.setHudVisible?.(true);
+    ui?.menu?.close?.();
+    return this;
+  }
+
+  async startRaid(opts = {}) {
+    if (this._transitioning) return;
+    this._transitioning = true;
+    const raid = this.ctx.peek('raid');
+    const startOpts = {
+      mapId: opts.mapId ?? 'factory',
+      faction: opts.faction ?? 'pmc',
+      night: !!opts.night,
+    };
+    try {
+      if (this.mainMenu?.isOpen?.()) {
+        await this.mainMenu.close({ fade: 700, destroy: false });
+      }
+      this.enterLoading();
+      if (!raid || typeof raid.start !== 'function') {
+        throw new Error('[engine] raid subsystem missing');
+      }
+      await raid.start(startOpts.mapId, startOpts.faction, startOpts.night);
+      this.enterGameplay();
+      this.requestPointerLock();
+    } catch (err) {
+      console.error('[engine] startRaid failed', err);
+      this.enterMenu();
+      throw err;
+    } finally {
+      this._transitioning = false;
+    }
+  }
+
+  showResults(payload = {}) {
+    const ui = this.ctx.peek('ui');
+    const summary = payload?.summary ? payload.summary : payload;
+    this.setState(STATE.RESULTS);
+    this._setInputActive(false);
+    ui?.menu?.close?.();
+    ui?.setHudVisible?.(false);
+    ui?.showRaidResults?.(summary);
+    return this;
+  }
+
+  returnToMenu() {
+    const ui = this.ctx.peek('ui');
+    ui?.hideRaidResults?.();
+    ui?.setHudVisible?.(false);
+    ui?.menu?.close?.();
+    this.enterMenu();
+    return this;
   }
 
   dispose() {

@@ -505,13 +505,11 @@ export class AudioSystem {
       return;
     }
     try {
-      this.actx = new AC({ latencyHint: "interactive" });
+      this._AC = AC;
     } catch (e) {
       console.warn("[audio] не удалось создать AudioContext", e);
       return;
     }
-    this.sampleRate = this.actx.sampleRate;
-    this._buildGraph();
     try {
       await this._renderBank();
     } catch (e) {
@@ -521,6 +519,28 @@ export class AudioSystem {
     this._bindEvents();
     this._bindUnlock();
     this.ready = true;
+  }
+
+  _ensureActx() {
+    if (this.actx) return this.actx;
+    const AC = this._AC;
+    if (!AC) return null;
+    try {
+      this.actx = new AC({ latencyHint: "interactive" });
+    } catch (e) {
+      console.warn("[audio] не удалось создать AudioContext", e);
+      return null;
+    }
+    this.sampleRate = this.actx.sampleRate;
+    this._buildGraph();
+    return this.actx;
+  }
+
+  resume() {
+    const a = this._ensureActx();
+    if (!a) return null;
+    if (a.state === "suspended") return a.resume();
+    return Promise.resolve(a);
   }
 
   _buildGraph() {
@@ -686,8 +706,7 @@ export class AudioSystem {
   _bindUnlock() {
     const self = this;
     this._unlockFn = function unlock() {
-      if (!self.actx) return;
-      if (self.actx.state !== "running") self.actx.resume();
+      self.resume();
     };
     window.addEventListener("pointerdown", this._unlockFn);
     window.addEventListener("keydown", this._unlockFn);
@@ -823,6 +842,7 @@ export class AudioSystem {
    */
   _occlusion(pos, dist) {
     if (dist < 2) return 0;
+    if (!this.actx) return 0;
     const now = this.actx.currentTime;
     for (let i = 0; i < OCC_CACHE_SIZE; i++) {
       if (now - this._occT[i] > OCC_TTL) continue;
@@ -914,7 +934,8 @@ export class AudioSystem {
   /* Главный вход. Не аллоцирует ни одного JS-объекта. */
   play(kind, position, opts) {
     if (!this.ready || this.muted) return null;
-    const a = this.actx;
+    const a = this.actx || this._ensureActx();
+    if (!a) return null;
     if (a.state !== "running") return null;
 
     let dist = 0;
@@ -1047,6 +1068,7 @@ export class AudioSystem {
   }
 
   _applyListener() {
+    if (!this.actx) return;
     const l = this.actx.listener;
     const f = this.field;
     if (l.positionX) {
@@ -1075,6 +1097,7 @@ export class AudioSystem {
 
   update(dt, ctx) {
     if (!this.ready) return;
+    if (!this.actx) return;
     this._rays = RAYS_PER_FRAME;
 
     const c = ctx || this.ctx;

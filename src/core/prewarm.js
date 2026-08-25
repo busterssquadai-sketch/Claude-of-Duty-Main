@@ -19,9 +19,10 @@
  *
  * Two mechanisms, because neither alone is sufficient:
  *
- *  1. renderer.compileAsync() — uses KHR_parallel_shader_compile where available,
- *     so it compiles off the main thread and does not block. Covers the forward
- *     lit pass for everything currently in a scene graph.
+ *  1. renderer.compile() — forces the forward lit pass for everything currently
+ *     in a scene graph. We intentionally use the synchronous path here because
+ *     Three's compileAsync readiness poll has been observed to throw on some
+ *     material sets during boot.
  *  2. Real frames from representative poses — compileAsync does NOT cover the
  *     depth/shadow-map variant of a material, nor the post-processing chain,
  *     nor permutations that only exist once a subsystem has spawned its transient
@@ -152,17 +153,12 @@ export async function prewarm(engine, { onProgress = () => {}, transients = fals
   const prevMip = renderer.getActiveMipmapLevel?.() ?? 0;
 
   const compile = async () => {
-    // compileAsync is non-blocking where KHR_parallel_shader_compile exists.
     renderer.setRenderTarget(scratchRt);
     try {
-      await renderer.compileAsync(engine.scene, engine.camera);
-      await renderer.compileAsync(engine.viewScene, engine.viewCamera);
+      renderer.compile(engine.scene, engine.camera);
+      renderer.compile(engine.viewScene, engine.viewCamera);
     } catch {
-      // Older three or a driver without the extension — fall back to sync.
-      try {
-        renderer.compile(engine.scene, engine.camera);
-        renderer.compile(engine.viewScene, engine.viewCamera);
-      } catch { /* nothing more we can do; boot must still proceed */ }
+      /* nothing more we can do; boot must still proceed */
     } finally {
       renderer.setRenderTarget(prevRt, prevFace, prevMip);
     }
@@ -201,7 +197,7 @@ export async function prewarm(engine, { onProgress = () => {}, transients = fals
     // doc comment above says is missing — "a prewarmMaterials() on each subsystem
     // that builds and compiles its materials WITHOUT spawning gameplay objects".
     // It is now implemented by render, world and ai, and it reaches exactly what
-    // `compileAsync(scene, camera)` provably cannot:
+    // `compile(scene, camera)` provably cannot:
     //
     //   render  the CSM depth pass, the MRT prepass and the ~13 full-screen post
     //           materials (blitted into a 4x4 scratch). +34-40 programs.
