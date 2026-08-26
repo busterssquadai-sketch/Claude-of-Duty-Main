@@ -231,6 +231,7 @@ export class RaidResultSystem {
     this.destroyed = false
     this.stepIndex = 0
     this.model = null
+    this._xpCommitted = false      // одна фиксация опыта на один показ итогов
 
     this._raf = 0
     this._onClick = this._onClick.bind(this)
@@ -273,6 +274,13 @@ export class RaidResultSystem {
 
   get step() {
     return RAID_STEP_ORDER[this.stepIndex] || RAID_STEP_ORDER[0]
+  }
+
+  /** Накопленный за рейд опыт — ровно то, что визард показал на третьем
+   *  экране. Поля такого раньше не было вообще. */
+  get totalXpEarned() {
+    const xp = this.model && this.model.experience ? Number(this.model.experience.gained) : 0
+    return Number.isFinite(xp) && xp > 0 ? Math.round(xp) : 0
   }
 
   /* ----------------------------------------------------------- модель */
@@ -376,6 +384,10 @@ export class RaidResultSystem {
     const need = levelRequirement(meta, current)
     return {
       levelFrom: levelFrom,
+      /* Дорейдовый снимок сохраняем целиком: по нему _commitExperience()
+       * понимает, был ли опыт уже зачислен обработчиком raid:end. */
+      xpBefore: xpInLevel,
+      hadSnapshot: !!before,
       levelTo: current,
       leveledUp: current > levelFrom,
       gained: gained,
@@ -411,6 +423,7 @@ export class RaidResultSystem {
     if (this.destroyed || typeof document === 'undefined') return
     this.model = this._buildModel(payload)
     this.stepIndex = 0
+    this._xpCommitted = false
 
     if (this.root) this._teardownDom()
     this.isOpen = true
@@ -643,10 +656,71 @@ export class RaidResultSystem {
     this._paintStep()
   }
 
+  /* ------------------------------------------------- фиксация опыта в профиль */
+
+  /* 'meta' — штатный владелец профиля, 'profile' поддержан как псевдоним.
+   * Идём только через peek: registry.get() бросает для незарегистрированного
+   * id, а не возвращает ложь, так что get('meta') || get('profile') упал бы на
+   * первом же отсутствующем сервисе и сломал кнопку выхода. */
+  _profile() {
+    return this._svc('meta') || this._svc('profile')
+  }
+
+  /** MetaSystem._afterRaid() уже зачисляет опыт по событию raid:end до того,
+   *  как игрок увидит этот экран. Если профиль уже отличается ото дорейдового
+   *  снимка — начисление было, и второй раз писать нельзя: опыт и уровни
+   *  удвоились бы на каждом рейде. */
+  _experienceAlreadyCredited(meta) {
+    const xp = this.model && this.model.experience ? this.model.experience : null
+    if (!xp || !xp.hadSnapshot) return true      // без снимка не рискуем дублем
+    const P = meta && meta.P ? meta.P : null
+    if (!P) return true
+    const lvl = Math.max(1, Math.round(Number(P.lvl) || 1))
+    const inLevel = Math.max(0, Math.round(Number(P.xp) || 0))
+    return lvl !== xp.levelFrom || inLevel !== xp.xpBefore
+  }
+
+  /** Запись опыта в профиль и коммит сейва. Идемпотентно. */
+  _commitExperience() {
+    if (this._xpCommitted) return false
+    const meta = this._profile()
+    if (!meta) return false
+
+    const gained = this.totalXpEarned
+    let written = false
+
+    if (gained > 0 && !this._experienceAlreadyCredited(meta)) {
+      if (typeof meta.addExperience === 'function') {
+        try {
+          meta.addExperience(gained)
+          written = true
+        } catch (err) {
+          console.error('[EFL/res] addExperience упал', err)
+        }
+      } else {
+        console.warn('[EFL/res] у профиля нет addExperience(), опыт не начислен')
+      }
+    }
+
+    /* Коммит нужен и тогда, когда опыт начислила MetaSystem: игрок уходит
+     * из рейда, и следующего кадра с отложенным сейвом может и не быть. */
+    if (typeof meta.save === 'function') {
+      try { meta.save() } catch (err) { console.error('[EFL/res] save профиля упал', err) }
+    }
+
+    this._xpCommitted = true
+    return written
+  }
+
   /* Кнопка «В УБЕЖИЩЕ». Раньше звала _svc('mainMenu').show() — такого
    * сервиса в реестре нет, поэтому визард был тупиком. */
   finish() {
     playUiSound(this._audio(), 'click')
+
+    /* Опыт фиксируем ДО ухода в убежище и ДО close(): это последняя точка,
+     * где известны и начисление, и дорейдовый снимок прогресса. */
+    this._commitExperience()
+
     const engine = this._engine()
     this.close()
 
