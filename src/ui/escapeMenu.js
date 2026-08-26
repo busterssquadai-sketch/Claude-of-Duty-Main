@@ -736,8 +736,13 @@ export class EscapeMenuSystem {
     const canvas = document.querySelector(this.canvasSelector)
     if (canvas && canvas.requestPointerLock) canvas.requestPointerLock()
 
-    const state = this._svc('state')
-    call(state, 'set', STATE.GAMEPLAY)
+    /* Снятие паузы идёт напрямую через стейт-менеджер ядра. Легаси-сервиса
+     * 'state' в контейнере больше нет: _svc('state') отдавал null, и вызов
+     * call(state, 'set', STATE.GAMEPLAY) молча терял переход — игровой цикл
+     * оставался замороженным. Тот же путь, что и в desertRaid(). */
+    if (this.ctx && this.ctx.engine && typeof this.ctx.engine.setState === 'function') {
+      this.ctx.engine.setState(STATE.GAMEPLAY)
+    }
     this._emit('escape:resumed', {})
   }
 
