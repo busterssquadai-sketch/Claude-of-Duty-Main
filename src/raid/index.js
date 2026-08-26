@@ -5,6 +5,10 @@ export class RaidSystem {
   static id = 'raid';
   static deps = ['world', 'inventory', 'items', 'health', 'meta', 'ai', 'ui', 'audio', 'physics'];
 
+  /* Общий буфер статуса выхода. Раньше exitStatus() писал в this._exitStatus,
+   * которого не существует ни в одном файле проекта. */
+  _exitOut = { open: false, reason: '', progress: 0 };
+
   async init(ctx) {
     this.ctx = ctx;
     this.world = ctx.get('world');
@@ -130,89 +134,123 @@ export class RaidSystem {
   }
 
   /* ---------- выходы ---------- */
-  /** Условия выхода из EFL: фракция, время, ключ, цена, свободные руки. */
-exitStatus(exit, player) {
-  const s = this._exitStatus;
-  s.open = false;
-  s.reason = "";
-  s.progress = 0;
 
-  const left = this.timeLeft;
-
-  /* Фракция: выходы Диких не работают за ЧВК и наоборот. */
-  if (exit.faction && exit.faction !== this.faction) {
-    s.reason = "Только за Дикого";
-    return s;
+  /** Сколько рублей у игрока. Без этого геттера this.money был undefined,
+   *  а undefined < exit.cost всегда false — платные выходы ничего не проверяли. */
+  get money() {
+    if (!this.meta || typeof this.meta.money !== 'function') return 0;
+    const v = Number(this.meta.money('rub'));
+    return Number.isFinite(v) ? v : 0;
   }
 
-  /* afterSec: открывается, когда до конца рейда осталось меньше afterSec. */
-  if (exit.afterSec > 0 && left > exit.afterSec) {
-    s.reason =
-      "Откроется через " + Math.ceil((left - exit.afterSec) / 60) + " мин";
-    return s;
+  /** Сколько уже стоим в зоне выхода. */
+  get extractHeld() {
+    return this._holdT;
   }
 
-  /* beforeSec: закрывается под конец рейда. */
-  if (exit.beforeSec > 0 && left < exit.beforeSec) {
-    s.reason = "Уже закрыт";
-    return s;
+  /** Вызывался из exitStatus(), но не существовал: было только _hasItem(). */
+  hasItem(id) {
+    return this._hasItem(id);
   }
 
-  /* Ключ или карта доступа. */
-  if (exit.needKey && !this.hasItem(exit.needKey)) {
-    s.reason = "Нужен ключ";
-    return s;
+  /** Ни рюкзака, ни основного ствола. Тоже не существовал. */
+  handsFree() {
+    if (!this.inv || typeof this.inv.slotItem !== 'function') return true;
+    let backpack = null;
+    let primary = null;
+    try { backpack = this.inv.slotItem('backpack'); } catch (e) { backpack = null; }
+    try { primary = this.inv.slotItem('primary'); } catch (e) { primary = null; }
+    return !backpack && !primary;
   }
 
-  /* Свободные руки: ни рюкзака, ни основного ствола. */
-  if (exit.freeHands && !this.handsFree()) {
-    s.reason = "Нужны свободные руки";
-    return s;
-  }
+  /** Условия выхода из EFL: фракция, время, ключ, цена, свободные руки.
+   *  Второй аргумент — буфер для результата (fixedUpdate передаёт _exitOut). */
+  exitStatus(exit, out) {
+    const s = (out && typeof out === 'object') ? out : this._exitOut;
+    s.open = false;
+    s.reason = '';
+    s.progress = 0;
 
-  /* Платный выход. */
-  if (exit.cost > 0 && this.money < exit.cost) {
-    s.reason = "Нужно " + exit.cost + " ₽";
-    return s;
-  }
+    if (!exit) {
+      s.reason = 'Выход недоступен';
+      return s;
+    }
 
-  /*
-   * noBotsNear: выход блокируется, пока в радиусе есть живой бот.
-   * Сравнение идёт по квадратам дистанций, без sqrt и без аллокаций.
-   */
-  if (exit.noBotsNear > 0) {
-    const ai =
-      this.ctx && typeof this.ctx.peek === "function"
-        ? this.ctx.peek("ai")
-        : null;
-    const list = ai ? ai.actors || ai.bots : null;
-    if (list && list.length > 0) {
-      const r2 = exit.noBotsNear * exit.noBotsNear;
-      const ex = exit.position.x;
-      const ez = exit.position.z;
-      for (let i = 0; i < list.length; i++) {
-        const bot = list[i];
-        if (!bot || bot.dead || !bot.position) continue;
-        const dx = bot.position.x - ex;
-        const dz = bot.position.z - ez;
-        if (dx * dx + dz * dz < r2) {
-          s.reason = "Рядом противник";
-          return s;
+    const left = this.timeLeft;
+
+    /* Фракция: выходы Диких не работают за ЧВК и наоборот. */
+    if (exit.faction && exit.faction !== this.faction) {
+      s.reason = 'Только за Дикого';
+      return s;
+    }
+
+    /* afterSec: открывается, когда до конца рейда осталось меньше afterSec. */
+    if (exit.afterSec > 0 && left > exit.afterSec) {
+      s.reason = 'Откроется через ' + Math.ceil((left - exit.afterSec) / 60) + ' мин';
+      return s;
+    }
+
+    /* beforeSec: закрывается под конец рейда. */
+    if (exit.beforeSec > 0 && left < exit.beforeSec) {
+      s.reason = 'Уже закрыт';
+      return s;
+    }
+
+    /* Ключ или карта доступа. */
+    if (exit.needKey && !this.hasItem(exit.needKey)) {
+      s.reason = 'Нужен ключ';
+      return s;
+    }
+
+    /* Свободные руки: ни рюкзака, ни основного ствола. */
+    if (exit.freeHands && !this.handsFree()) {
+      s.reason = 'Нужны свободные руки';
+      return s;
+    }
+
+    /* Платный выход. */
+    if (exit.cost > 0 && this.money < exit.cost) {
+      s.reason = 'Нужно ' + exit.cost + ' ₽';
+      return s;
+    }
+
+    /*
+     * noBotsNear: выход блокируется, пока в радиусе есть живой бот.
+     * Сравнение идёт по квадратам дистанций, без sqrt и без аллокаций.
+     */
+    if (exit.noBotsNear > 0 && exit.position) {
+      const ai = this.ctx && typeof this.ctx.peek === 'function' ? this.ctx.peek('ai') : null;
+      const list = ai ? ai.actors || ai.bots : null;
+      if (list && list.length > 0) {
+        const r2 = exit.noBotsNear * exit.noBotsNear;
+        const ex = exit.position.x;
+        const ez = exit.position.z;
+        for (let i = 0; i < list.length; i++) {
+          const bot = list[i];
+          if (!bot || bot.dead || !bot.position) continue;
+          const dx = bot.position.x - ex;
+          const dz = bot.position.z - ez;
+          if (dx * dx + dz * dz < r2) {
+            s.reason = 'Рядом противник';
+            return s;
+          }
         }
       }
     }
+
+    /* Прогресс удержания: 7 секунд обычно, 9 для перехода между картами.
+     * Было this.cfg.raid.* — this.cfg не существует, берём EFL как fixedUpdate. */
+    s.open = true;
+    const hold = exit.transfer ? EFL.raid.transferHold : EFL.raid.extractHold;
+    s.progress = hold > 0 ? Math.min(1, this._holdT / hold) : 1;
+    return s;
   }
 
-  /* Прогресс удержания: 7 секунд обычно, 9 для перехода между картами. */
-  s.open = true;
-  const hold = exit.transfer
-    ? this.cfg.raid.transferHold
-    : this.cfg.raid.extractHold;
-  s.progress = hold > 0 ? Math.min(1, this.extractHeld / hold) : 1;
-  return s;
-}
-  _exitOut = { open: false, reason: '' };
-  _hasItem(id) { for (const it of this.inv.all) if (it.id === id && this.inv.onBody(it)) return true; return false; }
+  _hasItem(id) {
+    if (!this.inv || !this.inv.all) return false;
+    for (const it of this.inv.all) if (it && it.id === id && this.inv.onBody(it)) return true;
+    return false;
+  }
 
   fixedUpdate(h, ctx) {
     if (!this.active) return;
@@ -256,7 +294,11 @@ exitStatus(exit, player) {
     s.night = this.night;
     s.time = Math.max(0, this.ctx.time.elapsed - this._startElapsed);
     s.value = 0;
-    for (const it of this.inv.all) if (this.inv.onBody(it)) s.value += this.items.price(it.id) * it.n;
+    /* Коэрсим цену и количество: один undefined превращал всю сводку в NaN. */
+    for (const it of this.inv.all) {
+      if (!this.inv.onBody(it)) continue;
+      s.value += (Number(this.items.price(it.id)) || 0) * (Number(it.n) || 0);
+    }
 
     if (kind === 'survived') this.meta.keepLoadout();
     else this.meta.loseLoadout(kind);              // страховка разбирается внутри meta
@@ -272,3 +314,5 @@ exitStatus(exit, player) {
     this.lootPoints.length = 0; this.corpses.length = 0; this.exits.length = 0;
   }
 }
+
+export default RaidSystem;
