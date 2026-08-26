@@ -626,6 +626,19 @@ export class EscapeMenuSystem {
     try { return this.ctx.get(name) } catch (e) { return null }
   }
 
+  /* Активное состояние движка. Единственный живой источник истины:
+   * легаси-сервис 'state' выпилен из контейнера, _svc('state') отдаёт null,
+   * поэтому любые проверки состояния идут через ядро (engine.state), куда
+   * пишет engine.setState(). */
+  get engineState() {
+    return this.ctx?.engine?.state
+  }
+
+  /* Рейд активен: только в этих двух состояниях ESC-меню имеет смысл. */
+  _isRaidState(state) {
+    return state === STATE.GAMEPLAY || state === STATE.PAUSED
+  }
+
   _injectStyles() {
     if (document.getElementById('efl-escape-menu-css')) return
     const style = document.createElement('style')
@@ -675,6 +688,7 @@ export class EscapeMenuSystem {
   _onKeyDown(event) {
     if (this.destroyed || event.code !== 'Escape') return
 
+    /* Настройки поверх меню закрываются первыми и не зависят от состояния. */
     if (this.settingsMenu && this.settingsMenu.isOpen) {
       event.preventDefault()
       event.stopPropagation()
@@ -682,15 +696,23 @@ export class EscapeMenuSystem {
       return
     }
 
+    /* Состояние читаем напрямую из ядра. Раньше здесь был мёртвый
+     * this._svc('state'): он всегда отдавал null, current молча падал в
+     * STATE.GAMEPLAY, и ESC открывал рейдовое меню в главном меню, на
+     * загрузке и на экране итогов, зацикливая переходы. */
+    const currentState = this.ctx?.engine?.state
+
     if (!this.open) {
-      const state = this._svc('state')
-      const current = state ? state.current : STATE.GAMEPLAY
-      if (current !== STATE.GAMEPLAY) return
+      if (currentState !== STATE.GAMEPLAY && currentState !== STATE.PAUSED) return
       event.preventDefault()
       event.stopPropagation()
       this.openMenu()
       return
     }
+
+    /* Меню открыто: закрывать/листать экраны можно только пока рейд жив.
+     * В STATE.RESULTS (дезертирство) ESC не должен возвращать в рейд. */
+    if (currentState !== STATE.GAMEPLAY && currentState !== STATE.PAUSED) return
 
     event.preventDefault()
     event.stopPropagation()
@@ -701,9 +723,15 @@ export class EscapeMenuSystem {
   _onPointerLockChange() {
     if (this.destroyed || this.open) return
     if (document.pointerLockElement) return
-    const state = this._svc('state')
-    if (state && state.current !== STATE.GAMEPLAY) return
     if (this.options.openOnPointerLockLost === false) return
+
+    /* Тот же путь к состоянию, что и в _onKeyDown(). Прежняя проверка
+     * this._svc('state') всегда была null-безопасной пустышкой, поэтому
+     * любая потеря pointer lock (alt-tab в меню, конец рейда, выход в
+     * итоги) насильно открывала ESC-меню и вешала цикл открытий. */
+    const currentState = this.ctx?.engine?.state
+    if (currentState !== STATE.GAMEPLAY && currentState !== STATE.PAUSED) return
+
     this.openMenu()
   }
 
@@ -1089,11 +1117,10 @@ export class EscapeMenuSystem {
     // 3. Вызываем встроенный метод ядра движка для безопасной очистки стейта
     if (this.ctx && this.ctx.engine && typeof this.ctx.engine.returnToMenu === 'function') {
       this.ctx.engine.returnToMenu()
-    } else {
-      // Фаллбэк на случай прямой подмены состояния
-      const state = this._svc('state')
+    } else if (this.ctx && this.ctx.engine && typeof this.ctx.engine.setState === 'function') {
+      // Фаллбэк: тот же стейт-менеджер ядра, легаси-сервис 'state' мёртв
       call(this._svc('mainMenu'), 'show')
-      call(state, 'set', STATE.MENU)
+      this.ctx.engine.setState(STATE.MENU)
     }
 
     this._emit('escape:exitToMenu', {})
