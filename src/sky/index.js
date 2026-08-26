@@ -1,8 +1,8 @@
 /* ==========================================================================
  * Escape-From-Larpov · src/sky/index.js
  *
- * Sky dome: atmospheric scattering (Rayleigh + Mie + aerosol) and a two-deck
- * cloud layer, drawn as one primitive centred on the camera.
+ * Sky subsystem: an atmosphere + two-deck cloud dome drawn as one primitive
+ * centred on the camera, plus the scene's sun light.
  *
  * ---------------------------------------------------------------------------
  * WHAT WAS BROKEN — fatal boot crash, black screen
@@ -10,390 +10,483 @@
  *   ReferenceError: SKY_FRAGMENT_SHADER is not defined
  *       at SkySystem.init (index.js:171:28)
  *
- * `init()` referenced SKY_VERTEX_SHADER and SKY_FRAGMENT_SHADER, but neither
- * was ever declared or imported in this file: the two GLSL constants were lost
- * in an earlier upload. The stubs left behind in the class body
- * («... дальше ваш конструктор и метод async init(ctx)») are from that same
- * truncated edit. Both shaders are restored below in full and are exported, so
- * the shader guard and any test can reach them.
+ * init() referenced SKY_VERTEX_SHADER and SKY_FRAGMENT_SHADER, but neither was
+ * ever declared or imported in this file: the two GLSL constants were lost in an
+ * earlier bulk upload, along with the bodies the leftover stubs pointed at
+ * («... дальше ваш конструктор и метод async init(ctx)»). Only two commits ever
+ * touched the file, both bulk uploads, so there was no good revision to recover:
+ * the shaders were rewritten from scratch and now live in ./shaders.js. They are
+ * re-exported below, so any existing import of them from this module still
+ * resolves.
  *
- * A second, latent black screen is fixed with them. The dome was scaled to 8000
+ * A second, latent black screen is fixed with it. The dome was scaled to 8000
  * while the gameplay camera's far plane is 1200 (src/core/engine.js), so every
- * dome vertex sat outside the frustum and the entire mesh was clipped away.
- * `depthTest: false` does not help — far-plane clipping happens in clip space,
- * before the depth test ever runs. The dome is now sized from `camera.far`, and
- * the vertex shader pins it to the far plane so its radius stops mattering.
+ * dome vertex sat outside the frustum and the whole mesh was clipped away.
+ * depthTest:false does not help — far-plane clipping happens in clip space,
+ * before the depth test runs. The dome is sized from camera.far now, and the
+ * vertex shader pins it to the far plane so its radius stops mattering.
  *
- * ---------------------------------------------------------------------------
- * [X3595] LOOP AND DERIVATIVE POLICY — do not regress this
- * ---------------------------------------------------------------------------
- * Every `for` loop in the fragment shader is bounded by a compile-time constant
- * that arrives through THREE.ShaderMaterial.defines (STEPS, LIGHT_STEPS), never
- * by a uniform, and no loop contains a `break`. The step counts are part of the
- * material's permutation key, so changing quality recompiles the program rather
- * than branching per pixel at runtime. `assertStaticLoopBounds` fails the build
- * loudly if that ever regresses.
- *
- * The shader is also completely free of implicit-derivative instructions:
- * texture reads use `textureLod()` with an analytically derived level, and edge
- * antialiasing uses fixed angular widths instead of `fwidth()`. That removes
- * the "gradient instruction used in a loop with varying iteration" class of
- * driver stalls at the root instead of working around it, and it is why the
- * cloud march may branch freely without paying for it.
- *
- * Cost, per pixel, at the `high` preset: STEPS (44) ALU-only atmosphere steps,
- * plus 3 texture reads for the cumulus density, LIGHT_STEPS (8) for its light
- * march and 2 for the cirrus veil. No nested marches, no render targets, no
- * per-frame allocation.
+ * [X3595] The loop and derivative policy that keeps the GPU driver from
+ * stalling is documented at the top of ./shaders.js and enforced by
+ * assertStaticLoopBounds() below, which runs before the material is built.
  *
  * ---------------------------------------------------------------------------
  * Registry contract (src/core/registry.js)
  * ---------------------------------------------------------------------------
- *   static id = 'sky'        unique id, fetched by others via ctx.get('sky')
- *   static deps = ['render'] the renderer must exist before we init
- *   async init(ctx)          builds every resource
- *   update(dt, ctx)          once per frame, before render
- *   dispose()                frees GPU resources
+ *   static id = 'sky'         fetched by others via ctx.get('sky')
+ *   static deps = ['render']  the renderer must exist before we init
+ *   async init(ctx)           builds every resource
+ *   update(dt, ctx)           once per frame, before render
+ *   dispose()                 frees GPU resources
  *
  * No sibling subsystem is imported: the renderer is resolved through ctx.
  * ========================================================================== */
 
 import * as THREE from 'three';
+import { SKY_VERTEX_SHADER, SKY_FRAGMENT_SHADER } from './shaders.js';
+
+export { SKY_VERTEX_SHADER, SKY_FRAGMENT_SHADER };
 
 /* --------------------------------------------------------------------------
  * Procedural tiling cloud noise.
  *
- * R, G and B hold value-noise FBM at three different base frequencies, so a
- * single texture read is worth three octaves in the shader. The mip pyramid is
- * what makes the shader's explicit LOD meaningful — without it, grazing rays
- * near the horizon alias into a shimmering mess.
+ * R, G and B hold value-noise FBM at three different base frequencies, so one
+ * texture read is worth three octaves in the shader. The mip pyramid is what
+ * makes the shader's explicit LOD meaningful — without it, grazing rays near the
+ * horizon alias into a shimmering mess.
  * ------------------------------------------------------------------------ */
-export function createCloudNoiseTexture(size = 256) {
-  const data = new Uint8Array(size * size * 4);
+export function createCloudNoiseTexture( size = 256 ) {
 
-  const hash = (x, y, seed) => {
-    const s = Math.sin(x * 127.1 + y * 311.7 + seed * 74.7) * 43758.5453123;
-    return s - Math.floor(s);
-  };
-  const fade = (t) => t * t * (3 - 2 * t);
+	const data = new Uint8Array( size * size * 4 );
 
-  const valueNoise = (u, v, freq, seed) => {
-    const fx = u * freq;
-    const fy = v * freq;
-    const ix = Math.floor(fx);
-    const iy = Math.floor(fy);
-    const tx = fade(fx - ix);
-    const ty = fade(fy - iy);
-    const wrap = (n) => ((n % freq) + freq) % freq;
-    const x0 = wrap(ix);
-    const x1 = wrap(ix + 1);
-    const y0 = wrap(iy);
-    const y1 = wrap(iy + 1);
-    const a = hash(x0, y0, seed);
-    const b = hash(x1, y0, seed);
-    const c = hash(x0, y1, seed);
-    const d = hash(x1, y1, seed);
-    return (a + (b - a) * tx) * (1 - ty) + (c + (d - c) * tx) * ty;
-  };
+	const hash = ( x, y, seed ) => {
+		const s = Math.sin( x * 127.1 + y * 311.7 + seed * 74.7 ) * 43758.5453123;
+		return s - Math.floor( s );
+	};
+	const fade = ( t ) => t * t * ( 3 - 2 * t );
 
-  const fbm = (u, v, base, seed) => {
-    let sum = 0;
-    let amp = 0.5;
-    let freq = base;
-    for (let o = 0; o < 4; o++) {
-      sum += valueNoise(u, v, freq, seed + o) * amp;
-      amp *= 0.5;
-      freq *= 2;
-    }
-    return sum;
-  };
+	const valueNoise = ( u, v, freq, seed ) => {
+		const fx = u * freq;
+		const fy = v * freq;
+		const ix = Math.floor( fx );
+		const iy = Math.floor( fy );
+		const tx = fade( fx - ix );
+		const ty = fade( fy - iy );
+		const wrap = ( n ) => ( ( n % freq ) + freq ) % freq;
+		const x0 = wrap( ix );
+		const x1 = wrap( ix + 1 );
+		const y0 = wrap( iy );
+		const y1 = wrap( iy + 1 );
+		const a = hash( x0, y0, seed );
+		const b = hash( x1, y0, seed );
+		const c = hash( x0, y1, seed );
+		const d = hash( x1, y1, seed );
+		return ( a + ( b - a ) * tx ) * ( 1 - ty ) + ( c + ( d - c ) * tx ) * ty;
+	};
 
-  const byte = (n) => Math.max(0, Math.min(255, Math.round(n * 255)));
+	const fbm = ( u, v, base, seed ) => {
+		let sum = 0;
+		let amp = 0.5;
+		let freq = base;
+		for ( let o = 0; o < 4; o ++ ) {
+			sum += valueNoise( u, v, freq, seed + o ) * amp;
+			amp *= 0.5;
+			freq *= 2;
+		}
+		return sum;
+	};
 
-  for (let y = 0; y < size; y++) {
-    for (let x = 0; x < size; x++) {
-      const u = x / size;
-      const v = y / size;
-      const i = (y * size + x) * 4;
-      data[i + 0] = byte(fbm(u, v, 4, 11));
-      data[i + 1] = byte(fbm(u, v, 8, 23));
-      data[i + 2] = byte(fbm(u, v, 16, 37));
-      data[i + 3] = 255;
-    }
-  }
+	const byte = ( n ) => Math.max( 0, Math.min( 255, Math.round( n * 255 ) ) );
 
-  const tex = new THREE.DataTexture(data, size, size, THREE.RGBAFormat);
-  tex.name = 'EFL_CloudNoise';
-  tex.wrapS = THREE.RepeatWrapping;
-  tex.wrapT = THREE.RepeatWrapping;
-  tex.minFilter = THREE.LinearMipmapLinearFilter;
-  tex.magFilter = THREE.LinearFilter;
-  tex.generateMipmaps = true;
-  /* Noise is data, not colour: it must never go through a transfer function. */
-  tex.colorSpace = THREE.NoColorSpace;
-  tex.needsUpdate = true;
-  return tex;
+	for ( let y = 0; y < size; y ++ ) {
+		for ( let x = 0; x < size; x ++ ) {
+			const u = x / size;
+			const v = y / size;
+			const i = ( y * size + x ) * 4;
+			data[ i + 0 ] = byte( fbm( u, v, 4, 11 ) );
+			data[ i + 1 ] = byte( fbm( u, v, 8, 23 ) );
+			data[ i + 2 ] = byte( fbm( u, v, 16, 37 ) );
+			data[ i + 3 ] = 255;
+		}
+	}
+
+	const tex = new THREE.DataTexture( data, size, size, THREE.RGBAFormat );
+	tex.name = 'EFL_CloudNoise';
+	tex.wrapS = THREE.RepeatWrapping;
+	tex.wrapT = THREE.RepeatWrapping;
+	tex.minFilter = THREE.LinearMipmapLinearFilter;
+	tex.magFilter = THREE.LinearFilter;
+	tex.generateMipmaps = true;
+	// Noise is data, not colour: it must never go through a transfer function.
+	tex.colorSpace = THREE.NoColorSpace;
+	tex.needsUpdate = true;
+	return tex;
+
 }
 
 /* --------------------------------------------------------------------------
- * Quality presets.
- *
- * These become #defines, i.e. part of the shader permutation key. STEPS is the
- * atmosphere march; LIGHT_STEPS is the in-cloud light march; CLOUDS compiles
- * the whole cloud path in or out.
+ * Quality presets. These become #defines, i.e. part of the shader permutation
+ * key: STEPS is the atmosphere march, LIGHT_STEPS the in-cloud light march, and
+ * CLOUDS compiles the entire cloud path in or out.
  * ------------------------------------------------------------------------ */
 export const SKY_QUALITY_PRESETS = {
-  low:    { STEPS: 16, LIGHT_STEPS: 4,  CLOUDS: 0 },
-  medium: { STEPS: 28, LIGHT_STEPS: 6,  CLOUDS: 1 },
-  high:   { STEPS: 44, LIGHT_STEPS: 8,  CLOUDS: 1 },
-  ultra:  { STEPS: 64, LIGHT_STEPS: 12, CLOUDS: 1 },
+	low: { STEPS: 16, LIGHT_STEPS: 4, CLOUDS: 0 },
+	medium: { STEPS: 28, LIGHT_STEPS: 6, CLOUDS: 1 },
+	high: { STEPS: 44, LIGHT_STEPS: 8, CLOUDS: 1 },
+	ultra: { STEPS: 64, LIGHT_STEPS: 12, CLOUDS: 1 },
 };
 
 /* --------------------------------------------------------------------------
- * Weather presets.
- *
- * rayleigh scales the molecular coefficients, mie the aerosol ones (1/Mm, so
- * the uniforms carry 5.8 / 13.5 / 33.1 at rayleigh = 1.0), turbidity the haze
- * on top of that. `overcast` is unchanged and remains the default.
+ * Weather presets. rayleigh scales the molecular coefficients, mie the aerosol
+ * ones, turbidity the haze on top of that. overcast is unchanged and remains the
+ * default look.
  * ------------------------------------------------------------------------ */
 export const SKY_WEATHER_PRESETS = {
-  clear:    { turbidity: 2.2, rayleigh: 1.00, mie: 0.0035, mieG: 0.76, coverage: 0.18, density: 22, exposure: 0.34 },
-  hazy:     { turbidity: 4.4, rayleigh: 1.20, mie: 0.0065, mieG: 0.74, coverage: 0.42, density: 32, exposure: 0.32 },
-  overcast: { turbidity: 6.5, rayleigh: 1.45, mie: 0.0090, mieG: 0.72, coverage: 0.72, density: 46, exposure: 0.30 },
-  storm:    { turbidity: 8.5, rayleigh: 1.60, mie: 0.0125, mieG: 0.70, coverage: 0.92, density: 68, exposure: 0.22 },
+	clear: { turbidity: 2.2, rayleigh: 1.00, mie: 0.0035, mieG: 0.76, coverage: 0.18, density: 22, exposure: 0.34 },
+	hazy: { turbidity: 4.4, rayleigh: 1.20, mie: 0.0065, mieG: 0.74, coverage: 0.42, density: 32, exposure: 0.32 },
+	overcast: { turbidity: 6.5, rayleigh: 1.45, mie: 0.0090, mieG: 0.72, coverage: 0.72, density: 46, exposure: 0.30 },
+	storm: { turbidity: 8.5, rayleigh: 1.60, mie: 0.0125, mieG: 0.70, coverage: 0.92, density: 68, exposure: 0.22 },
 };
 
+/**
+ * [X3595] Rejects any `for` loop whose bound is not a compile-time constant.
+ *
+ * Uppercase identifiers (STEPS, LIGHT_STEPS) and float(CONST) casts are the only
+ * accepted bounds, because those are the ones that reach the compiler as
+ * #defines from THREE.ShaderMaterial.defines. A uniform bound compiles into a
+ * loop with a varying iteration count, and any gradient instruction inside one
+ * makes the driver emit "gradient instruction used in a loop with varying
+ * iteration" — a compile stall on the render thread, i.e. a hitch mid-raid.
+ *
+ * The regex is built per call on purpose: a module-level /g regex keeps its
+ * lastIndex between calls and would silently skip half of the second shader it
+ * was handed.
+ */
+export function assertStaticLoopBounds( source, label = 'shader' ) {
+
+	const loopRe = /for\s*\(\s*(?:int|float|uint)\s+(\w+)\s*=\s*[^;]+;\s*\1\s*<=?\s*([A-Za-z_][\w.()]*)/g;
+	const bad = [];
+	let m;
+
+	while ( ( m = loopRe.exec( String( source ) ) ) !== null ) {
+		const bound = m[ 2 ];
+		const isConstant = /^[A-Z0-9_]+$/.test( bound ) || /^float\(\s*[A-Z0-9_]+\s*\)$/.test( bound );
+		if ( ! isConstant ) bad.push( bound );
+	}
+
+	if ( bad.length ) {
+		const msg = '[X3595] ' + label + ': dynamic loop bound -> ' + bad.join( ', ' ) +
+			'. Use a #define or a material define, never a uniform.';
+		console.error( msg );
+		throw new Error( msg );
+	}
+
+	return true;
+
+}
+
+/** Surfaces GLSL link/compile failures in the console instead of a black frame. */
+export function installShaderCompileGuard( renderer ) {
+
+	if ( ! renderer || ! renderer.debug ) return;
+
+	renderer.debug.checkShaderErrors = true;
+	renderer.debug.onShaderError = ( gl, program, vs, fs ) => {
+		console.error( '[EFL/shader] link failed', {
+			program: ( gl.getProgramInfoLog( program ) || '' ).trim(),
+			vertex: ( gl.getShaderInfoLog( vs ) || '' ).trim(),
+			fragment: ( gl.getShaderInfoLog( fs ) || '' ).trim(),
+		} );
+	};
+
+}
+
 /* ==========================================================================
- * GLSL — restored. GLSL ES 3.00, matching the rest of src/sky/.
+ * SkySystem
  * ========================================================================== */
+export class SkySystem {
 
-export const SKY_VERTEX_SHADER = /* glsl */ `
-out vec3 vRayDir;
+	static id = 'sky';
+	static deps = [ 'render' ];
 
-void main() {
-  /* The dome is re-centred on the camera every frame, so its object-space
-   * position is the view direction once the model rotation and scale are
-   * applied. Normalised in the fragment shader. */
-  vRayDir = mat3( modelMatrix ) * position;
+	constructor( options = {} ) {
 
-  vec4 clip = projectionMatrix * modelViewMatrix * vec4( position, 1.0 );
-  /* Pin the dome to the far plane. Without this a dome larger than camera.far
-   * is clipped away in clip space and the frame comes back black —
-   * depthTest:false cannot save it, because clipping happens before the depth
-   * test. With it, the dome radius stops mattering. */
-  clip.z = clip.w;
-  gl_Position = clip;
+		this.options = options;
+		this.ctx = null;
+		this.scene = null;
+		this.camera = null;
+		this.renderer = null;
+
+		this.uniforms = null;
+		this.material = null;
+		this.mesh = null;
+		this.sunLight = null;
+		this.noiseTexture = null;
+
+		this.quality = options.quality ?? 'high';
+		this.weather = options.weather ?? 'overcast';
+		this.elevation = options.elevation ?? 22;
+		this.azimuth = options.azimuth ?? 145;
+		this.timeScale = options.timeScale ?? 1;
+
+		this._elapsed = 0;
+		this._far = 0;
+
+	}
+
+	// Registry.get() throws for unregistered ids, so prefer the non-throwing
+	// peek(). 'render' is a declared dep, but the capture harness builds partial
+	// engines, and ctx itself carries no renderer.
+	_resolveRenderer( ctx ) {
+
+		let render = null;
+		try {
+			if ( ctx && typeof ctx.peek === 'function' ) render = ctx.peek( 'render' );
+			else if ( ctx && typeof ctx.get === 'function' ) render = ctx.get( 'render' );
+		} catch ( err ) {
+			render = null;
+		}
+
+		return render?.renderer ?? ctx?.renderer ?? ctx?.engine?.renderer ?? null;
+
+	}
+
+	_defines() {
+
+		const preset = SKY_QUALITY_PRESETS[ this.quality ] ?? SKY_QUALITY_PRESETS.high;
+		const defines = {
+			STEPS: preset.STEPS,
+			LIGHT_STEPS: preset.LIGHT_STEPS,
+			CLOUDS: preset.CLOUDS,
+		};
+
+		if ( this.renderer && this.renderer.outputColorSpace !== THREE.SRGBColorSpace ) {
+			defines.SRGB_ENCODE = 1;
+		}
+
+		return defines;
+
+	}
+
+	// Radius from the live far plane. engine.js builds the gameplay camera with
+	// far = 1200; a dome scaled past that used to be clipped away entirely, which
+	// is the second black screen this file had.
+	_domeRadius() {
+
+		const far = this.camera?.far ?? 1200;
+		return Math.max( 50, Math.min( far * 0.5, 8000 ) );
+
+	}
+
+	async init( ctx ) {
+
+		this.ctx = ctx;
+		this.scene = ctx?.scene ?? null;
+		this.camera = ctx?.camera ?? null;
+		this.renderer = this._resolveRenderer( ctx );
+
+		if ( SKY_QUALITY_PRESETS[ ctx?.config?.quality ] ) this.quality = ctx.config.quality;
+		if ( SKY_WEATHER_PRESETS[ ctx?.config?.weather ] ) this.weather = ctx.config.weather;
+
+		// Installed before the material exists, so our own link failures are the
+		// first thing it catches.
+		installShaderCompileGuard( this.renderer );
+
+		// Built here, not in the constructor: every subsystem is constructed
+		// synchronously inside engine.add(), and a 9-octave FBM on the main thread
+		// there is a visible boot hitch.
+		this.noiseTexture = createCloudNoiseTexture(
+			this.options.noiseSize ?? ( this.quality === 'low' ? 128 : 256 )
+		);
+
+		const w = SKY_WEATHER_PRESETS[ this.weather ] ?? SKY_WEATHER_PRESETS.overcast;
+
+		this.uniforms = {
+			uSunDirection: { value: new THREE.Vector3( 0.3, 0.4, 0.85 ).normalize() },
+			// 1/Mm units: 5.8 / 13.5 / 33.1 at rayleigh = 1.0. The shader scales to 1/m.
+			uRayleighCoeff: { value: new THREE.Vector3( 5.8, 13.5, 33.1 ).multiplyScalar( w.rayleigh ) },
+			uGroundAlbedo: { value: new THREE.Color( 0x2b2a26 ) },
+			uMieCoeff: { value: w.mie * 1e3 },
+			uMieG: { value: w.mieG },
+			uTurbidity: { value: w.turbidity },
+			uSunIntensity: { value: 20 },
+			uExposure: { value: w.exposure },
+			uTime: { value: 0 },
+			uCameraHeight: { value: 2 },
+			uCloudCoverage: { value: w.coverage },
+			uCloudDensity: { value: w.density },
+			uCloudAltitude: { value: 1400 },
+			uCloudSpeed: { value: 1 },
+			uCloudNoiseSize: { value: 12 },
+			uCloudNoise: { value: this.noiseTexture },
+		};
+
+		// [X3595] Fail loudly here rather than stalling the render thread later.
+		assertStaticLoopBounds( SKY_FRAGMENT_SHADER, 'src/sky/shaders.js#fragment' );
+
+		this.material = new THREE.ShaderMaterial( {
+			name: 'EFL_AtmosphereShader',
+			uniforms: this.uniforms,
+			vertexShader: SKY_VERTEX_SHADER,
+			fragmentShader: SKY_FRAGMENT_SHADER,
+			defines: this._defines(),
+			glslVersion: THREE.GLSL3,
+			side: THREE.BackSide,
+			depthWrite: false,
+			depthTest: false,
+			toneMapped: false,
+			transparent: false,
+			fog: false,
+			blending: THREE.NoBlending,
+		} );
+
+		this.mesh = new THREE.Mesh( new THREE.SphereGeometry( 1, 64, 40 ), this.material );
+		this.mesh.name = 'EFL_SkyDome';
+		this.mesh.frustumCulled = false;
+		this.mesh.renderOrder = -1000;
+		// Render contract: the sky must not pollute the depth/normal prepass or the
+		// shadow cascades.
+		this.mesh.userData.owNoPrepass = true;
+		this.mesh.userData.owNoShadow = true;
+
+		this._far = this.camera?.far ?? 1200;
+		this.mesh.scale.setScalar( this._domeRadius() );
+		if ( this.camera ) this.mesh.position.copy( this.camera.position );
+
+		this.sunLight = new THREE.DirectionalLight( 0xfff2e0, 2.2 );
+		this.sunLight.name = 'EFL_SunLight';
+		this.sunLight.castShadow = true;
+
+		if ( this.scene ) {
+			this.scene.add( this.mesh );
+			this.scene.add( this.sunLight );
+		}
+
+		this.setSunAngles( this.elevation, this.azimuth );
+
+	}
+
+	update( dt, ctx ) {
+
+		this._elapsed += ( dt || 0 ) * this.timeScale;
+		if ( ! this.uniforms ) return;
+		this.uniforms.uTime.value = this._elapsed;
+
+		const camera = this.camera ?? ctx?.camera ?? null;
+		if ( ! camera || ! this.mesh ) return;
+
+		// The dome rides the camera, so the horizon never slides.
+		this.uniforms.uCameraHeight.value = Math.max( 1, camera.position.y );
+		this.mesh.position.copy( camera.position );
+
+		if ( camera.far !== this._far ) {
+			this._far = camera.far;
+			this.mesh.scale.setScalar( this._domeRadius() );
+		}
+
+	}
+
+	/** Step counts are #defines, so this recompiles rather than branching. */
+	setQuality( name ) {
+
+		if ( ! SKY_QUALITY_PRESETS[ name ] || name === this.quality ) return;
+		this.quality = name;
+		if ( ! this.material ) return;
+		this.material.defines = this._defines();
+		this.material.needsUpdate = true;
+
+	}
+
+	setWeather( name ) {
+
+		const w = SKY_WEATHER_PRESETS[ name ];
+		if ( ! w ) return;
+		this.weather = name;
+		if ( ! this.uniforms ) return;
+
+		const u = this.uniforms;
+		u.uRayleighCoeff.value.set( 5.8, 13.5, 33.1 ).multiplyScalar( w.rayleigh );
+		u.uMieCoeff.value = w.mie * 1e3;
+		u.uMieG.value = w.mieG;
+		u.uTurbidity.value = w.turbidity;
+		u.uCloudCoverage.value = w.coverage;
+		u.uCloudDensity.value = w.density;
+		u.uExposure.value = w.exposure;
+
+		// Re-run so the sun light picks up the new air.
+		this.setSunAngles( this.elevation, this.azimuth );
+
+	}
+
+	setSunAngles( elevationDeg, azimuthDeg ) {
+
+		this.elevation = elevationDeg;
+		this.azimuth = azimuthDeg;
+
+		const phi = THREE.MathUtils.degToRad( 90 - elevationDeg );
+		const theta = THREE.MathUtils.degToRad( azimuthDeg );
+		const dir = new THREE.Vector3().setFromSphericalCoords( 1, phi, theta );
+
+		if ( this.uniforms ) this.uniforms.uSunDirection.value.copy( dir );
+
+		if ( this.sunLight ) {
+			this.sunLight.position.copy( dir ).multiplyScalar( 2000 );
+			this.sunLight.intensity = Math.max(
+				0.05,
+				Math.sin( THREE.MathUtils.degToRad( Math.max( elevationDeg, 0 ) ) ) * 2.6
+			);
+			this._applySunColour( dir.y );
+		}
+
+	}
+
+	// Sun colour from the same Chapman airmass and the same coefficients the
+	// shader uses, so the DirectionalLight can never disagree with the sky it
+	// hangs in. Hue only — normalised, so intensity stays where setSunAngles put
+	// it.
+	_applySunColour( mu ) {
+
+		const u = this.uniforms;
+		if ( ! u || ! this.sunLight ) return;
+
+		const R = 6371000;
+		const column = ( H ) => {
+			const c = Math.sqrt( 0.5 * Math.PI * ( R / H ) );
+			return ( c / ( c * Math.max( mu, 0 ) + 1 ) ) * H;
+		};
+		const amR = column( 8000 );
+		const amM = column( 1200 );
+
+		const br = u.uRayleighCoeff.value;
+		const bm = ( u.uMieCoeff.value * 1e-6 * ( 0.55 + 0.075 * u.uTurbidity.value ) ) / 0.9;
+		const r = Math.exp( - ( br.x * 1e-6 * amR + bm * amM ) );
+		const g = Math.exp( - ( br.y * 1e-6 * amR + bm * amM ) );
+		const b = Math.exp( - ( br.z * 1e-6 * amR + bm * amM ) );
+		const peak = Math.max( r, g, b, 1e-6 );
+
+		this.sunLight.color.setRGB( r / peak, g / peak, b / peak, THREE.LinearSRGBColorSpace );
+
+	}
+
+	dispose() {
+
+		if ( this.mesh ) {
+			this.mesh.parent?.remove( this.mesh );
+			this.mesh.geometry?.dispose();
+		}
+		if ( this.sunLight ) this.sunLight.parent?.remove( this.sunLight );
+
+		this.material?.dispose();
+		this.noiseTexture?.dispose();
+
+		this.mesh = null;
+		this.material = null;
+		this.sunLight = null;
+		this.noiseTexture = null;
+		this.uniforms = null;
+
+	}
+
 }
-`;
 
-export const SKY_FRAGMENT_SHADER = /* glsl */ `
-precision highp float;
-
-/* ---- compile-time quality knobs -----------------------------------------
- * Real values arrive through THREE.ShaderMaterial.defines (SkySystem._defines).
- * These fallbacks only exist so this source stays compilable standalone.
- * [X3595] They MUST stay #defines: every loop bound below is one of them. */
-#ifndef STEPS
-  #define STEPS 32
-#endif
-#ifndef LIGHT_STEPS
-  #define LIGHT_STEPS 6
-#endif
-#ifndef CLOUDS
-  #define CLOUDS 1
-#endif
-
-const float PI = 3.141592653589793;
-const float INV_PI = 0.3183098861837907;
-const float INV_4PI = 0.07957747154594767;
-
-/* Planetary shell, metres. */
-const float R_GROUND = 6371000.0;
-const float R_TOP = 6471000.0;
-const float H_RAY = 8000.0;
-const float H_MIE = 1200.0;
-const float X_RAY = R_GROUND / H_RAY;
-const float X_MIE = R_GROUND / H_MIE;
-
-/* Angular radius of the sun, and the factor it is drawn oversize by so it
- * survives TAA and the sharpen filter. Energy is divided by the area factor,
- * so a larger disc is not a brighter sun. */
-const float SUN_ANGULAR_R = 0.00465;
-const float SUN_DRAW_SCALE = 2.4;
-const float SUN_SOLID_ANGLE = 6.7935e-5;
-
-/* Energy returned by second- and higher-order scattering, which a
- * single-scattering integral cannot see. Without it the zenith is too dark and
- * an overcast sky goes grey-black instead of luminous. */
-const float MULTI_SCATTER = 0.55;
-
-uniform vec3 uSunDirection;
-uniform vec3 uRayleighCoeff;
-uniform vec3 uGroundAlbedo;
-uniform float uMieCoeff;
-uniform float uMieG;
-uniform float uTurbidity;
-uniform float uSunIntensity;
-uniform float uExposure;
-uniform float uTime;
-uniform float uCameraHeight;
-uniform float uCloudCoverage;
-uniform float uCloudDensity;
-uniform float uCloudAltitude;
-uniform float uCloudSpeed;
-uniform float uCloudNoiseSize;
-uniform sampler2D uCloudNoise;
-
-in vec3 vRayDir;
-layout(location = 0) out vec4 fragColor;
-
-/* ---- media ---------------------------------------------------------------
- * The presets carry the coefficients in the conventional 1/Mm units, so they
- * are scaled to 1/m here and nowhere else. */
-vec3 betaRayleigh() {
-  return max( uRayleighCoeff, vec3( 0.0 ) ) * 1.0e-6;
-}
-
-float betaMie() {
-  return max( uMieCoeff, 0.0 ) * 1.0e-6 * ( 0.55 + 0.075 * max( uTurbidity, 0.0 ) );
-}
-
-/* Aerosol single-scattering albedo is about 0.9, so extinction sits a little
- * above scattering. That difference is what greys a hazy horizon. */
-float betaMieExt() {
-  return betaMie() / 0.9;
-}
-
-/* Nearest positive hit of a ray against a sphere centred on the origin. */
-float raySphere( vec3 ro, vec3 rd, float radius ) {
-  float b = dot( ro, rd );
-  float c = dot( ro, ro ) - radius * radius;
-  float d = b * b - c;
-  if ( d < 0.0 ) return -1.0;
-  d = sqrt( d );
-  float t1 = -b + d;
-  if ( t1 < 0.0 ) return -1.0;
-  float t0 = -b - d;
-  return t0 < 0.0 ? t1 : t0;
-}
-
-float phaseRayleigh( float mu ) {
-  return 3.0 / ( 16.0 * PI ) * ( 1.0 + mu * mu );
-}
-
-float phaseHG( float mu, float g ) {
-  float g2 = g * g;
-  float d = max( 1.0e-4, 1.0 + g2 - 2.0 * g * mu );
-  return INV_4PI * ( 1.0 - g2 ) / ( d * sqrt( d ) );
-}
-
-/* Chapman function: column density along a ray leaving altitude h (in scale
- * heights) at zenith cosine mu, expressed in scale heights. Correct in both
- * limits that matter — 1.0 straight up, sqrt(pi*X/2) along the horizon — which
- * is what makes a low sun redden properly instead of merely dimming.
- *
- * Only the upward branch exists, deliberately: the analytic continuation for
- * downward rays contains exp(X), which overflows to Inf for a real planet and
- * would poison the frame. Rays that dive into the planet are handled by
- * sunVisibility() instead. */
-float chapman( float X, float h, float mu ) {
-  float c = sqrt( 0.5 * PI * ( X + h ) );
-  return c / ( c * max( mu, 0.0 ) + 1.0 ) * exp( -h );
-}
-
-/* Geometric terminator, softened by roughly the atmospheric refraction plus
- * the solar radius. Below it the light ray has crossed the planet. */
-float sunVisibility( float mu ) {
-  return smoothstep( -0.035, 0.020, mu );
-}
-
-/* Transmittance from an altitude out to space along a light ray. */
-vec3 lightTransmittance( float altitude, float mu ) {
-  float alt = max( altitude, 0.0 );
-  float hR = alt / H_RAY;
-  float hM = alt / H_MIE;
-  vec3 od = betaRayleigh() * ( H_RAY * chapman( X_RAY, hR, mu ) )
-          + vec3( betaMieExt() * ( H_MIE * chapman( X_MIE, hM, mu ) ) );
-  return exp( -od ) * sunVisibility( mu );
-}
-
-/* Sun irradiance reaching a given altitude, in scene light units. */
-vec3 sunIrradiance( float altitude, vec3 sunDir ) {
-  return vec3( max( uSunIntensity, 0.0 ) ) * lightTransmittance( altitude, sunDir.y );
-}
-
-/* ---- atmosphere ---------------------------------------------------------
- * Single scattering along the view ray. The light-ray optical depth comes from
- * chapman() analytically rather than from a nested march, which is what keeps
- * this to one loop: a nested STEPS x LIGHT_STEPS march is 350+ iterations per
- * pixel and is exactly the shape that stalls drivers.
- *
- * [X3595] One loop, bound by the STEPS #define, no break, no texture read, no
- * derivative. */
-void atmosphere( vec3 ro, vec3 rd, vec3 sunDir, out vec3 radiance, out vec3 viewTransmittance ) {
-  radiance = vec3( 0.0 );
-  viewTransmittance = vec3( 1.0 );
-
-  float tTop = raySphere( ro, rd, R_TOP );
-  float tGround = raySphere( ro, rd, R_GROUND );
-  float tMax = tGround > 0.0 ? tGround : tTop;
-  if ( tMax <= 0.0 ) return;
-
-  vec3 betaR = betaRayleigh();
-  float betaM = betaMie();
-  float betaMe = betaMieExt();
-
-  float mu = dot( rd, sunDir );
-  float pR = phaseRayleigh( mu );
-  float pM = phaseHG( mu, clamp( uMieG, -0.95, 0.95 ) );
-
-  float dt = tMax / float( STEPS );
-  float t = 0.5 * dt;
-  float odR = 0.0;
-  float odM = 0.0;
-  vec3 sumR = vec3( 0.0 );
-  vec3 sumM = vec3( 0.0 );
-
-  for ( int i = 0; i < STEPS; i ++ ) {
-    vec3 p = ro + rd * t;
-    float r = max( length( p ), R_GROUND );
-    float alt = r - R_GROUND;
-    float dR = exp( -alt / H_RAY );
-    float dM = exp( -alt / H_MIE );
-
-    odR += dR * dt;
-    odM += dM * dt;
-
-    vec3 tView = exp( -( betaR * odR + vec3( betaMe * odM ) ) );
-    vec3 tSun = lightTransmittance( alt, dot( p / r, sunDir ) );
-    vec3 w = tView * tSun * dt;
-
-    sumR += w * dR;
-    sumM += w * dM;
-    t += dt;
-  }
-
-  viewTransmittance = exp( -( betaR * odR + vec3( betaMe * odM ) ) );
-
-  float sun = max( uSunIntensity, 0.0 );
-  radiance = sun * ( betaR * ( pR * sumR ) + vec3( betaM * pM ) * sumM )
-           + sun * ( MULTI_SCATTER * INV_4PI ) * ( betaR * sumR + vec3( betaM ) * sumM );
-}
-
-#if CLOUDS
-
-/* One read is worth three octaves: createCloudNoiseTexture packs value noise at
- * frequencies 4, 8 and 16 into R, G and B.
- *
- * textureLod, never texture(): an implicit LOD inside a loop is precisely what
- * makes a driver emit "gradient instruction used in a loop with varying
- * iteration", and it is unnecessary here because the correct filter width is a
- * function of the ray elevation, which we know analytically. */
-float cloudTap( vec2 uv, float lod ) {
-  vec3 n = textureLod( uCloudNoise, uv, lod ).rgb;
-  return n.r * 0.55 + n.g * 0.30 + n.b * 0.15;
-}
-
-/* Nine effective octaves from three reads, manually unrolled — cheaper than a
- * loop and immune to it. */
-float cloudFbm( vec2 
+export default SkySystem;
