@@ -48,11 +48,13 @@ export class UiSystem {
     this._offState = null
     this._pendingResults = null
     this._progressBefore = null
+    this._resultsData = null        // накопленная сводка текущего показа итогов
+    this._shownSignature = null     // что именно визард уже показывает
     this._menuFacade = null
   }
 
   /* registry.get() БРОСАЕТ для незарегистрированного id, peek() — нет.
-   * Половина того, что спрашивал старый UI ('state', 'input', 'hud',
+   * Половина того, что спрашивал старый UI ('state', 'input',
    * 'mainMenu', 'postfx'), в реестре не регистрируется вообще. */
   _peek(id) {
     const ctx = this.ctx
@@ -151,9 +153,17 @@ export class UiSystem {
       }
 
       if (to === STATE.RESULTS) {
-        /* Сам визард открывает engine.showResults() через showRaidResults()
-         * сразу после setState — здесь только гасим HUD. */
+        /* Раньше здесь только гас HUD, а визард открывал исключительно
+         * engine.showResults(). Но в STATE.RESULTS можно попасть и прямым
+         * setState() — тогда игрок оставался на пустом экране. Теперь
+         * переход сам тянет сводку из RaidSystem и запускает отчёт;
+         * повторный показ гасит дедуп внутри showRaidResults(). */
         this.setHudVisible(false)
+        const raid = this._peek('raid')
+        const raidPayload = raid && typeof raid.getSummaryPayload === 'function'
+          ? raid.getSummaryPayload()
+          : null
+        this.showRaidResults(raidPayload)
         return
       }
 
@@ -193,6 +203,26 @@ export class UiSystem {
     }
   }
 
+  /* Сигнатура сводки. В STATE.RESULTS мы приходим дважды: сначала
+   * событием state из setState(), потом прямым вызовом engine.showResults().
+   * Без дедупа второй показ пересобирал DOM и сбрасывал визард на
+   * первый экран. */
+  _resultsSignature(data) {
+    const src = data && typeof data === 'object' ? data : {}
+    return [
+      src.kind || '',
+      Number(src.kills) || 0,
+      Number(src.xp) || 0,
+      Number(src.value) || 0,
+      Math.round(Number(src.time) || 0),
+      src.exit || '',
+      src.mapId || '',
+      src.faction || '',
+      src.night ? 1 : 0,
+      Array.isArray(src.killList) ? src.killList.length : -1,
+    ].join('|')
+  }
+
   showRaidResults(payload) {
     const data = payload && typeof payload === 'object' ? payload : {}
 
@@ -203,26 +233,42 @@ export class UiSystem {
     if (this.escapeMenu &&
         typeof this.escapeMenu.ownsResultsScreen === 'function' &&
         this.escapeMenu.ownsResultsScreen()) {
-      this._pendingResults = data
+      this._pendingResults = Object.assign({}, this._pendingResults || {}, data)
       return
     }
 
     /* Отложенная сводка из raid:end точнее фолбэка оверлея, поэтому побеждает. */
-    const merged = Object.assign({}, data, this._pendingResults || {})
+    const merged = Object.assign({}, this._resultsData || {}, data, this._pendingResults || {})
     this._pendingResults = null
 
-    if (this.raidResult && typeof this.raidResult.show === 'function') {
-      this.raidResult.show(Object.assign({}, merged, {
-        progressBefore: this._progressBefore,
-      }))
-    } else {
+    if (!this.raidResult || typeof this.raidResult.show !== 'function') {
       console.warn('[EFL/ui] RaidResultSystem недоступен, итоги рейда пропущены')
+      return
     }
+
+    const signature = this._resultsSignature(merged)
+    if (this.raidResult.isOpen) {
+      /* Те же данные — визард их уже показывает, второй show() лишний. */
+      if (signature === this._shownSignature) return
+      /* Игрок уже листает отчёт: данные докладываем, но экран не дёргаем. */
+      if ((Number(this.raidResult.stepIndex) || 0) > 0) {
+        this._resultsData = merged
+        return
+      }
+    }
+
+    this._resultsData = merged
+    this._shownSignature = signature
+    this.raidResult.show(Object.assign({}, merged, {
+      progressBefore: this._progressBefore,
+    }))
   }
 
   hideRaidResults() {
     this._pendingResults = null
     this._progressBefore = null
+    this._resultsData = null
+    this._shownSignature = null
     call(this.raidResult, 'close')
   }
 
@@ -264,7 +310,8 @@ export class UiSystem {
       document.documentElement.setAttribute('data-hud', on ? 'on' : 'off')
     }
 
-    /* 'hud' в реестр никто не добавляет, но контракт держим. */
+    /* Hud теперь регистрируется в main.js, но до его init() (и в дев-харнессах
+     * без HUD) переключатель видимости обязан молча работать. */
     const hud = this._peek('hud')
     if (hud) {
       if (typeof hud.setVisible === 'function') call(hud, 'setVisible', on)
@@ -321,6 +368,8 @@ export class UiSystem {
     this._menuFacade = null
     this._pendingResults = null
     this._progressBefore = null
+    this._resultsData = null
+    this._shownSignature = null
     this.audio = null
     this.ctx = null
   }

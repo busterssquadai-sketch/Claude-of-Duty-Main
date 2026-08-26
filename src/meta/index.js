@@ -189,14 +189,48 @@ export class MetaSystem {
     this.save();
   }
 
+  /**
+   * Публичное начисление опыта и фиксация его в профиль.
+   *
+   * До этого опыт умел зачислять только приватный _afterRaid() по событию
+   * raid:end, так что ни один экран UI не мог записать прогресс в профиль:
+   * meta.addExperience() просто не существовало.
+   *
+   * @param {number} amount — опыт за рейд (мусор и отрицательные гасятся в 0,
+   *   иначе undefined превратил бы P.xp в NaN и убил сейв).
+   * @param {{ commit?: boolean }} [opts] — commit: false откладывает запись на диск.
+   * @returns {{ lvl: number, xp: number, gained: number, leveledUp: boolean }}
+   */
+  addExperience(amount, opts = {}) {
+    const gained = Math.max(0, Math.round(Number(amount) || 0));
+    const lvlBefore = this.P.lvl;
+    if (gained <= 0) return { lvl: this.P.lvl, xp: this.P.xp, gained: 0, leveledUp: false };
+
+    /* Старые сейвы могли прийти без bp — иначе P.bp.xp упал бы с TypeError. */
+    if (!this.P.bp || typeof this.P.bp !== 'object') this.P.bp = { tier: 0, xp: 0 };
+
+    this.P.xp += gained;
+    while (this.P.xp >= this._need(this.P.lvl)) { this.P.xp -= this._need(this.P.lvl); this.P.lvl++; }
+
+    this.P.bp.xp += gained;
+    while (this.P.bp.xp >= 1200 && this.P.bp.tier < 53) { this.P.bp.xp -= 1200; this.P.bp.tier++; }
+
+    this._dirty = true;
+    const leveledUp = this.P.lvl > lvlBefore;
+    this.ctx?.events?.emit('meta:xp', { gained, lvl: this.P.lvl, xp: this.P.xp, leveledUp });
+    if (opts.commit !== false) this.save();             // фиксация в localStorage
+    return { lvl: this.P.lvl, xp: this.P.xp, gained, leveledUp };
+  }
+
   _afterRaid({ kind, summary }) {
+    const s = summary || {};
     this.P.stats.raids++;
     if (kind === 'survived') this.P.stats.survived++;
-    this.P.stats.kills += summary.kills;
-    this.P.xp += summary.xp;
-    while (this.P.xp >= this._need(this.P.lvl)) { this.P.xp -= this._need(this.P.lvl); this.P.lvl++; }
-    this.P.bp.xp += summary.xp;
-    while (this.P.bp.xp >= 1200 && this.P.bp.tier < 53) { this.P.bp.xp -= 1200; this.P.bp.tier++; }
+    this.P.stats.kills += Math.max(0, Math.round(Number(s.kills) || 0));
+    /* Опыт, боевой пропуск, уровни и коммит — внутри addExperience():
+     * единая точка начисления, чтобы экран итогов не посчитал тот же
+     * опыт второй раз. */
+    this.addExperience(s.xp);
     this._dirty = true;
     this.save();                                       // после рейда — сразу, кадры уже не важны
   }
