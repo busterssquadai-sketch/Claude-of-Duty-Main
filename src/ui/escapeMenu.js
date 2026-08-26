@@ -2,15 +2,21 @@
  * Escape-From-Larpov · src/ui/escapeMenu.js
  * ESC-меню внутри рейда: Пауза -> Предупреждение -> Дезертирство.
  * Полностью автономный модуль: DOM + scoped CSS + шрифты + логика движка.
+ *
+ * ВАЖНО: этот файл НЕ импортирует ./settingsMenu.js статически.
+ * settingsMenu.js импортирует ensureTarkovFonts отсюда, и статический
+ * импорт в обратную сторону замыкал ESM-цикл: при входе через ui/index.js
+ * тело escapeMenu.js прерывалось на импорте, settingsMenu.js исполнялся
+ * первым и видел половину модуля (все const-константы в TDZ). Панель
+ * настроек приходит снаружи через options.settingsFactory.
  * ========================================================================== */
-
-import * as SettingsModule from './settingsMenu.js'
 
 /* Единственный источник истины по состояниям — src/core/engine.js.
  * Значения строк ОБЯЗАНЫ совпадать с ядром посимвольно (нижний регистр):
- * engine.setState() пишет строку в data-game-state и сверяет её со списками
- * состояний систем из src/main.js. Любое расхождение (RESULT вместо RESULTS
- * или верхний регистр) глушит подсистемы и вешает движок. */
+ * Engine.setState() НЕ валидирует аргумент, он просто пишет то, что дали, в
+ * this.state и в data-game-state. Любая опечатка (RESULT вместо RESULTS или
+ * верхний регистр) кладёт state в undefined, и Engine._canRun() перестаёт
+ * пропускать вообще все игровые подсистемы. */
 export const STATE = Object.freeze({
   BOOT: 'boot',
   MENU: 'menu',
@@ -71,6 +77,8 @@ export const MAP_CATALOG = {
 
 /* --------------------------------------------------------------------------
  * Шрифты Google Fonts — подключаются самим модулем, один раз на документ.
+ * Объявлено как function declaration: settingsMenu.js импортирует именно эту
+ * функцию, и хойстинг делает её доступной даже при частичной инициализации.
  * ------------------------------------------------------------------------ */
 export function ensureTarkovFonts() {
   if (typeof document === 'undefined') return
@@ -91,10 +99,146 @@ export function ensureTarkovFonts() {
   document.head.appendChild(css)
 }
 
-/* Безопасный вызов метода подсистемы движка. */
-function call(target, method, ...args) {
-  if (target && typeof target[method] === 'function') return target[method](...args)
-  return undefined
+/* --------------------------------------------------------------------------
+ * Безопасный вызов метода подсистемы движка.
+ * Отсутствующий метод — не ошибка: подсистемы движка развиваются вразнобой, и
+ * UI не имеет права падать из-за того, что в AudioSystem ещё нет duck().
+ * try/catch добавлен намеренно: раньше исключение ВНУТРИ существующего метода
+ * пробивало UI насквозь и рвало стейт-машину.
+ * ------------------------------------------------------------------------ */
+export function call(target, method, ...args) {
+  if (!target) return undefined
+  const fn = target[method]
+  if (typeof fn !== 'function') return undefined
+  try {
+    return fn.apply(target, args)
+  } catch (err) {
+    if (typeof console !== 'undefined') console.warn('[EFL/ui] ' + method + '() бросил исключение, проигнорировано', err)
+    return undefined
+  }
+}
+
+function clamp01(v) {
+  const n = Number(v)
+  if (!Number.isFinite(n)) return 0
+  return n < 0 ? 0 : n > 1 ? 1 : n
+}
+
+/* --------------------------------------------------------------------------
+ * Звук интерфейса.
+ *
+ * AudioSystem.playUi(kind) уходит в play(kind, null, null), а тот берёт
+ * this._bank[kind]. В банке есть только процедурно отрендеренные виды:
+ * ui, click, hitmark, pickup, heal, door, loot и т.п. Имена вроде 'back',
+ * 'hover' или 'alert' банку неизвестны — play() тихо возвращал null, и
+ * половина интерфейса была беззвучной. Раскладываем псевдонимы на реальные
+ * виды банка.
+ * ------------------------------------------------------------------------ */
+export const UI_SOUND_ALIASES = {
+  ui: 'ui',
+  click: 'click',
+  ok: 'click',
+  confirm: 'click',
+  accept: 'click',
+  apply: 'click',
+  toggle: 'click',
+  back: 'ui',
+  cancel: 'ui',
+  close: 'ui',
+  open: 'ui',
+  hover: 'ui',
+  focus: 'ui',
+  tab: 'ui',
+  step: 'ui',
+  alert: 'hitmark',
+  warn: 'hitmark',
+  error: 'hitmark',
+  danger: 'hitmark',
+  levelup: 'pickup',
+  reward: 'pickup',
+  success: 'pickup',
+}
+
+export function playUiSound(audio, name) {
+  if (!audio) return
+  const key = typeof name === 'string' ? name : 'ui'
+  const kind = UI_SOUND_ALIASES[key] || 'ui'
+  if (typeof audio.playUi === 'function') {
+    call(audio, 'playUi', kind)
+    return
+  }
+  call(audio, 'play', kind, null, null)
+}
+
+/* --------------------------------------------------------------------------
+ * Совместимость с миксером AudioSystem.
+ *
+ * Реальная реализация src/audio/index.js умеет ровно это:
+ *   play, playUi, stun, setIndoor, setVolume, setMuted, setPaused, resume
+ *
+ * А UI исторически звал:
+ *   SettingsMenu   -> setMasterVolume, setUiVolume, setMusicVolume,
+ *                     setHideoutVolume, playMenuAmbience
+ *   EscapeMenu     -> duck, unduck, stopRaidAmbience, stopHideoutLoop,
+ *                     playMenuMusic
+ *
+ * Ни одного из них не существовало. Все вызовы шли через безопасный call() и
+ * просто исчезали — то есть ползунок общей громкости НИЧЕГО не делал, а звук
+ * никогда не приглушался на паузе. Ставим один адаптер на инстанс: после него
+ * все существующие места вызова становятся корректными, и ни одно из них не
+ * может бросить исключение.
+ * ------------------------------------------------------------------------ */
+export function installAudioCompat(audio) {
+  if (!audio || audio.__eflAudioCompat) return audio || null
+  try {
+    Object.defineProperty(audio, '__eflAudioCompat', { value: true, enumerable: false, configurable: true })
+  } catch (e) {
+    audio.__eflAudioCompat = true
+  }
+
+  const mix = {
+    master: typeof audio.masterVolume === 'number' ? audio.masterVolume : 0.75,
+    ui: 0.6,
+    music: 0.45,
+    hideout: 0.55,
+    duck: 1,
+  }
+  audio.mix = mix
+
+  const applyMaster = () => {
+    const v = clamp01(mix.master * mix.duck)
+    if (typeof audio.setVolume === 'function') {
+      call(audio, 'setVolume', v)
+      return
+    }
+    audio.masterVolume = v
+    if (audio.master && audio.master.gain) audio.master.gain.value = v
+  }
+
+  const define = (name, fn) => {
+    if (typeof audio[name] === 'function') return
+    audio[name] = fn
+  }
+
+  define('setMasterVolume', (v) => { mix.master = clamp01(v); applyMaster() })
+  define('getMasterVolume', () => mix.master)
+  define('setUiVolume', (v) => { mix.ui = clamp01(v) })
+  define('setMusicVolume', (v) => { mix.music = clamp01(v) })
+  define('setHideoutVolume', (v) => { mix.hideout = clamp01(v) })
+
+  /* duck(amount, fadeMs) — fade игнорируем, у мастер-гейна нет рампы. */
+  define('duck', (amount) => { mix.duck = clamp01(amount == null ? 0.35 : amount); applyMaster() })
+  define('unduck', () => { mix.duck = 1; applyMaster() })
+
+  /* Потоковых лупов в процедурном банке нет — безопасные заглушки, чтобы ни
+   * один вызов не превратился в TypeError. */
+  define('stopRaidAmbience', () => {})
+  define('stopHideoutLoop', () => {})
+  define('stopMenuMusic', () => {})
+  define('playMenuMusic', () => {})
+  define('playMenuAmbience', () => {})
+
+  return audio
 }
 
 function pad2(n) {
@@ -102,7 +246,7 @@ function pad2(n) {
 }
 
 export function formatRaidClock(ms) {
-  const total = Math.max(0, Math.floor(ms / 1000))
+  const total = Math.max(0, Math.floor((Number(ms) || 0) / 1000))
   const h = Math.floor(total / 3600)
   const m = Math.floor((total % 3600) / 60)
   const s = total % 60
@@ -585,22 +729,27 @@ const LEVEL_CLAW = `
 
 /* ==========================================================================
  * EscapeMenuSystem
+ *
+ * ЕДИНСТВЕННЫЙ владелец клавиши Escape во всём проекте. Раньше их было два:
+ * здесь (document, capture) и в UiSystem (window, capture). Оконный слушатель
+ * срабатывал первым и звал stopPropagation(), поэтому этот вообще не получал
+ * событие, а логика паузы жила в двух местах сразу. Оконный удалён.
  * ========================================================================== */
 export class EscapeMenuSystem {
   constructor(ctx, options = {}) {
     this.ctx = ctx
-    this.options = options
+    this.options = options || {}
 
     this.root = null
     this.screen = null
     this.open = false
     this.destroyed = false
 
-    this.buildVersion = options.buildVersion || '1.1.0.1.46911'
-    this.raidMode = options.raidMode || 'TRAINING'
-    this.gameMode = options.gameMode || 'PvE'
-    this.graceSeconds = options.graceSeconds != null ? options.graceSeconds : 30
-    this.canvasSelector = options.canvasSelector || 'canvas'
+    this.buildVersion = this.options.buildVersion || '1.1.0.1.46911'
+    this.raidMode = this.options.raidMode || 'TRAINING'
+    this.gameMode = this.options.gameMode || 'PvE'
+    this.graceSeconds = this.options.graceSeconds != null ? this.options.graceSeconds : 30
+    this.canvasSelector = this.options.canvasSelector || 'canvas'
 
     this.settingsMenu = null
     this._graceLeft = this.graceSeconds
@@ -608,6 +757,8 @@ export class EscapeMenuSystem {
     this._clockTimer = null
     this._deserted = false
     this._raidElapsedMs = 0
+    this._fallbackStart = 0
+    this._kbBound = false
 
     this._onKeyDown = this._onKeyDown.bind(this)
     this._onClick = this._onClick.bind(this)
@@ -616,600 +767,23 @@ export class EscapeMenuSystem {
     ensureTarkovFonts()
     this._injectStyles()
 
-    document.addEventListener('keydown', this._onKeyDown, true)
-    document.addEventListener('pointerlockchange', this._onPointerLockChange, false)
+    /* Адаптер миксера ставим сразу: SettingsMenu могла быть создана раньше и
+     * уже прогнать applyAll() — повторная установка идемпотентна. */
+    installAudioCompat(this._svc('audio'))
+
+    if (typeof document !== 'undefined') {
+      document.addEventListener('keydown', this._onKeyDown, true)
+      document.addEventListener('pointerlockchange', this._onPointerLockChange, false)
+    }
   }
 
   /* ---------------------------------------------------------------- utils */
+  /* Registry хранит ТОЛЬКО подсистемы со static id. В нём нет и никогда не
+   * было 'state', 'input', 'bus', 'events', 'hud' и 'mainMenu' — все обращения
+   * к ним возвращали null, а значит молча теряли переходы состояний, не
+   * выключали ввод и не публиковали события. Ниже — правильные пути. */
   _svc(name) {
-    if (!this.ctx || typeof this.ctx.get !== 'function') return null
-    try { return this.ctx.get(name) } catch (e) { return null }
-  }
-
-  _injectStyles() {
-    if (document.getElementById('efl-escape-menu-css')) return
-    const style = document.createElement('style')
-    style.id = 'efl-escape-menu-css'
-    style.textContent = ESCAPE_MENU_CSS
-    document.head.appendChild(style)
-  }
-
-  _emit(event, payload) {
-    const bus = this._svc('bus') || this._svc('events')
-    call(bus, 'emit', event, payload)
-    if (typeof this.options.onEvent === 'function') this.options.onEvent(event, payload)
-  }
-
-  _ui(sound) {
-    call(this._svc('audio'), 'playUi', sound)
-  }
-
-  get currentMap() {
-    const raid = this._svc('raid')
-    const id = (raid && (raid.mapId || raid.map)) || this.options.mapId || 'factory'
-    return MAP_CATALOG[id] || MAP_CATALOG.factory
-  }
-
-  get playerLevel() {
-    const player = this._svc('player')
-    if (player && player.level != null) return player.level
-    const raid = this._svc('raid')
-    if (raid && raid.level != null) return raid.level
-    return this.options.level != null ? this.options.level : 41
-  }
-
-  get nickname() {
-    const player = this._svc('player')
-    if (player && player.nickname) return player.nickname
-    return this.options.nickname || 'SBEU_BABUINOV'
-  }
-
-  get raidStartedAt() {
-    const raid = this._svc('raid')
-    if (raid && raid.startedAt) return raid.startedAt
-    if (!this._fallbackStart) this._fallbackStart = Date.now()
-    return this._fallbackStart
-  }
-
-  /* --------------------------------------------------------------- keys */
-  _onKeyDown(event) {
-    if (this.destroyed || event.code !== 'Escape') return
-
-    /* Настройки поверх меню закрываются первыми и не зависят от состояния. */
-    if (this.settingsMenu && this.settingsMenu.isOpen) {
-      event.preventDefault()
-      event.stopPropagation()
-      this.settingsMenu.close()
-      return
-    }
-
-    /* Состояние читаем напрямую из ядра. Раньше здесь был мёртвый
-     * this._svc('state'): он всегда отдавал null, current молча падал в
-     * STATE.GAMEPLAY, и ESC открывал рейдовое меню в главном меню, на
-     * загрузке и на экране итогов, зацикливая переходы. */
-    const currentState = this.ctx?.engine?.state
-
-    if (!this.open) {
-      if (currentState !== STATE.GAMEPLAY && currentState !== STATE.PAUSED) return
-      event.preventDefault()
-      event.stopPropagation()
-      this.openMenu()
-      return
-    }
-
-    /* Меню открыто: закрывать/листать экраны можно только пока рейд жив.
-     * В STATE.RESULTS (дезертирство) ESC не должен возвращать в рейд. */
-    if (currentState !== STATE.GAMEPLAY && currentState !== STATE.PAUSED) return
-
-    event.preventDefault()
-    event.stopPropagation()
-    if (this.screen === ESC_SCREEN.PAUSE) this.resumeGameplay()
-    else if (this.screen === ESC_SCREEN.ABANDON) this.showScreen(ESC_SCREEN.PAUSE)
-  }
-
-  _onPointerLockChange() {
-    if (this.destroyed || this.open) return
-    if (document.pointerLockElement) return
-    if (this.options.openOnPointerLockLost === false) return
-
-    /* Тот же путь к состоянию, что и в _onKeyDown(). Прежняя проверка
-     * this._svc('state') всегда была null-безопасной пустышкой, поэтому
-     * любая потеря pointer lock (alt-tab в меню, конец рейда, выход в
-     * итоги) насильно открывала ESC-меню и вешала цикл открытий. */
-    const currentState = this.ctx?.engine?.state
-    if (currentState !== STATE.GAMEPLAY && currentState !== STATE.PAUSED) return
-
-    this.openMenu()
-  }
-
-  /* --------------------------------------------------------------- open */
-  /* Односторонний поток данных: ESC-меню не источник истины по состоянию.
-   * Пока ядро не в STATE.PAUSED, openMenu() только толкает переход и выходит,
-   * а разметку рисует уже повторный вход из ctx.events.on('state') ->
-   * UiSystem._onStateTransition() -> escapeMenu.openMenu(). Флаг this.open
-   * поднимается только на проходе с рендером, поэтому рекурсия гаснет на
-   * первой же итерации, а не зацикливается. */
-  openMenu() {
-    if (this.open || this.destroyed) return
-
-    /* Ядро ещё в рейде: отдаём переход стейт-машине и ждём её события. */
-    const engine = this.ctx?.engine
-    if (engine && typeof engine.setState === 'function' && engine.state !== STATE.PAUSED) {
-      engine.setState(STATE.PAUSED)
-      return
-    }
-
-    /* Ядро уже в STATE.PAUSED (или движка нет вовсе — автономный режим):
-     * переход не дублируем, просто собираем и показываем экран паузы. */
-    this.open = true
-
-    call(this._svc('raid'), 'pause')
-    call(this._svc('input'), 'setEnabled', false)
-    call(this._svc('audio'), 'duck', 0.35, 180)
-    if (document.exitPointerLock) document.exitPointerLock()
-
-    this._render()
-    this.showScreen(ESC_SCREEN.PAUSE)
-    requestAnimationFrame(() => this.root && this.root.classList.add('is-visible'))
-    this._emit('escape:opened', {})
-  }
-
-  /* Закрытие тоже односторонее: сначала снимаем DOM и флаг this.open, только
-   * потом сообщаем ядру. Обратный вызов UiSystem на (PAUSED -> GAMEPLAY)
-   * упрётся в !this.open и выйдет, а сверка engine.state не даёт послать
-   * второй setState(GAMEPLAY). */
-  resumeGameplay() {
-    if (!this.open || this._deserted) return
-    this._ui('back')
-    this._teardownDom()
-    this.open = false
-
-    call(this._svc('raid'), 'resume')
-    call(this._svc('input'), 'setEnabled', true)
-    call(this._svc('audio'), 'unduck', 220)
-
-    const canvas = document.querySelector(this.canvasSelector)
-    if (canvas && canvas.requestPointerLock) canvas.requestPointerLock()
-
-    /* Снятие паузы идёт напрямую через стейт-менеджер ядра. Легаси-сервиса
-     * 'state' в контейнере больше нет: _svc('state') отдавал null, и вызов
-     * call(state, 'set', STATE.GAMEPLAY) молча терял переход — игровой цикл
-     * оставался замороженным. Тот же путь, что и в desertRaid(). */
-    const engine = this.ctx?.engine
-    if (engine && typeof engine.setState === 'function' && engine.state !== STATE.GAMEPLAY) {
-      engine.setState(STATE.GAMEPLAY)
-    }
-    this._emit('escape:resumed', {})
-  }
-
-  /* ------------------------------------------------------------- render */
-  _render() {
-    if (this.root) return
-    const root = document.createElement('div')
-    root.className = 'efl-esc'
-    root.setAttribute('role', 'dialog')
-    root.setAttribute('aria-modal', 'true')
-    root.innerHTML =
-      '<div class="efl-esc__backdrop"></div>' +
-      '<div class="efl-esc__grain"></div>' +
-      '<div class="efl-esc__vignette"></div>' +
-      this._renderPauseScreen() +
-      this._renderAbandonScreen() +
-      this._renderDesertedScreen() +
-      this._renderShellBar()
-
-    root.addEventListener('click', this._onClick)
-    document.body.appendChild(root)
-    this.root = root
-
-    const shot = root.querySelector('[data-role="map-shot"]')
-    if (shot) {
-      shot.addEventListener('error', () => {
-        shot.classList.add('efl-esc__map-shot--fallback')
-        shot.removeAttribute('src')
-      })
-    }
-  }
-
-  _renderShellBar() {
-    if (this.options.showShellBar === false) return ''
-    const left = ['ГЛАВНОЕ МЕНЮ', 'УБЕЖИЩЕ']
-    const right = ['ПЕРСОНАЖ', 'ТОРГОВЦЫ', 'БАРАХОЛКА', 'СБОРКИ', 'СПРАВОЧНИК', 'СООБЩЕНИЯ', 'ОПРОС', 'РАСШИРЕНИЯ']
-    const item = t => '<span>' + t + '</span>'
-    return (
-      '<div class="efl-esc__shell">' +
-        '<div class="efl-esc__shell-group">' + left.map(item).join('') + '</div>' +
-        '<div class="efl-esc__shell-group efl-esc__shell-group--right">' + right.map(item).join('') + '</div>' +
-      '</div>'
-    )
-  }
-
-  _buildString() {
-    return [this.buildVersion, this.raidMode, this.gameMode].join(' | ')
-  }
-
-  _renderLevelBadge() {
-    return (
-      '<div class="efl-esc__level">' +
-        LEVEL_CLAW +
-        '<span class="efl-esc__level-value" data-role="level">' + this.playerLevel + '</span>' +
-      '</div>'
-    )
-  }
-
-  /* ---------------------------------------------------- SCREEN 1: ПАУЗА */
-  _renderPauseScreen() {
-    return (
-      '<section class="efl-esc__screen" data-screen="pause">' +
-        '<div class="efl-esc__stack">' +
-          '<button type="button" class="efl-esc__big efl-esc__big--danger" data-act="abandon">ОТКЛЮЧИТЬСЯ</button>' +
-          '<button type="button" class="efl-esc__big" data-act="resume">ВЕРНУТЬСЯ</button>' +
-        '</div>' +
-        '<div class="efl-esc__build" data-role="build">' + this._buildString() + '</div>' +
-        '<div class="efl-esc__gear" data-act="settings" role="button" tabindex="0" title="Настройки">' + ICON_GEAR + '</div>' +
-      '</section>'
-    )
-  }
-
-  /* ------------------------------------- SCREEN 2: ВОЗВРАЩАЙТЕСЬ В РЕЙД */
-  _renderAbandonScreen() {
-    const map = this.currentMap
-    const dots = new Array(11).fill(0)
-      .map((v, i) => '<span class="efl-esc__dot' + (i === 0 ? ' is-active' : '') + '"></span>').join('')
-
-    return (
-      '<section class="efl-esc__screen" data-screen="abandon">' +
-        '<h1 class="efl-esc__title">ВОЗВРАЩАЙТЕСЬ В РЕЙД</h1>' +
-        '<p class="efl-esc__subtitle">Не пытайтесь покинуть его</p>' +
-
-        '<div class="efl-esc__body">' +
-          '<div class="efl-esc__pmc">' +
-            this._renderLevelBadge() +
-            (this.options.portrait
-              ? '<img class="efl-esc__pmc-art" src="' + this.options.portrait + '" alt="" />'
-              : PMC_SILHOUETTE) +
-          '</div>' +
-
-          '<div class="efl-esc__map" style="--efl-map-accent:' + map.accent + '">' +
-            '<span class="efl-esc__map-tag">' + map.title + '</span>' +
-            '<img class="efl-esc__map-shot" data-role="map-shot" src="' + map.thumbnail + '" alt="' + map.title + '" />' +
-            '<div class="efl-esc__map-info">' +
-              '<div class="efl-esc__map-name">' + map.title + '</div>' +
-              '<div class="efl-esc__map-desc">' + map.description + '</div>' +
-            '</div>' +
-            '<div class="efl-esc__dots">' + dots + '</div>' +
-          '</div>' +
-        '</div>' +
-
-        '<div class="efl-esc__alert">' +
-          '<div class="efl-esc__alert-icon">' + ICON_ALERT + '</div>' +
-          '<div>' +
-            '<div class="efl-esc__alert-title">Внимание! Вы пытаетесь покинуть рейд из-за разрыва соединения или намеренно.</div>' +
-            '<div class="efl-esc__alert-text">Пожалуйста, избегайте покидания рейда подобным способом. Ваш персонаж остался в рейде без вашего контроля. У вас есть ограниченный запас времени на возвращение в рейд.</div>' +
-          '</div>' +
-        '</div>' +
-
-        '<div class="efl-esc__grace">' +
-          '<span>Время на возвращение</span>' +
-          '<span class="efl-esc__grace-value" data-role="grace">00:' + pad2(this.graceSeconds) + '</span>' +
-        '</div>' +
-
-        '<div class="efl-esc__footer">' +
-          '<button type="button" class="efl-esc__big" data-act="back">НАЗАД</button>' +
-          '<button type="button" class="efl-esc__big efl-esc__big--danger" data-act="confirm-desert">ПОКИНУТЬ РЕЙД</button>' +
-        '</div>' +
-
-        '<div class="efl-esc__build">' + this._buildString() + '</div>' +
-        '<div class="efl-esc__gear" data-act="settings" role="button" tabindex="0" title="Настройки">' + ICON_GEAR + '</div>' +
-      '</section>'
-    )
-  }
-
-  /* --------------------------------------------- SCREEN 3: РЕЙД ОКОНЧЕН */
-  _renderDesertedScreen() {
-    return (
-      '<section class="efl-esc__screen" data-screen="deserted">' +
-        '<h1 class="efl-esc__title">РЕЙД ОКОНЧЕН</h1>' +
-        '<p class="efl-esc__subtitle">Досрочное завершение</p>' +
-
-        '<div class="efl-esc__result">' +
-          '<div class="efl-esc__result-figure">' +
-            this._renderLevelBadge() +
-            (this.options.portrait
-              ? '<img class="efl-esc__pmc-art" src="' + this.options.portrait + '" alt="" />'
-              : PMC_SILHOUETTE) +
-          '</div>' +
-
-          '<div class="efl-esc__nickname">' + ICON_USER + '<span data-role="nickname">' + this.nickname + '</span></div>' +
-
-          '<div class="efl-esc__verdict">' +
-            '<div class="efl-esc__badge">' + ICON_EXIT + '<span>Дезертир</span></div>' +
-            '<div class="efl-esc__clock">' +
-              '<div>' +
-                '<div class="efl-esc__clock-label">Время рейда:</div>' +
-                '<div class="efl-esc__clock-row">' + ICON_CLOCK +
-                  '<span class="efl-esc__clock-value" data-role="raid-clock">00:00:00</span>' +
-                '</div>' +
-              '</div>' +
-            '</div>' +
-          '</div>' +
-
-          '<div class="efl-esc__exp">' +
-            '<span class="efl-esc__exp-tag">EXP</span>' +
-            '<span class="efl-esc__exp-value" data-role="exp">0</span>' +
-          '</div>' +
-        '</div>' +
-
-        '<div class="efl-esc__alert efl-esc__alert--center">' +
-          '<div class="efl-esc__alert-icon">' + ICON_ALERT + '</div>' +
-          '<div>' +
-            '<div class="efl-esc__alert-title">Внимание! Вы покинули рейд и лишились всего снаряжения.</div>' +
-            '<div class="efl-esc__alert-text">Когда вы покидаете рейд, вы теряете всё найденное и также получаете статус "Покинул Игру".</div>' +
-          '</div>' +
-        '</div>' +
-
-        '<div class="efl-esc__footer">' +
-          '<button type="button" class="efl-esc__big" data-act="next">ДАЛЕЕ</button>' +
-          '<button type="button" class="efl-esc__big" data-act="main-menu">ГЛАВНОЕ МЕНЮ</button>' +
-        '</div>' +
-
-        '<div class="efl-esc__build">' + [this.buildVersion, this.gameMode].join(' | ') + '</div>' +
-      '</section>'
-    )
-  }
-
-  /* --------------------------------------------------- переключение экранов */
-  showScreen(name) {
-    if (!this.root) this._render()
-    if (this.screen === name) return
-    this.screen = name
-
-    const screens = this.root.querySelectorAll('.efl-esc__screen')
-    for (let i = 0; i < screens.length; i++) {
-      const el = screens[i]
-      el.classList.toggle('is-active', el.getAttribute('data-screen') === name)
-    }
-
-    this._bindKeyboardActivation()
-
-    if (name === ESC_SCREEN.ABANDON) this._startGraceCountdown()
-    else this._stopGraceCountdown()
-
-    if (name !== ESC_SCREEN.DESERTED) this._stopStopwatch()
-
-    const first = this.root.querySelector('.efl-esc__screen.is-active [data-act]')
-    if (first && typeof first.focus === 'function') first.focus()
-
-    this._emit('escape:screen', { screen: name })
-  }
-
-  _bindKeyboardActivation() {
-    if (!this.root || this._kbBound) return
-    this._kbBound = true
-    this.root.addEventListener('keydown', event => {
-      if (event.key !== 'Enter' && event.key !== ' ') return
-      const target = event.target && event.target.closest ? event.target.closest('[data-act]') : null
-      if (!target) return
-      event.preventDefault()
-      target.click()
-    })
-  }
-
-  /* ------------------------------------------------ таймер возврата в рейд */
-  _paintGrace() {
-    const el = this.root && this.root.querySelector('[data-role="grace"]')
-    if (!el) return
-    const left = Math.max(0, this._graceLeft)
-    el.textContent = '00:' + pad2(left)
-    el.classList.toggle('is-critical', left <= 10)
-  }
-
-  _startGraceCountdown() {
-    this._stopGraceCountdown()
-    if (this.graceSeconds <= 0) return
-    this._graceLeft = this.graceSeconds
-    this._paintGrace()
-    this._graceTimer = setInterval(() => {
-      this._graceLeft -= 1
-      this._paintGrace()
-      if (this._graceLeft <= 0) {
-        this._stopGraceCountdown()
-        this.desertRaid()
-      }
-    }, 1000)
-  }
-
-  _stopGraceCountdown() {
-    if (this._graceTimer) clearInterval(this._graceTimer)
-    this._graceTimer = null
-  }
-
-  /* ------------------------------------------------------- секундомер рейда */
-  _startStopwatch() {
-    this._stopStopwatch()
-    const paint = () => {
-      const el = this.root && this.root.querySelector('[data-role="raid-clock"]')
-      if (!el) return
-      const ms = this.options.liveStopwatch === false
-        ? this._raidElapsedMs
-        : Date.now() - this.raidStartedAt
-      el.textContent = formatRaidClock(ms)
-    }
-    paint()
-    this._clockTimer = setInterval(paint, 200)
-  }
-
-  _stopStopwatch() {
-    if (this._clockTimer) clearInterval(this._clockTimer)
-    this._clockTimer = null
-  }
-
-  /* --------------------------------------------------------- меню настроек */
-  openSettings() {
-    if (!this.settingsMenu) {
-      const factory = this.options.settingsFactory
-      this.settingsMenu = typeof factory === 'function'
-        ? factory(this.ctx)
-        : new SettingsModule.SettingsMenu(this.ctx, {
-            zIndex: 9600,
-            onClose: () => this._emit('settings:closed', {}),
-          })
-    }
-    this.settingsMenu.open()
-    this._emit('settings:opened', {})
-  }
-
-  /* ------------------------------------------------------------ дезертирство */
-  desertRaid() {
-    if (this._deserted) return
-    this._deserted = true
-    this._raidElapsedMs = Date.now() - this.raidStartedAt
-
-    const raid = this._svc('raid')
-    const player = this._svc('player')
-
-    /* 1. Фиксируем итог рейда и полностью гасим симуляцию. */
-    if (raid && raid.stats) {
-      raid.stats.experience = 0
-      raid.stats.survived = false
-      raid.stats.exitStatus = 'Дезертир'
-      raid.stats.durationMs = this._raidElapsedMs
-    }
-    if (raid && typeof raid.teardown === 'function') raid.teardown()
-
-    /* 2. Статус MIA: ПМК теряет всё снаряжение, взятое в рейд. */
-    const inventory = player && player.inventory
-    if (inventory) {
-      if (typeof inventory.clear === 'function') inventory.clear()
-      else if (Array.isArray(inventory.items)) inventory.items.length = 0
-      if (inventory.slots && typeof inventory.slots === 'object') {
-        Object.keys(inventory.slots).forEach(slot => { inventory.slots[slot] = null })
-      }
-      call(inventory, 'setStatus', 'MIA')
-    }
-    call(player, 'setStatus', 'MIA')
-
-    /* 3. Опыт за рейд обнуляется. */
-    if (player) {
-      player.raidExperience = 0
-      if (player.pendingExperience != null) player.pendingExperience = 0
-    }
-
-    /* 4. Переход на экран 3 с живым секундомером. */
-    this._stopGraceCountdown()
-    this.showScreen(ESC_SCREEN.DESERTED)
-    this._startStopwatch()
-
-    const audio = this._svc('audio')
-    call(audio, 'stopRaidAmbience')
-    call(audio, 'playUi', 'alert')
-
-    if (this.ctx && this.ctx.engine && typeof this.ctx.engine.setState === 'function') {
-      this.ctx.engine.setState(STATE.RESULTS)
-    }
-    this._emit('raid:deserted', { durationMs: this._raidElapsedMs, experience: 0, status: 'Дезертир' })
-  }
-
-  /* ------------------------------------------------------ выход в главное меню */
-  exitToMainMenu() {
-    // 1. Очищаем все оверлеи DOM
-    this.destroyOverlay()
-
-    // 2. Возвращаем нормальное микширование звуков
-    const audio = this._svc('audio')
-    call(audio, 'unduck', 300)
-    call(audio, 'stopRaidAmbience')
-    call(audio, 'stopHideoutLoop')
-    call(audio, 'playMenuMusic')
-
-    // 3. Вызываем встроенный метод ядра движка для безопасной очистки стейта
-    if (this.ctx && this.ctx.engine && typeof this.ctx.engine.returnToMenu === 'function') {
-      this.ctx.engine.returnToMenu()
-    } else if (this.ctx && this.ctx.engine && typeof this.ctx.engine.setState === 'function') {
-      // Фаллбэк: тот же стейт-менеджер ядра, легаси-сервис 'state' мёртв
-      call(this._svc('mainMenu'), 'show')
-      this.ctx.engine.setState(STATE.MENU)
-    }
-
-    this._emit('escape:exitToMenu', {})
-  }
-
-  destroyOverlay() {
-    if (this.settingsMenu && this.settingsMenu.isOpen) this.settingsMenu.close()
-    this._teardownDom()
-    this.open = false
-    this._deserted = false
-  }
-
-  /* --------------------------------------------------------- снос DOM-оверлея */
-  /* Единственная точка удаления DOM. Вызывается из resumeGameplay() и
-   * destroyOverlay() — раньше метод отсутствовал в классе, и любой выход из
-   * ESC-меню падал с TypeError: this._teardownDom is not a function, унося с
-   * собой стейт-машину движка. */
-  _teardownDom() {
-    /* Реальная ссылка на корневой узел — this.root (создаётся в _render()).
-     * Остальные имена оставлены как фаллбэк для прежних ревизий модуля. */
-    const container =
-      this.root ||
-      this.overlay ||
-      this.element ||
-      this.dom ||
-      this.container ||
-      this.menuElement
-
-    if (container) {
-      if (typeof container.remove === 'function') container.remove()
-      else if (container.parentNode) container.parentNode.removeChild(container)
-    }
-
-    /* Гасим таймеры: иначе отсчёт возврата продолжает тикать без DOM и
-     * способен вызвать desertRaid() уже после закрытия меню. */
-    this._stopGraceCountdown()
-    this._stopStopwatch()
-
-    this.root = null
-    this.overlay = null
-    this.element = null
-    this.dom = null
-    this.container = null
-    this.menuElement = null
-
-    /* Сбрасываем кэш экрана и флаг подписки на клавиатуру, чтобы следующий
-     * openMenu() заново отрисовал разметку и повесил слушатели на новый узел,
-     * а не показал пустой оверлей. */
-    this.screen = null
-    this._kbBound = false
-    this.open = false
-  }
-
-  destroy() {
-    this.destroyed = true
-    this.destroyOverlay()
-    document.removeEventListener('keydown', this._onKeyDown, true)
-    document.removeEventListener('pointerlockchange', this._onPointerLockChange, false)
-    if (this.settingsMenu) call(this.settingsMenu, 'destroy')
-    this.settingsMenu = null
-  }
-
-  /* -------------------------------------------------------- делегат кликов */
-  _onClick(event) {
-    const target = event.target && event.target.closest ? event.target.closest('[data-act]') : null
-    if (!target) return
-    event.preventDefault()
-    const act = target.getAttribute('data-act')
-    this._ui(act === 'back' || act === 'resume' ? 'back' : 'click')
-
-    switch (act) {
-      case 'resume': this.resumeGameplay(); break
-      case 'abandon': this.showScreen(ESC_SCREEN.ABANDON); break
-      case 'back': this.showScreen(ESC_SCREEN.PAUSE); break
-      case 'confirm-desert': this.desertRaid(); break
-      case 'next': this.exitToMainMenu(); break
-      case 'main-menu': this.exitToMainMenu(); break
-      case 'settings': this.openSettings(); break
-      default: break
-    }
-  }
-}
-
-export default EscapeMenuSystem
+    const ctx = this.ctx
+    if (!ctx) return null
+    if (typeof ctx.peek === 'function') {
+      try { return ctx.peek(
