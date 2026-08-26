@@ -1,4 +1,5 @@
 import { EFL } from '../core/config.js';
+import { STATE } from '../core/engine.js';
 
 const EMPTY = 0xffff;
 const CELL = 34;
@@ -142,6 +143,7 @@ export class InventorySystem {
     this._drag = null;
     this._useLabel = '';
     this._bound = [];
+    this._savedScale = 1;
 
     this.grids.set('stash', new Grid(EFL.stash.width, EFL.stash.rows));
     this.grids.set('pocket', new Grid(4, 1));
@@ -161,6 +163,13 @@ export class InventorySystem {
     });
     this.ctx.events.on('health:heal', () => this._render());
 
+    /* Любой уход из боя закрывает панель: иначе она останется висеть поверх
+     * итогов рейда и навсегда оставит time.scale в нуле. */
+    this.ctx.events.on('raid:end', () => this.hide());
+    this.ctx.events.on('state', (e) => {
+      if (e && e.to && e.to !== STATE.GAMEPLAY) this.hide();
+    });
+
     this._syncWeapons();
     this._emit('ready');
   }
@@ -176,6 +185,55 @@ export class InventorySystem {
   slotItem(slot) {
     const uid = this.slots.get(slot);
     return uid ? this.byUid.get(uid) : null;
+  }
+
+  /* ------------------------------------------------- состояние движка / курсор */
+
+  _engineState() {
+    const engine = this.ctx && this.ctx.engine ? this.ctx.engine : null;
+    if (engine && typeof engine.state === 'string') return engine.state;
+    /* Engine.setState() дублирует состояние в data-game-state — резервный путь
+     * для дев-харнессов, где ctx.engine не проброшен. */
+    if (typeof document !== 'undefined' && document.documentElement) {
+      return document.documentElement.getAttribute('data-game-state');
+    }
+    return null;
+  }
+
+  /* TAB работает только в рейде. В меню, на загрузке, в паузе и на итогах
+   * клавиша нам не принадлежит и проходит мимо нетронутой. */
+  _canOpen() {
+    return this._engineState() === STATE.GAMEPLAY;
+  }
+
+  /* EscapeMenuSystem живёт на UiSystem, а не в реестре. Берём лениво, без deps:
+   * инвентарь обязан работать и без UI. */
+  _escapeMenu() {
+    const ui = this.ctx && typeof this.ctx.peek === 'function' ? this.ctx.peek('ui') : null;
+    return ui && ui.escapeMenu ? ui.escapeMenu : null;
+  }
+
+  _holdCursor() {
+    const esc = this._escapeMenu();
+    if (esc && typeof esc.holdCursor === 'function') {
+      try { esc.holdCursor('inventory'); } catch (e) {}
+    }
+  }
+
+  /* Снимаем заявку через два кадра: эвристика потери pointer lock в
+   * escapeMenu проверяет себя через один rAF, и снятие раньше срока снова
+   * открыло бы паузу. */
+  _releaseCursorSoon() {
+    const esc = this._escapeMenu();
+    if (!esc || typeof esc.releaseCursor !== 'function') return;
+    const drop = () => {
+      try { esc.releaseCursor('inventory'); } catch (e) {}
+    };
+    if (typeof requestAnimationFrame === 'function') {
+      requestAnimationFrame(() => requestAnimationFrame(drop));
+    } else {
+      setTimeout(drop, 32);
+    }
   }
 
   _ensureContainer(host) {
@@ -586,13 +644,31 @@ export class InventorySystem {
     else this.hide();
   }
 
+  /**
+   * Открытие панели. Курсор забирается ЯВНО и С УВЕДОМЛЕНИЕМ.
+   *
+   * Раньше здесь был просто document.exitPointerLock(), и EscapeMenuSystem
+   * видел в этом альт-таб, после чего ставил STATE.PAUSED и поднимал
+   * полноценное меню паузы поверх инвентаря.
+   */
   show() {
     if (this.open || !this.root) return;
     this.open = true;
-    this._savedScale = this.ctx.time.scale;
-    this.ctx.time.scale = 0;
+
+    this._holdCursor();
+
+    const time = this.ctx.time;
+    this._savedScale = time && Number.isFinite(time.scale) ? time.scale : 1;
+    if (this._savedScale === 0) this._savedScale = 1;
+    if (time) time.scale = 0;
+
     this.ctx.peek('player')?.setControlEnabled?.(false);
-    document.exitPointerLock?.();
+    if (this.ctx.input) this.ctx.input.frozen = true;
+
+    if (typeof document !== 'undefined' && typeof document.exitPointerLock === 'function') {
+      try { document.exitPointerLock(); } catch (e) {}
+    }
+
     this.root.classList.add('open');
     this._render();
     this.ctx.events.emit('inventory:toggle', { open: true });
@@ -601,11 +677,20 @@ export class InventorySystem {
   hide() {
     if (!this.open || !this.root) return;
     this.open = false;
-    this.ctx.time.scale = this._savedScale ?? 1;
+
+    const time = this.ctx.time;
+    if (time) time.scale = Number.isFinite(this._savedScale) && this._savedScale > 0 ? this._savedScale : 1;
+
     this.ctx.peek('player')?.setControlEnabled?.(true);
-    this.ctx.input?.requestPointerLock?.();
+    if (this.ctx.input) this.ctx.input.frozen = false;
+
     this.root.classList.remove('open');
     this._stopDrag();
+
+    /* Захват курсора возвращаем только если бой всё ещё идảт. */
+    if (this._canOpen()) this.ctx.input?.requestPointerLock?.();
+    this._releaseCursorSoon();
+
     this.ctx.events.emit('inventory:toggle', { open: false });
   }
 
@@ -630,34 +715,62 @@ export class InventorySystem {
     this.$main = this.root.querySelector('#inv-main');
   }
 
+  /**
+   * Слушатель клавиатуры висит в фазе ПЕРЕХВАТА на window — самое раннее
+   * звено во всей цепочке события. Это обязательно для TAB: core/input.js
+   * держит swapWeapon = ['Digit1','Digit2','Tab'], и без stopPropagation каждое
+   * открытие инвентаря ещё и переключало оружие игрока.
+   *
+   * Глушим СТРОГО те клавиши, которые реально обработали. Всё остальное
+   * уходит дальше нетронутым — в том числе Escape, когда панель закрыта.
+   */
   _bindUi() {
+    const stop = (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      if (typeof e.stopImmediatePropagation === 'function') e.stopImmediatePropagation();
+    };
+
     const onKey = (e) => {
+      if (!e) return;
+
+      /* ---- TAB: исключительная собственность инвентаря ---- */
       if (e.code === 'Tab') {
-        e.preventDefault();
+        if (e.repeat) { stop(e); return; }
+        /* Вне рейда TAB нам не принадлежит. Закрыть можно всегда. */
+        if (!this.open && !this._canOpen()) return;
+        stop(e);
         this.toggle();
         return;
       }
+
       if (!this.open) return;
+
       if (e.code === 'Escape') {
-        e.preventDefault();
+        stop(e);
         this.hide();
         return;
       }
+
       if (e.code === 'KeyR' && this._drag) {
-        e.preventDefault();
+        stop(e);
         this._drag.rot = this._drag.rot ? 0 : 1;
         this._updateGhost();
+        return;
       }
-      if (e.code === 'Digit4') this.useQuickSlot(0);
-      if (e.code === 'Digit5') this.useQuickSlot(1);
-      if (e.code === 'Digit6') this.useQuickSlot(2);
+
+      if (e.code === 'Digit4') { stop(e); this.useQuickSlot(0); return; }
+      if (e.code === 'Digit5') { stop(e); this.useQuickSlot(1); return; }
+      if (e.code === 'Digit6') { stop(e); this.useQuickSlot(2); return; }
     };
+
     const onMove = (e) => this._onPointerMove(e);
     const onUp = (e) => this._onPointerUp(e);
-    window.addEventListener('keydown', onKey);
+
+    window.addEventListener('keydown', onKey, true);
     window.addEventListener('pointermove', onMove);
     window.addEventListener('pointerup', onUp);
-    this._bound.push(['keydown', onKey], ['pointermove', onMove], ['pointerup', onUp]);
+    this._bound.push(['keydown', onKey, true], ['pointermove', onMove, false], ['pointerup', onUp, false]);
   }
 
   _render() {
@@ -824,12 +937,27 @@ export class InventorySystem {
 
   dispose() {
     this._stopDrag();
-    for (const [type, fn] of this._bound) window.removeEventListener(type, fn);
+
+    /* Не оставляем мир замороженным и курсор захваченным. */
+    if (this.open) {
+      this.open = false;
+      const time = this.ctx && this.ctx.time;
+      if (time) time.scale = Number.isFinite(this._savedScale) && this._savedScale > 0 ? this._savedScale : 1;
+      if (this.ctx && this.ctx.input) this.ctx.input.frozen = false;
+      const esc = this._escapeMenu();
+      if (esc && typeof esc.releaseCursor === 'function') {
+        try { esc.releaseCursor('inventory'); } catch (e) {}
+      }
+    }
+
+    for (const [type, fn, capture] of this._bound) window.removeEventListener(type, fn, !!capture);
+    this._bound.length = 0;
     this.byUid.clear();
     this.grids.clear();
     this.slots.clear();
     this.all.length = 0;
     this.root?.remove();
+    this.root = null;
   }
 }
 
