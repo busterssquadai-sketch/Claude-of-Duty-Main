@@ -626,19 +626,6 @@ export class EscapeMenuSystem {
     try { return this.ctx.get(name) } catch (e) { return null }
   }
 
-  /* Активное состояние движка. Единственный живой источник истины:
-   * легаси-сервис 'state' выпилен из контейнера, _svc('state') отдаёт null,
-   * поэтому любые проверки состояния идут через ядро (engine.state), куда
-   * пишет engine.setState(). */
-  get engineState() {
-    return this.ctx?.engine?.state
-  }
-
-  /* Рейд активен: только в этих двух состояниях ESC-меню имеет смысл. */
-  _isRaidState(state) {
-    return state === STATE.GAMEPLAY || state === STATE.PAUSED
-  }
-
   _injectStyles() {
     if (document.getElementById('efl-escape-menu-css')) return
     const style = document.createElement('style')
@@ -736,8 +723,24 @@ export class EscapeMenuSystem {
   }
 
   /* --------------------------------------------------------------- open */
+  /* Односторонний поток данных: ESC-меню не источник истины по состоянию.
+   * Пока ядро не в STATE.PAUSED, openMenu() только толкает переход и выходит,
+   * а разметку рисует уже повторный вход из ctx.events.on('state') ->
+   * UiSystem._onStateTransition() -> escapeMenu.openMenu(). Флаг this.open
+   * поднимается только на проходе с рендером, поэтому рекурсия гаснет на
+   * первой же итерации, а не зацикливается. */
   openMenu() {
     if (this.open || this.destroyed) return
+
+    /* Ядро ещё в рейде: отдаём переход стейт-машине и ждём её события. */
+    const engine = this.ctx?.engine
+    if (engine && typeof engine.setState === 'function' && engine.state !== STATE.PAUSED) {
+      engine.setState(STATE.PAUSED)
+      return
+    }
+
+    /* Ядро уже в STATE.PAUSED (или движка нет вовсе — автономный режим):
+     * переход не дублируем, просто собираем и показываем экран паузы. */
     this.open = true
 
     call(this._svc('raid'), 'pause')
@@ -751,6 +754,10 @@ export class EscapeMenuSystem {
     this._emit('escape:opened', {})
   }
 
+  /* Закрытие тоже односторонее: сначала снимаем DOM и флаг this.open, только
+   * потом сообщаем ядру. Обратный вызов UiSystem на (PAUSED -> GAMEPLAY)
+   * упрётся в !this.open и выйдет, а сверка engine.state не даёт послать
+   * второй setState(GAMEPLAY). */
   resumeGameplay() {
     if (!this.open || this._deserted) return
     this._ui('back')
@@ -768,8 +775,9 @@ export class EscapeMenuSystem {
      * 'state' в контейнере больше нет: _svc('state') отдавал null, и вызов
      * call(state, 'set', STATE.GAMEPLAY) молча терял переход — игровой цикл
      * оставался замороженным. Тот же путь, что и в desertRaid(). */
-    if (this.ctx && this.ctx.engine && typeof this.ctx.engine.setState === 'function') {
-      this.ctx.engine.setState(STATE.GAMEPLAY)
+    const engine = this.ctx?.engine
+    if (engine && typeof engine.setState === 'function' && engine.state !== STATE.GAMEPLAY) {
+      engine.setState(STATE.GAMEPLAY)
     }
     this._emit('escape:resumed', {})
   }
