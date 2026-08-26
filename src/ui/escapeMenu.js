@@ -44,7 +44,7 @@ export const MAP_CATALOG = {
     thumbnail: 'assets/maps/factory.jpg',
     accent: 'linear-gradient(135deg, #3b3a34 0%, #22211d 55%, #14140f 100%)',
     description:
-      'Территория и производственные помещения химического комбината №16 были незаконно сданы ' +
+      'Территория и производственные помещения химического комбината №21 были незаконно сданы ' +
       'компании TerraGroup. В период Контрактных Войн здесь проходили бои между подразделениями USEC и ' +
       'BEAR, определяющие контроль за заводским районом города Таркова.',
   },
@@ -249,6 +249,9 @@ function escapeHtml(value) {
  * (document, capture) и в UiSystem (window, capture). Оконный срабатывал раньше
  * и звал stopPropagation(), поэтому этот вообще не получал событие. Оконный
  * удалён из ui/index.js.
+ *
+ * Клавиша Tab здесь НЕ обрабатывается и никогда не будет: инвентарь —
+ * единственный владелец Tab (src/inventory/index.js).
  * ========================================================================== */
 export class EscapeMenuSystem {
   constructor(ctx, options = {}) {
@@ -263,15 +266,17 @@ export class EscapeMenuSystem {
     this.buildVersion = this.options.buildVersion || '1.1.0.1.46911'
     this.raidMode = this.options.raidMode || 'TRAINING'
     this.gameMode = this.options.gameMode || 'PvE'
-    this.graceSeconds = this.options.graceSeconds != null ? this.options.graceSeconds : 30
 
     this.settingsMenu = null
-    this._graceLeft = this.graceSeconds
-    this._graceTimer = null
     this._clockTimer = null
     this._deserted = false
     this._raidElapsedMs = 0
     this._fallbackStart = Date.now()
+
+    /* Заявки на курсор. Пока хотя бы один оверлей держит мышь, потеря
+     * pointer lock НЕ считается альт-табом и пауза не открывается. */
+    this._cursorHolds = new Set()
+    this._lockProbe = 0
 
     this._onKeyDown = this._onKeyDown.bind(this)
     this._onClick = this._onClick.bind(this)
@@ -341,6 +346,38 @@ export class EscapeMenuSystem {
     document.head.appendChild(style)
   }
 
+  /* ------------------------------------------------- заявка на курсор (публично) */
+
+  /**
+   * Оверлей, который намеренно отдаёт pointer lock, обязан сказать об этом.
+   * Иначе pointerlockchange неотличим от альт-таба и мы уроним игру в паузу.
+   */
+  holdCursor(owner) {
+    this._cursorHolds.add(owner == null ? 'anonymous' : owner)
+  }
+
+  releaseCursor(owner) {
+    this._cursorHolds.delete(owner == null ? 'anonymous' : owner)
+  }
+
+  isCursorHeld() {
+    if (this._cursorHolds.size > 0) return true
+    if (this._inventoryOpen()) return true
+    if (this.settingsMenu && this.settingsMenu.isOpen) return true
+    const raidResult = this._svc('ui')
+    if (raidResult && raidResult.raidResult && raidResult.raidResult.isOpen) return true
+    return false
+  }
+
+  _inventory() {
+    return this._svc('inventory')
+  }
+
+  _inventoryOpen() {
+    const inv = this._inventory()
+    return !!(inv && inv.open)
+  }
+
   /* -------------------------------------------------------------- данные */
   get currentMap() {
     const raid = this._svc('raid')
@@ -369,14 +406,31 @@ export class EscapeMenuSystem {
   }
 
   /* ------------------------------------------------------------- клавиатура */
+
+  /**
+   * Строго одна клавиша: Escape. Всё остальное — включая Tab — уходит
+   * дальше без preventDefault и без stopPropagation. Пауза НИКОГДА не реагирует
+   * на Tab: инвентарём владеет InventorySystem и только он.
+   */
   _onKeyDown(event) {
     if (this.destroyed) return
-    if (!event || event.code !== 'Escape') return
+    if (!event) return
+
+    /* Tab — чужая клавиша. Явный выход вынесен отдельной строкой, чтобы никто
+     * больше не добавил сюда ветку переключения инвентаря. */
+    if (event.code === 'Tab') return
+    if (event.code !== 'Escape') return
 
     /* SettingsMenu регистрирует свой capture-слушатель позже нашего, а на
      * одном и том же узле capture-слушатели идут в порядке регистрации.
      * Без этого выхода мы бы съели Escape и панель настроек не закрылась. */
     if (this.settingsMenu && this.settingsMenu.isOpen) return
+
+    /* Точно так же уступаем инвентарю. Его слушатель висит на window в фазе
+     * всплытия, то есть ПОСЛЕ нашего document-capture. Раньше мы глушили
+     * событие через stopPropagation(), инвентарь Escape не видел и оставался
+     * открытым навсегда при time.scale === 0. */
+    if (this._inventoryOpen()) return
 
     const state = this._engineState()
 
@@ -402,15 +456,38 @@ export class EscapeMenuSystem {
     /* MENU / LOADING / RESULTS — Escape нас не касается. Не глушим событие. */
   }
 
+  /**
+   * Потеря pointer lock — эвристика альт-таба, а не факт. Любое окно,
+   * которому нужен курсор (инвентарь на Tab, настройки, итоги рейда),
+   * легитимно отдаёт lock сам. До этого фильтра Tab уронял игру в PAUSED.
+   */
   _onPointerLockChange() {
     if (this.destroyed || this.open) return
     if (this.options.openOnPointerLockLost === false) return
     if (typeof document === 'undefined') return
     if (document.pointerLockElement) return
+
+    /* Оверлей забрал мышь сознательно — это не альт-таб. */
+    if (this.isCursorHeld()) return
+
     /* Только из GAMEPLAY: в MENU/RESULTS движок сам снимает захват курсора
      * в _setInputActive(false), и открывать меню паузы там нельзя. */
     if (this._engineState() !== STATE.GAMEPLAY) return
-    this.openMenu()
+
+    /* Откладываем на кадр: пара release -> requestPointerLock внутри одного
+     * жеста не должна считаться потерей. */
+    const probe = ++this._lockProbe
+    const check = () => {
+      if (this.destroyed || this.open) return
+      if (probe !== this._lockProbe) return
+      if (typeof document === 'undefined') return
+      if (document.pointerLockElement) return
+      if (this.isCursorHeld()) return
+      if (this._engineState() !== STATE.GAMEPLAY) return
+      this.openMenu()
+    }
+    if (typeof requestAnimationFrame === 'function') requestAnimationFrame(check)
+    else setTimeout(check, 16)
   }
 
   /* ---------------------------------------------------------------- ввод */
@@ -438,6 +515,9 @@ export class EscapeMenuSystem {
   openMenu() {
     if (this.destroyed || this.open) return
 
+    /* Над инвентарем пауза не встаёт никогда. */
+    if (this._inventoryOpen()) return
+
     const engine = this._engine()
     const state = this._engineState()
 
@@ -452,7 +532,6 @@ export class EscapeMenuSystem {
 
     this.open = true
     this._deserted = false
-    this._graceLeft = this.graceSeconds
 
     this._setInputActive(false)
     const audio = this._audio()
@@ -469,7 +548,6 @@ export class EscapeMenuSystem {
 
     /* Снимаем DOM и флаг ДО передачи перехода ядру, иначе обратный
      * вызов из UiSystem увидит open === true и зациклится. */
-    this._stopGraceCountdown()
     this._stopStopwatch()
     this._teardownDom()
     this.open = false
@@ -555,7 +633,7 @@ export class EscapeMenuSystem {
         '<div class="efl-esc__stack">' +
           '<button type="button" class="efl-esc__big" data-act="resume">ПРОДОЛЖИТЬ</button>' +
           '<button type="button" class="efl-esc__big" data-act="settings">НАСТРОЙКИ</button>' +
-          '<button type="button" class="efl-esc__big efl-esc__big--danger" data-act="abandon">ПОКИНУТЬ РЕЙД</button>' +
+          '<button type="button" class="efl-esc__big efl-esc__big--danger" data-act="abandon">ОТКЛЮЧИТЬСЯ</button>' +
         '</div>' +
         '<div class="efl-esc__build">' + this._buildString() + '</div>' +
         '<button type="button" class="efl-esc__gear" data-act="settings" aria-label="Настройки">' + ICON_GEAR + '</button>' +
@@ -599,12 +677,14 @@ export class EscapeMenuSystem {
             '</div>' +
           '</div>' +
         '</div>' +
+        /* Автоматического выхода больше нет: таймер удалён целиком.
+         * Блок оставлен ради существующей вёрстки escapeMenuTheme.css. */
         '<div class="efl-esc__grace">' +
-          '<span>автоматический выход через</span>' +
-          '<span class="efl-esc__grace-value" data-role="grace">00:' + pad2(this.graceSeconds) + '</span>' +
+          '<span>автоматического выхода нет</span>' +
+          '<span class="efl-esc__grace-value">решение за вами</span>' +
         '</div>' +
         '<div class="efl-esc__footer">' +
-          '<button type="button" class="efl-esc__big efl-esc__big--danger" data-act="confirm-desert">ПОКИНУТЬ</button>' +
+          '<button type="button" class="efl-esc__big efl-esc__big--danger" data-act="confirm-desert">ПОКИНУТЬ РЕЙД</button>' +
           '<button type="button" class="efl-esc__big" data-act="back">НАЗАД</button>' +
         '</div>' +
         '<div class="efl-esc__build">' + this._buildString() + '</div>' +
@@ -650,43 +730,12 @@ export class EscapeMenuSystem {
     for (let i = 0; i < screens.length; i++) {
       screens[i].classList.toggle('is-active', screens[i].getAttribute('data-screen') === name)
     }
-    if (name === ESC_SCREEN.ABANDON) this._startGraceCountdown()
-    else this._stopGraceCountdown()
+    /* Экран ABANDON больше не взводит никаких таймеров — игрок стоит там
+     * сколько угодно и уходит только кнопкой. */
     if (name !== ESC_SCREEN.DESERTED) this._stopStopwatch()
   }
 
   /* ------------------------------------------------------------- таймеры */
-  _paintGrace() {
-    if (!this.root) return
-    const el = this.root.querySelector('[data-role="grace"]')
-    if (!el) return
-    const left = Math.max(0, this._graceLeft)
-    el.textContent = '00:' + pad2(left)
-    el.classList.toggle('is-critical', left <= 5)
-  }
-
-  _startGraceCountdown() {
-    this._stopGraceCountdown()
-    this._graceLeft = this.graceSeconds
-    this._paintGrace()
-    this._graceTimer = setInterval(() => {
-      this._graceLeft -= 1
-      if (this._graceLeft <= 0) {
-        this._stopGraceCountdown()
-        this.desertRaid()
-        return
-      }
-      this._paintGrace()
-    }, 1000)
-  }
-
-  _stopGraceCountdown() {
-    if (this._graceTimer) {
-      clearInterval(this._graceTimer)
-      this._graceTimer = null
-    }
-  }
-
   _startStopwatch() {
     this._stopStopwatch()
     if (!this.root) return
@@ -719,11 +768,21 @@ export class EscapeMenuSystem {
     call(this.settingsMenu, 'open')
   }
 
+  onSettingsClosed() {
+    /* UiSystem передаёт сюда onClose из SettingsMenu. Ничего не делаем кроме
+     * сброса заявки на курсор: меню паузы остаётся открытым под панелью. */
+    this.releaseCursor('settings')
+  }
+
   /* ---------------------------------------------------------- дезертирство */
+
+  /**
+   * Вызывается ТОЛЬКО из кнопки ПОКИНУТЬ РЕЙД. Автоматического
+   * вызова по таймеру больше не существует.
+   */
   desertRaid() {
     if (this.destroyed || this._deserted) return
     this._deserted = true
-    this._stopGraceCountdown()
     this._raidElapsedMs = Math.max(0, Date.now() - this.raidStartedAt)
 
     /* Экран дезертира поднимаем ДО raid.end(): тот шлёт 'raid:end',
@@ -834,6 +893,7 @@ export class EscapeMenuSystem {
         this.resumeGameplay()
         break
       case 'settings':
+        this.holdCursor('settings')
         this.openSettings()
         break
       case 'abandon':
@@ -869,12 +929,12 @@ export class EscapeMenuSystem {
   }
 
   destroyOverlay() {
-    this._stopGraceCountdown()
     this._stopStopwatch()
     this._teardownDom()
     this.open = false
     this.screen = null
     this._deserted = false
+    this._cursorHolds.clear()
   }
 
   destroy() {
