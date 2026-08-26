@@ -308,6 +308,30 @@ export class RaidSystem {
     this.ctx.events.emit('raid:end', { kind, summary: { ...s } });
   }
 
+  /**
+   * Снимок сводки для UI. Экран итогов не всегда приходит из raid:end —
+   * в STATE.RESULTS можно попасть и прямым setState(), и повторным показом
+   * визарда, а payload события к тому моменту уже потерян.
+   *
+   * Возвращает копию (визард не должен писать в живую сводку) или null, пока
+   * ни один рейд не завершался: kind == '' означает "показывать нечего".
+   */
+  getSummaryPayload() {
+    const s = this.summary;
+    if (!s || !s.kind) return null;
+    return {
+      kind: s.kind,
+      kills: Number(s.kills) || 0,
+      xp: Number(s.xp) || 0,
+      value: Number(s.value) || 0,
+      time: Number(s.time) || 0,
+      exit: s.exit || '',
+      mapId: s.mapId || '',
+      faction: s.faction || '',
+      night: !!s.night,
+    };
+  }
+
   dispose() {
     this.ctx.events.off('damage:dealt', this._onKill);
     this.ctx.events.off('actor:death', this._onDeath);

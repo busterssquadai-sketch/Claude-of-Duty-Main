@@ -12,6 +12,7 @@ import { WeaponSystem } from './weapons/index.js';
 import { FxSystem } from './fx/index.js';
 import { AiSystem } from './ai/index.js';
 import { UiSystem } from './ui/index.js';
+import { Hud } from './ui/hud.js';
 import { AudioSystem } from './audio/index.js';
 
 // --- EFL ---
@@ -42,6 +43,16 @@ const engine = new Engine({ canvas: document.getElementById('game'), config });
 const ALL_STATES = [STATE.MENU, STATE.LOADING, STATE.GAMEPLAY, STATE.PAUSED, STATE.RESULTS];
 const GAMEPLAY = [STATE.GAMEPLAY];
 
+/* engine.add() принимает КЛАСС и сам делает new SystemClass(opts), поэтому
+ * сюда нельзя передавать готовый экземпляр — new instance() бросает TypeError
+ * и убивает загрузку.
+ *
+ * Порядок вызовов add() на порядок init() не влияет: registry.resolve() строит
+ * его топологической сортировкой по static deps (именно поэтому UiSystem с
+ * deps ['audio','meta'] спокойно регистрируется раньше AudioSystem и
+ * MetaSystem). Hud объявляет deps = [] и берёт health/weapons/inventory/raid
+ * лениво через ctx.peek() на каждом тике, так что зависимостей у него нет —
+ * регистрируем последним, поверх остальных систем. */
 engine
   .add(RenderSystem, { states: ALL_STATES })
   .add(MaterialSystem, { states: ALL_STATES })
@@ -59,7 +70,8 @@ engine
   .add(HealthSystem, { states: GAMEPLAY })
   .add(MetaSystem, { states: ALL_STATES })
   .add(RaidSystem, { states: GAMEPLAY })
-  .add(NetSystem, { states: GAMEPLAY });
+  .add(NetSystem, { states: GAMEPLAY })
+  .add(Hud, { states: GAMEPLAY });
 
 try {
   await engine.init();

@@ -2,6 +2,61 @@
 // mmss() вызывался в update(), но нигде не был объявлен и не импортирован —
 // гарантированный ReferenceError на первом же тике таймера рейда.
 
+const HUD_STYLE_ID = 'efl-hud-css';
+
+/* Разметки HUD не было нигде: в index.html лежат только #game и #ui, ни одна
+ * система контейнер #hud не создавала. getElementById('hud') всегда возвращал
+ * null, поэтому mount() выходил на первой строке, а update() молчал. Контейнер
+ * создаём сами — один раз, при первом mount(). */
+const HUD_CSS = `
+#hud.efl-hud {
+  position: fixed; inset: 0; z-index: 8000;
+  pointer-events: none; user-select: none;
+  font-family: 'Oswald', 'Bebas Neue', 'DIN Condensed', Impact, Arial, sans-serif;
+  color: #c8c7c2;
+}
+#hud.efl-hud .efl-hud__clock {
+  position: absolute; top: 18px; left: 50%; transform: translateX(-50%);
+  font-size: 30px; line-height: 1; letter-spacing: 0.14em;
+  font-variant-numeric: tabular-nums; color: #eceae5;
+  text-shadow: 0 2px 12px rgba(0, 0, 0, 0.9);
+}
+#hud.efl-hud .efl-hud__vitals {
+  position: absolute; left: 26px; bottom: 24px;
+  display: flex; align-items: flex-end; gap: 26px;
+}
+#hud.efl-hud .efl-hud__cell { display: flex; flex-direction: column; gap: 3px; }
+#hud.efl-hud .efl-hud__cap {
+  font-size: 10px; letter-spacing: 0.22em; text-transform: uppercase;
+  color: rgba(200, 199, 194, 0.55);
+}
+#hud.efl-hud .efl-hud__val {
+  font-size: 26px; line-height: 1; letter-spacing: 0.06em;
+  font-variant-numeric: tabular-nums; color: #eceae5;
+  text-shadow: 0 2px 12px rgba(0, 0, 0, 0.9);
+}
+#hud.efl-hud .efl-hud__val.warn { color: #e2a114; }
+#hud.efl-hud .efl-hud__val.over { color: #e2544a; }
+`;
+
+/* Селекторы совпадают с тем, что ищет pick(): [data-hud="<имя>"]. */
+const HUD_MARKUP =
+  '<div class="efl-hud__clock" data-hud="time">--:--</div>' +
+  '<div class="efl-hud__vitals">' +
+    '<div class="efl-hud__cell">' +
+      '<span class="efl-hud__cap">Здоровье</span>' +
+      '<span class="efl-hud__val" data-hud="hp">—</span>' +
+    '</div>' +
+    '<div class="efl-hud__cell">' +
+      '<span class="efl-hud__cap">Патроны</span>' +
+      '<span class="efl-hud__val" data-hud="ammo">0</span>' +
+    '</div>' +
+    '<div class="efl-hud__cell">' +
+      '<span class="efl-hud__cap">Вес</span>' +
+      '<span class="efl-hud__val" data-hud="kg">0 кг</span>' +
+    '</div>' +
+  '</div>';
+
 function pad2(n) {
   return String(Math.max(0, Math.floor(Number(n) || 0))).padStart(2, '0');
 }
@@ -15,17 +70,24 @@ export class Hud {
   static id = 'hud';
   static deps = [];
 
-  constructor(ctx) {
-    this.ctx = ctx || null;
+  constructor(options = {}) {
+    /* Engine.add(Hud, opts) создаёт систему сам и передаёт сюда opts, а не ctx:
+     * ctx приходит только в init(). Ручное new Hud(ctx) из дев-харнессов тоже
+     * должно работать — ctx отличаем по наличию peek/get. */
+    const isCtx = !!options && (typeof options.peek === 'function' || typeof options.get === 'function');
+    this.options = isCtx ? {} : (options || {});
+    this.ctx = isCtx ? options : null;
+
     this._acc = 0;
     this._last = { hp: -1, ammo: -1, weight: -1, time: -1, mode: -1 };
     this.el = {};                       // ссылки на DOM берутся один раз, в mount()
     this.root = null;
     this.visible = false;
+    this._ownsRoot = false;             // контейнер создали мы — нам его и убирать
   }
 
   init(ctx) {
-    this.ctx = ctx;
+    this.ctx = ctx || this.ctx;
     this.mount();
     return this;
   }
@@ -43,11 +105,36 @@ export class Hud {
     return null;
   }
 
+  _injectStyles() {
+    if (typeof document === 'undefined') return;
+    if (document.getElementById(HUD_STYLE_ID)) return;
+    const style = document.createElement('style');
+    style.id = HUD_STYLE_ID;
+    style.textContent = HUD_CSS;
+    document.head.appendChild(style);
+  }
+
+  /** Контейнер #hud, которого нет ни в index.html, ни в других системах. */
+  _createRoot() {
+    const host = document.getElementById('ui') || document.body;
+    if (!host) return null;
+    const node = document.createElement('div');
+    node.id = 'hud';
+    node.className = 'efl-hud';
+    node.setAttribute('aria-hidden', 'true');
+    node.innerHTML = HUD_MARKUP;
+    host.appendChild(node);
+    this._ownsRoot = true;
+    return node;
+  }
+
   /** Старая версия никогда не заполняла this.el, так что любая запись в
    *  this.el.hp.textContent падала с TypeError. */
   mount(root) {
     if (typeof document === 'undefined') return this;
-    const host = root || document.getElementById('hud');
+    this._injectStyles();
+
+    const host = root || document.getElementById('hud') || this._createRoot();
     this.root = host || null;
     if (!this.root) return this;
 
@@ -63,13 +150,29 @@ export class Hud {
       kg: pick('kg') || pick('weight'),
       time: pick('time'),
     };
+
+    /* Ссылки новые — кэш прошлых значений больше ничего не значит. */
+    this._last = { hp: -1, ammo: -1, weight: -1, time: -1, mode: -1 };
+    this.setVisible(this.visible);
     return this;
+  }
+
+  /** UiSystem.setHudVisible() зовут ещё до init() (в самом UiSystem.init),
+   *  а hot-reload или пересборка оверлеев может выкинуть узел из документа. */
+  _ensureRoot() {
+    if (this.root && this.root.isConnected !== false) return this.root;
+    this.root = null;
+    this.el = {};
+    this.mount();
+    return this.root;
   }
 
   /** Контракт, который щупает UiSystem.setHudVisible(). */
   setVisible(v) {
     this.visible = !!v;
-    if (this.root && this.root.style) this.root.style.display = this.visible ? '' : 'none';
+    const node = this.root ||
+      (typeof document !== 'undefined' ? document.getElementById('hud') : null);
+    if (node && node.style) node.style.display = this.visible ? '' : 'none';
     return this;
   }
 
@@ -80,7 +183,7 @@ export class Hud {
     if (this._acc < 0.1) return;
     this._acc = 0;
 
-    if (!this.root) return;
+    if (!this._ensureRoot()) return;
 
     const health = this._svc('health');
     if (health && typeof health.total === 'function' && this.el.hp) {
@@ -99,7 +202,12 @@ export class Hud {
       const kg = Math.round((Number(inv.weight()) || 0) * 10) / 10;
       if (kg !== this._last.weight) {
         this.el.kg.textContent = kg + ' кг';
-        this.el.kg.className = kg > 42 ? 'over' : kg > 28 ? 'warn' : '';
+        /* Здесь была запись в className — она стирала базовый класс элемента
+         * вместе с его вёрсткой. Трогаем только модификаторы. */
+        if (this.el.kg.classList) {
+          this.el.kg.classList.toggle('over', kg > 42);
+          this.el.kg.classList.toggle('warn', kg > 28 && kg <= 42);
+        }
         this._last.weight = kg;
       }
     }
@@ -112,6 +220,10 @@ export class Hud {
   }
 
   dispose() {
+    if (this._ownsRoot && this.root && this.root.parentNode) {
+      this.root.parentNode.removeChild(this.root);
+    }
+    this._ownsRoot = false;
     this.el = {};
     this.root = null;
     this.ctx = null;
