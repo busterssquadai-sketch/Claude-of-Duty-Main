@@ -24,20 +24,24 @@
  *   4. прокидывает FOV в ctx.config (иначе CameraRig перезатирает камеру
  *      в следующем же кадре) и сразу в активную камеру;
  *   5. прокидывает инверсию вертикали и чувствительность в сырой обработчик
- *      мышиного делта (core/input.js) и в config;
+ *      мышиного дельта (core/input.js) и в config;
  *   6. гарантирует, что холодный десатурированный грейдинг Emilia доезжает
  *      до ShaderPass-ов композера.
  *
  * Патч ставится в applyTarkovBootstrap() ДО того, как UiSystem создаст
  * экземпляр SettingsMenu, поэтому конструкторный applyAll() уже рабочий.
+ *
+ * Импорт НАМЕРЕННО неймспейсный, а не именованный: промах именованного
+ * импорта в ESM — это ошибка СВЯЗЫВАНИЯ, которая роняет весь бандл, а не
+ * только этот модуль. Слой патчей не имеет права ронять загрузку.
  * ========================================================================== */
 
-import {
-  SettingsMenu,
-  SETTINGS_TABS,
-  DEFAULT_SETTINGS,
-  GRADING_PRESETS,
-} from './settingsMenu.js'
+import * as SettingsMenuModule from './settingsMenu.js'
+
+const SettingsMenu = SettingsMenuModule.SettingsMenu || SettingsMenuModule.default || null
+const SETTINGS_TABS = Array.isArray(SettingsMenuModule.SETTINGS_TABS) ? SettingsMenuModule.SETTINGS_TABS : []
+const DEFAULT_SETTINGS = SettingsMenuModule.DEFAULT_SETTINGS || {}
+const GRADING_PRESETS = SettingsMenuModule.GRADING_PRESETS || {}
 
 /** Пресеты качества из core/config.js (QUALITY_PRESETS). */
 export const QUALITY_PRESETS_IDS = ['low', 'medium', 'high', 'ultra']
@@ -321,7 +325,7 @@ export function applyPostFxMatrix(ctx, settings) {
   const postfx = postfxOf(ctx)
   if (!postfx || !settings || !settings.postfx) return null
   const p = settings.postfx
-  const grading = GRADING_PRESETS[p.grading] || GRADING_PRESETS.emilia
+  const grading = GRADING_PRESETS[p.grading] || GRADING_PRESETS.emilia || { id: p.grading }
 
   safeCall(postfx, 'setEnabled', !!p.enabled)
   safeCall(postfx, 'setBrightness', (Number(p.brightness) || 0) / 100)
@@ -371,6 +375,14 @@ function ensureQualityField() {
 export function applySettingsBridge() {
   if (applied) return SettingsMenu
   applied = true
+
+  /* Без класса патчить нечего. Не бросаем — загрузка игры важнее. */
+  if (!SettingsMenu || !SettingsMenu.prototype) {
+    if (typeof console !== 'undefined') {
+      console.error('[EFL/settings] SettingsMenu не найден в ./settingsMenu.js — мост не установлен')
+    }
+    return null
+  }
 
   ensureQualityField()
 

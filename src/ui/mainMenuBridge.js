@@ -15,10 +15,17 @@
  *      перерисовывает свой DOM целиком;
  *   3. аккуратно отходит в сторону, когда клик пришёл из ESC-меню или из
  *      самой панели настроек — там свои обработчики.
+ *
+ * Импорты НАМЕРЕННО неймспейсные: промах именованного импорта в ESM —
+ * это ошибка СВЯЗЫВАНИЯ, которая роняет весь бандл. Слой мостов не имеет
+ * права ронять загрузку игры.
  * ========================================================================== */
 
-import { MainMenuSystem } from './mainMenu.js'
-import { SettingsMenu } from './settingsMenu.js'
+import * as MainMenuModule from './mainMenu.js'
+import * as SettingsMenuModule from './settingsMenu.js'
+
+const MainMenuSystem = MainMenuModule.MainMenuSystem || MainMenuModule.default || null
+const SettingsMenu = SettingsMenuModule.SettingsMenu || SettingsMenuModule.default || null
 
 const SETTINGS_TEXT = /^(настройки|настроики|settings|опции|options)$/i
 const SETTINGS_TOKENS = [
@@ -128,6 +135,13 @@ export function ensureSettingsMenu(instance) {
 
   if (instance && instance.settingsMenu) return instance.settingsMenu
 
+  if (!SettingsMenu) {
+    if (typeof console !== 'undefined') {
+      console.error('[EFL/mainMenu] SettingsMenu не найден в ./settingsMenu.js')
+    }
+    return null
+  }
+
   try {
     const menu = new SettingsMenu(ctx, { zIndex: 9800 })
     if (instance) instance.settingsMenu = menu
@@ -216,43 +230,50 @@ export function applyMainMenuBridge() {
   applied = true
 
   const proto = MainMenuSystem && MainMenuSystem.prototype
-  if (proto) {
-    const original = proto.openSettings
+  if (!proto) {
+    if (typeof console !== 'undefined') {
+      console.error('[EFL/mainMenu] MainMenuSystem не найден в ./mainMenu.js — мост без прототипа')
+    }
+    /* Делегированный клик всё равно ставим: он умеет работать без инстанса. */
+    bindDelegatedClick()
+    return MainMenuSystem
+  }
 
-    proto.openSettings = function openSettings() {
-      /* Если у меню уже был свой рабочий метод — уважаем его, но страхуем. */
-      if (typeof original === 'function' && original !== proto.openSettings) {
-        try {
-          const res = original.call(this)
-          if (this.settingsMenu && this.settingsMenu.isOpen) return res
-        } catch (err) {
-          if (typeof console !== 'undefined') {
-            console.warn('[EFL/mainMenu] родной openSettings() упал, открываем панель сами', err)
-          }
+  const original = proto.openSettings
+
+  proto.openSettings = function openSettings() {
+    /* Если у меню уже был свой рабочий метод — уважаем его, но страхуем. */
+    if (typeof original === 'function' && original !== proto.openSettings) {
+      try {
+        const res = original.call(this)
+        if (this.settingsMenu && this.settingsMenu.isOpen) return res
+      } catch (err) {
+        if (typeof console !== 'undefined') {
+          console.warn('[EFL/mainMenu] родной openSettings() упал, открываем панель сами', err)
         }
       }
-      return openMainMenuSettings(this)
     }
+    return openMainMenuSettings(this)
+  }
 
-    if (typeof proto.showSettings !== 'function') {
-      proto.showSettings = function showSettings() {
-        return this.openSettings()
-      }
+  if (typeof proto.showSettings !== 'function') {
+    proto.showSettings = function showSettings() {
+      return this.openSettings()
     }
-    if (typeof proto.settingsMenuInstance !== 'function') {
-      proto.settingsMenuInstance = function settingsMenuInstance() {
-        return ensureSettingsMenu(this)
-      }
+  }
+  if (typeof proto.settingsMenuInstance !== 'function') {
+    proto.settingsMenuInstance = function settingsMenuInstance() {
+      return ensureSettingsMenu(this)
     }
+  }
 
-    /* Кнопка может рисоваться при mount() — вешаем делегирование после него. */
-    const originalMount = proto.mount
-    if (typeof originalMount === 'function') {
-      proto.mount = function patchedMount() {
-        const res = originalMount.apply(this, arguments)
-        bindDelegatedClick()
-        return res
-      }
+  /* Кнопка может рисоваться при mount() — вешаем делегирование после него. */
+  const originalMount = proto.mount
+  if (typeof originalMount === 'function') {
+    proto.mount = function patchedMount() {
+      const res = originalMount.apply(this, arguments)
+      bindDelegatedClick()
+      return res
     }
   }
 
