@@ -12,6 +12,23 @@ const DEF = [
 
 const S_IDLE = 0, S_PATROL = 1, S_ALERT = 2, S_COMBAT = 3, S_COVER = 4, S_HEAL = 5, S_DEAD = 6;
 
+/* Фолбэк ТТХ оружия: используется, только если items не отдал определение.
+ * Без него любой промах по таблице предметов ронял тик обращением к .cap/.rpm. */
+const DEFAULT_WEP = Object.freeze({ cap: 30, rpm: 600, spread: 0.02, cal: '545' });
+
+/* Скорость бокового шага в метрах в секунду и границы окна смены направления. */
+const STRAFE_SPEED = 2.35;
+const STRAFE_MIN_T = 0.45;
+const STRAFE_MAX_T = 1.30;
+
+/* Бюджеты по умолчанию, если EFL.budgets не заполнен целиком. */
+const BUDGET_FALLBACK = { bots: 12, botsUpdatedPerFrame: 4, pathRequestsPerFrame: 2 };
+
+function budget(name) {
+  const b = EFL && EFL.budgets ? EFL.budgets[name] : undefined;
+  return Number.isFinite(b) && b > 0 ? b : BUDGET_FALLBACK[name];
+}
+
 export class AiSystem {
   static id = 'ai';
   static deps = ['world', 'physics', 'items', 'health', 'fx', 'audio', 'materials'];
@@ -42,7 +59,14 @@ export class AiSystem {
     this._v2 = new THREE.Vector3();
     this._eye = new THREE.Vector3();
     this._target = new THREE.Vector3();
+    this._sv0 = new THREE.Vector3();     // зонд бокового шага: откуда
+    this._sv1 = new THREE.Vector3();     // зонд бокового шага: куда
     this._los = { hit: false, distance: 0, point: new THREE.Vector3(), normal: new THREE.Vector3(), surface: 0, actor: null, partIndex: -1 };
+
+    /* Единственный возвращаемый объект деградировавшей баллистики.
+     * Преаллоцирован, потому что путь может исполняться каждый выстрел. */
+    this._fallbackImpact = { hit: true, damage: 25, penetrated: false };
+    this._warned = Object.create(null);
 
     ctx.events.on('weapon:fire', this._onFire = (e) => this.hearNoise(e.origin, e.suppressed ? 22 : 85));
     ctx.events.on('explosion', this._onBoom = (e) => this.hearNoise(e.position, 140));
@@ -50,13 +74,81 @@ export class AiSystem {
     ctx.events.on('raid:end', this._onEnd = () => this.clear());
   }
 
+  /* Однократное предупреждение: тик не должен спамить консоль каждый кадр. */
+  _warnOnce(key, msg) {
+    if (this._warned[key]) return;
+    this._warned[key] = true;
+    console.warn('[ai] ' + msg);
+  }
+
+  /* ---------- безопасные обёртки над чужими подсистемами ---------- */
+
+  _wep(id) {
+    const it = this.items;
+    const w = it && typeof it.get === 'function' ? it.get(id) : null;
+    if (w) return w;
+    this._warnOnce('wep:' + id, 'items.get("' + id + '") returned nothing — using fallback ballistics');
+    return DEFAULT_WEP;
+  }
+
+  _groundAt(x, z, fromY) {
+    const p = this.physics;
+    if (!p || typeof p.groundHeight !== 'function') return NaN;
+    const gy = p.groundHeight(x, z, fromY, p.MASK_WORLD ?? 1);
+    return Number.isFinite(gy) ? gy : NaN;
+  }
+
+  _sees(from, to) {
+    const p = this.physics;
+    if (!p || typeof p.lineOfSight !== 'function') return true;
+    return !!p.lineOfSight(from, to);
+  }
+
+  /**
+   * Единственная точка входа ИИ в баллистику.
+   * Приоритет: physics.penetrate -> physics.fireBullet -> безопасная заглушка.
+   * Ни один из путей не может выбросить исключение в игровой поток.
+   */
+  _shoot(origin, dir, ammoIdx, shooter) {
+    const p = this.physics;
+    if (p && typeof p.penetrate === 'function') {
+      try {
+        // null здесь — легитимный промах, не подменяем его заглушкой
+        return p.penetrate(origin, dir, ammoIdx, shooter);
+      } catch (err) {
+        this._warnOnce('pen:throw', 'physics.penetrate threw, falling back: ' + err.message);
+      }
+    } else {
+      this._warnOnce('pen:missing', 'physics.penetrate unavailable — using fireBullet/stub');
+    }
+
+    if (p && typeof p.fireBullet === 'function') {
+      try {
+        const impacts = p.fireBullet({ origin, dir, ammoIndex: ammoIdx, shooter, damage: 25 });
+        if (Array.isArray(impacts)) return impacts.length ? impacts[0] : null;
+        if (impacts) return impacts;
+        return null;
+      } catch (err) {
+        this._warnOnce('fb:throw', 'physics.fireBullet threw, using stub: ' + err.message);
+      }
+    }
+
+    return this._fallbackImpact;
+  }
+
   /* ---------- спавн ---------- */
-  spawnWave({ faction, mapId, night }) {
+  spawnWave({ faction, mapId, night } = {}) {
     this.playerFaction = faction === 'scav' ? FACTION.SCAV : FACTION.PMC;
     this.scavKarmaHostile = false;
-    const zones = this.world.spawnZones('bot');
-    const budget = Math.min(EFL.budgets.bots, zones.length);
-    for (let i = 0; i < budget; i++) {
+    const zones = (this.world && typeof this.world.spawnZones === 'function')
+      ? this.world.spawnZones('bot')
+      : null;
+    if (!Array.isArray(zones) || zones.length === 0) {
+      this._warnOnce('zones', 'world.spawnZones("bot") gave no spawn points — wave skipped');
+      return;
+    }
+    const cap = Math.min(budget('bots'), zones.length);
+    for (let i = 0; i < cap; i++) {
       const r = this.rng.float();
       const kind = r < 0.68 ? FACTION.SCAV : r < 0.88 ? FACTION.RAIDER : r < 0.98 ? FACTION.PMC : FACTION.BOSS;
       this.spawn(kind, zones[i], night);
@@ -64,7 +156,8 @@ export class AiSystem {
   }
 
   spawn(kind, at, night) {
-    const d = DEF[kind];
+    if (!at) return null;
+    const d = DEF[kind] ?? DEF[FACTION.SCAV];
     const bot = this.free.pop() ?? this._createBot();
     bot.kind = kind;
     bot.hp = d.hp;
@@ -77,19 +170,23 @@ export class AiSystem {
     bot.pathPending = false;
     bot.coverPoint = null;
     bot.burst = 0;
+    bot.seesPlayer = false;
     bot.aimT = 0; bot.fireT = 0; bot.thinkT = 0; bot.lastSeen = -99;
+    bot.reloadT = 0;
+    bot.strafeSign = this.rng.float() < 0.5 ? -1 : 1;
+    bot.strafeT = STRAFE_MIN_T + this.rng.float() * (STRAFE_MAX_T - STRAFE_MIN_T);
     bot.wepId = d.wep[this.rng.int(0, d.wep.length - 1)];
-    bot.ammoIdx = this.items.ammoSlot(this._pickAmmo(bot.wepId));
-    bot.mag = this.items.get(bot.wepId).cap;
+    bot.ammoIdx = this._resolveAmmo(bot.wepId);
+    bot.mag = this._wep(bot.wepId).cap ?? DEFAULT_WEP.cap;
     bot.view = d.view * (night ? 0.45 : 1);
     bot.root.position.copy(at);
-    const gy = this.physics.groundHeight(bot.root.position.x, bot.root.position.z, bot.root.position.y + 6, this.physics.MASK_WORLD ?? 1);
+    const gy = this._groundAt(bot.root.position.x, bot.root.position.z, bot.root.position.y + 6);
     if (Number.isFinite(gy)) bot.root.position.y = gy;
     bot.noiseAt.copy(bot.root.position);
     bot.lastPos.copy(bot.root.position);
     bot.yaw = 0;
     bot.root.visible = true;
-    this.world.addActor(bot);              // в BVH как MASK_ACTOR
+    if (this.world && typeof this.world.addActor === 'function') this.world.addActor(bot);   // в BVH как MASK_ACTOR
     this._syncBot(bot);
     this.bots.push(bot);
     return bot;
@@ -136,12 +233,16 @@ export class AiSystem {
       aimT: 0,
       fireT: 0,
       thinkT: 0,
+      reloadT: 0,
       lastSeen: -99,
       suspicion: 0,
+      seesPlayer: false,
       ammoIdx: 0,
       mag: 0,
       view: 0,
       burst: 0,
+      strafeSign: 1,
+      strafeT: 0,
       path: [],
       pathI: 0,
       pathPending: false,
@@ -184,7 +285,7 @@ export class AiSystem {
     if (dist < 0.08) {
       p.x = dest.x;
       p.z = dest.z;
-      const gy = this.physics.groundHeight(p.x, p.z, p.y + 4, this.physics.MASK_WORLD ?? 1);
+      const gy = this._groundAt(p.x, p.z, p.y + 4);
       if (Number.isFinite(gy)) p.y = gy;
       this._syncBot(bot);
       return true;
@@ -192,11 +293,76 @@ export class AiSystem {
     const step = Math.min(dist, Math.max(0.1, speed || 1) * dt * 5);
     p.x += (dx / dist) * step;
     p.z += (dz / dist) * step;
-    const gy = this.physics.groundHeight(p.x, p.z, p.y + 4, this.physics.MASK_WORLD ?? 1);
+    const gy = this._groundAt(p.x, p.z, p.y + 4);
     if (Number.isFinite(gy)) p.y = gy;
     bot.yaw = Math.atan2(dx, dz);
     this._syncBot(bot);
     return dist <= step + 0.001;
+  }
+
+  /**
+   * Боковой шаг в бою. Раньше этот метод отсутствовал, и ветка ближнего боя
+   * (dist < 8) роняла весь Engine.step() на TypeError.
+   *
+   * Бот шаркает перпендикулярно своему взгляду, периодически меняя сторону.
+   * Перед шагом пускается зонд: если сбоку преграда — направление немедленно
+   * инвертируется, поэтому бот не втирается в стену и не застревает в ней.
+   *
+   * Терпимо относится к устаревшей форме вызова _strafe(dt).
+   */
+  _strafe(bot, dt) {
+    if (typeof bot === 'number') { dt = bot; bot = null; }
+    if (!bot || !bot.root || !bot.alive) return false;
+
+    const step = Number.isFinite(dt) && dt > 0 ? dt : 0;
+    if (step === 0) return false;
+
+    // окно выдержки: смена стороны раз в STRAFE_MIN_T..STRAFE_MAX_T секунд
+    bot.strafeT -= step;
+    if (bot.strafeT <= 0) {
+      bot.strafeT = STRAFE_MIN_T + this.rng.float() * (STRAFE_MAX_T - STRAFE_MIN_T);
+      bot.strafeSign = this.rng.float() < 0.5 ? -1 : 1;
+    }
+    if (bot.strafeSign !== 1 && bot.strafeSign !== -1) bot.strafeSign = 1;
+
+    // forward = (sin yaw, 0, cos yaw)  =>  right = (cos yaw, 0, -sin yaw)
+    const sy = Math.sin(bot.yaw);
+    const cy = Math.cos(bot.yaw);
+    let rx = cy * bot.strafeSign;
+    let rz = -sy * bot.strafeSign;
+
+    const p = bot.root.position;
+    const reach = STRAFE_SPEED * step;
+    const probe = reach + 0.42;               // радиус капсулы + запас
+
+    this._sv0.set(p.x, p.y + 0.95, p.z);
+    this._sv1.set(p.x + rx * probe, p.y + 0.95, p.z + rz * probe);
+
+    if (!this._sees(this._sv0, this._sv1)) {
+      // сбоку глухо: разворачиваемся и подрезаем выдержку
+      bot.strafeSign = -bot.strafeSign;
+      bot.strafeT = STRAFE_MIN_T * 0.75;
+      rx = -rx;
+      rz = -rz;
+      this._sv1.set(p.x + rx * probe, p.y + 0.95, p.z + rz * probe);
+      if (!this._sees(this._sv0, this._sv1)) return false;   // зажат с двух сторон
+    }
+
+    const nx = p.x + rx * reach;
+    const nz = p.z + rz * reach;
+    const gy = this._groundAt(nx, nz, p.y + 4);
+    if (!Number.isFinite(gy)) return false;                  // шаг в пустоту — стоим
+    if (Math.abs(gy - p.y) > 0.75) {                         // обрыв или ступень выше пояса
+      bot.strafeSign = -bot.strafeSign;
+      bot.strafeT = STRAFE_MIN_T * 0.75;
+      return false;
+    }
+
+    p.x = nx;
+    p.z = nz;
+    p.y = gy;
+    this._syncBot(bot);
+    return true;
   }
 
   _followPath(bot, dt, speed) {
@@ -228,9 +394,17 @@ export class AiSystem {
     this._syncBot(bot);
   }
 
-  _pickAmmo(wepId) {
-    const list = this.items.ammoForCaliber(this.items.get(wepId).cal);
-    return list[Math.min(list.length - 1, this.rng.int(0, list.length - 1))];
+  _resolveAmmo(wepId) {
+    const it = this.items;
+    const cal = this._wep(wepId).cal ?? DEFAULT_WEP.cal;
+    const list = it && typeof it.ammoForCaliber === 'function' ? it.ammoForCaliber(cal) : null;
+    if (!Array.isArray(list) || list.length === 0) return 0;
+    const pick = list[this.rng.int(0, list.length - 1)];
+    if (it && typeof it.ammoSlot === 'function') {
+      const slot = it.ammoSlot(pick);
+      if (Number.isFinite(slot)) return slot;
+    }
+    return Number.isFinite(pick) ? pick : 0;
   }
 
   /* ---------- враждебность: точно как в EFL ---------- */
@@ -257,13 +431,14 @@ export class AiSystem {
 
   /* ---------- восприятие ---------- */
   hearNoise(pos, loudness) {
+    if (!pos) return;
     for (let i = 0; i < this.bots.length; i++) {
       const b = this.bots[i];
       if (!b.alive) continue;
       const dist = b.root.position.distanceTo(pos);
       if (dist > loudness) continue;
       // стены глушат: один дешёвый луч на бота, а не полный рейкаст
-      const clear = this.physics.lineOfSight(b.root.position, pos);
+      const clear = this._sees(b.root.position, pos);
       if (!clear && dist > loudness * 0.45) continue;
       b.suspicion = Math.min(1, b.suspicion + (1 - dist / loudness) * 0.8);
       b.noiseAt.copy(pos);
@@ -272,18 +447,18 @@ export class AiSystem {
   }
 
   _perceive(bot, playerPos, dt) {
-    const d = DEF[bot.kind];
+    const d = DEF[bot.kind] ?? DEF[FACTION.SCAV];
     this._eye.copy(bot.root.position).y += 1.6;
     this._v.subVectors(playerPos, this._eye);
     const dist = this._v.length();
-    if (dist > bot.view) { bot.seesPlayer = false; return; }
+    if (dist > bot.view || dist < 1e-6) { bot.seesPlayer = false; return; }
 
     this._v.divideScalar(dist);
     bot.root.getWorldDirection(this._v2);
     const cos = this._v.dot(this._v2);
     if (cos < Math.cos((d.fov * 0.5) * 0.01745)) { bot.seesPlayer = false; return; }
 
-    bot.seesPlayer = this.physics.lineOfSight(this._eye, playerPos);
+    bot.seesPlayer = this._sees(this._eye, playerPos);
     if (bot.seesPlayer) {
       bot.lastSeen = this.ctx.time.elapsed;
       bot.lastPos.copy(playerPos);
@@ -296,7 +471,7 @@ export class AiSystem {
 
   /* ---------- бой ---------- */
   _combat(bot, playerPos, dt) {
-    const d = DEF[bot.kind];
+    const d = DEF[bot.kind] ?? DEF[FACTION.SCAV];
     bot.aimT -= dt;
     if (!bot.seesPlayer) {
       if (this.ctx.time.elapsed - bot.lastSeen > 4.5) { bot.state = S_ALERT; return; }
@@ -317,27 +492,31 @@ export class AiSystem {
     if (bot.fireT > 0) return;
 
     // стрельба очередями через ту же баллистику, что и у игрока
-    const wep = this.items.get(bot.wepId);
+    const wep = this._wep(bot.wepId);
+    const spreadBase = Number.isFinite(wep.spread) ? wep.spread : DEFAULT_WEP.spread;
+    const rpm = Number.isFinite(wep.rpm) && wep.rpm > 0 ? wep.rpm : DEFAULT_WEP.rpm;
     const skill = d.acc * (1 - Math.min(0.5, dist / 160));
-    const spread = wep.spread * (2.2 - skill * 1.6);
+    const spread = spreadBase * (2.2 - skill * 1.6);
     this._target.copy(playerPos);
     this._target.x += (this.rng.float() * 2 - 1) * spread * dist;
     this._target.y += (this.rng.float() * 2 - 1) * spread * dist + 0.9;
     this._target.z += (this.rng.float() * 2 - 1) * spread * dist;
-    this._v.subVectors(this._target, this._eye).normalize();
+    this._v.subVectors(this._target, this._eye);
+    if (this._v.lengthSq() < 1e-12) return;
+    this._v.normalize();
 
-    this.physics.penetrate(this._eye, this._v, bot.ammoIdx, bot);
+    this._shoot(this._eye, this._v, bot.ammoIdx, bot);
     this.ctx.events.emit('weapon:fire', { weapon: bot.wepId, origin: this._eye, dir: this._v, seed: this.rng.uint32(), bot: true });
     bot.mag--;
     bot.burst = bot.burst > 0 ? bot.burst - 1 : this.rng.int(2, 5);
-    bot.fireT = bot.burst > 0 ? 60 / wep.rpm : 0.35 + this.rng.float() * 0.9;
+    bot.fireT = bot.burst > 0 ? 60 / rpm : 0.35 + this.rng.float() * 0.9;
   }
 
   /* ---------- шаг модели поведения ---------- */
   _think(bot, playerPos, dt) {
     switch (bot.state) {
       case S_PATROL:
-        if (!bot.path || bot.pathI >= bot.path.length) this._requestPath(bot, this.world.randomPatrolPoint(this.rng));
+        if (!bot.path || bot.pathI >= bot.path.length) this._requestPath(bot, this._patrolPoint());
         this._followPath(bot, dt, 0.55);
         break;
       case S_ALERT:
@@ -347,20 +526,40 @@ export class AiSystem {
       case S_COMBAT: this._combat(bot, playerPos, dt); break;
       case S_COVER:
         bot.reloadT -= dt;
-        if (!bot.coverPoint) bot.coverPoint = this.world.findCover(bot.root.position, playerPos, this.rng);
+        if (!bot.coverPoint) bot.coverPoint = this._findCover(bot.root.position, playerPos);
         if (bot.coverPoint) this._moveTo(bot, bot.coverPoint, dt, 1.2);
-        if (bot.reloadT <= 0) { bot.mag = this.items.get(bot.wepId).cap; bot.coverPoint = null; bot.state = S_COMBAT; }
+        if (bot.reloadT <= 0) {
+          bot.mag = this._wep(bot.wepId).cap ?? DEFAULT_WEP.cap;
+          bot.coverPoint = null;
+          bot.state = S_COMBAT;
+        }
         break;
     }
+  }
+
+  _patrolPoint() {
+    const w = this.world;
+    if (w && typeof w.randomPatrolPoint === 'function') return w.randomPatrolPoint(this.rng);
+    return null;
+  }
+
+  _findCover(from, threat) {
+    const w = this.world;
+    if (w && typeof w.findCover === 'function') return w.findCover(from, threat, this.rng);
+    return null;
   }
 
   /* ---------- тайм-слайсинг: тяжёлое только для N ботов в кадр ---------- */
   update(dt, ctx) {
     const n = this.bots.length;
     if (!n) return;
-    const player = ctx.get('player');
-    const ppos = player.position;
-    const slice = Math.min(EFL.budgets.botsUpdatedPerFrame, n);
+    const player = ctx.peek ? ctx.peek('player') : ctx.get('player');
+    const ppos = player && player.position ? player.position : null;
+    if (!ppos) {
+      this._warnOnce('ppos', 'player system exposes no position — AI perception idle this frame');
+      return;
+    }
+    const slice = Math.min(budget('botsUpdatedPerFrame'), n);
 
     for (let k = 0; k < slice; k++) {
       const bot = this.bots[(this.cursor + k) % n];
@@ -382,39 +581,48 @@ export class AiSystem {
     }
 
     // очередь путей: не больше 2 A* в кадр
-    let budget = EFL.budgets.pathRequestsPerFrame;
-    while (budget-- > 0 && this.pathQueue.length) {
+    let left = budget('pathRequestsPerFrame');
+    const canPath = this.world && typeof this.world.findPath === 'function';
+    while (left-- > 0 && this.pathQueue.length) {
       const req = this.pathQueue.shift();
       if (!req.bot.alive) continue;
-      req.bot.path = this.world.findPath(req.bot.root.position, req.to);
+      req.bot.path = canPath && req.to ? (this.world.findPath(req.bot.root.position, req.to) || []) : [];
       req.bot.pathI = 0;
       req.bot.pathPending = false;
     }
   }
 
   _requestPath(bot, to) {
-    if (bot.pathPending) return;
+    if (bot.pathPending || !to) return;
     bot.pathPending = true;
     this.pathQueue.push({ bot, to });
   }
 
   /* ---------- смерть ---------- */
   kill(bot, byPlayer) {
-    if (!bot.alive) return;
+    if (!bot || !bot.alive) return;
     bot.alive = false;
     bot.state = S_DEAD;
+    this._syncBot(bot);
     this.ctx.events.emit('actor:death', { actor: bot, point: bot.root.position });
     if (byPlayer) {
       if (this.playerFaction === FACTION.SCAV && bot.kind === FACTION.SCAV) this.angerScavs('scav_kill');
       if (this.playerFaction === FACTION.SCAV && bot.kind === FACTION.RAIDER)
         this.ctx.events.emit('karma:scav', { delta: +0.05, reason: 'raider_kill' });
-      this.ctx.events.emit('damage:dealt', { target: bot, killed: true, xp: DEF[bot.kind].xp });
+      this.ctx.events.emit('damage:dealt', { target: bot, killed: true, xp: (DEF[bot.kind] ?? DEF[FACTION.SCAV]).xp });
     }
-    this.ctx.get('raid').spawnCorpse(bot);      // труп с лутом владеет raid
+    const raid = this.ctx.peek ? this.ctx.peek('raid') : null;
+    if (raid && typeof raid.spawnCorpse === 'function') raid.spawnCorpse(bot);   // труп с лутом владеет raid
   }
 
   clear() {
-    for (const b of this.bots) { b.root.visible = false; this.world.removeActor(b); this.free.push(b); }
+    for (const b of this.bots) {
+      b.root.visible = false;
+      b.alive = false;
+      if (b.collider) b.collider.enabled = false;
+      if (this.world && typeof this.world.removeActor === 'function') this.world.removeActor(b);
+      this.free.push(b);
+    }
     this.bots.length = 0;
     this.pathQueue.length = 0;
     this.cursor = 0;
@@ -422,7 +630,12 @@ export class AiSystem {
 
   dispose() {
     this.clear();
-    for (const b of this.free) this.world.disposeActor(b);
+    for (const b of this.free) {
+      if (this.world && typeof this.world.disposeActor === 'function') this.world.disposeActor(b);
+      if (b.collider && this.physics && typeof this.physics.removeCollider === 'function') {
+        this.physics.removeCollider(b.collider);
+      }
+    }
     this.free.length = 0;
     this._botBodyGeo.dispose();
     this._botHeadGeo.dispose();
