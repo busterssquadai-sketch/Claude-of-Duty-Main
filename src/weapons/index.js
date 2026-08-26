@@ -3,6 +3,7 @@ import { ammoIndex, ammoForCaliber, AMMO } from "../physics/penetration.js";
 import { WeaponMaterials } from "./materials.js";
 import { Viewmodel } from "./viewmodel.js";
 import { WEAPON_DEFS } from "./defs.js";
+import { ProjectileSim } from "./ballistics.js";
 import { buildRifle } from "./models/rifle.js";
 import { buildSmg } from "./models/smg.js";
 import { buildPistol } from "./models/pistol.js";
@@ -16,6 +17,7 @@ import { buildPistol } from "./models/pistol.js";
  *   weapon:reload      { weapon, phase }
  *   weapon:magcheck    { weapon, left }
  *   weapon:malfunction { weapon, kind }
+ *   bullet:tracer      { from, to, speed }   <- через ProjectileSim
  *
  * Ни одной аллокации в горячем пути: все векторы и пейлоады событий
  * созданы в конструкторе и перезаписываются на месте.
@@ -283,8 +285,46 @@ const HEAT_PER_SHOT = 0.055;
 const HEAT_COOL = 0.42;
 const MAX_HEAT = 3.2;
 
+/*
+ * Пружина отдачи камеры.
+ *
+ * Раньше отдача была голым сумматором: recoilPitch += rv, игрок забирал
+ * значение и оно обнулялось. Камера уезжала вверх и там оставалась.
+ * Теперь это пружина с демпфером: выстрел вбрасывает импульс в скорость,
+ * update() интегрирует положение обратно к нулю, а pullRecoil() отдаёт
+ * РАЗНИЦУ положения за кадр. Контракт наружу не изменился, но ствол
+ * подбрасывает и возвращает на место.
+ *
+ * RECOIL_K   - жёсткость (чем выше, тем быстрее возврат)
+ * RECOIL_D   - демпфирование, ~2*sqrt(K) даёт критическое
+ */
+const RECOIL_K = 148;
+const RECOIL_D = 23;
+
+/* Запас патронов на старте. Ключи РАЗРЕШАЮТСЯ через ammoForCaliber,
+ * а не пишутся строками: прежний хардкод "556m855" не совпадал с реальным
+ * идентификатором "556_m855" из CAL_DEFAULT, поэтому _reserveFor() всегда
+ * возвращал 0 и M4A1 невозможно было перезарядить в принципе. */
+const START_RESERVE = [
+  ["556", 120],
+  ["545", 90],
+  ["9x18", 48],
+  ["9x19", 60],
+  ["762x54", 40],
+  ["12x70", 24],
+];
+
 function clamp(v, a, b) {
   return v < a ? a : v > b ? b : v;
+}
+
+function ammoField(field, idx, fallback) {
+  const col = AMMO && AMMO[field];
+  if (!col) return fallback;
+  const v = col[idx];
+  if (v === undefined || v === null) return fallback;
+  if (typeof v === "string") return v;
+  return Number.isFinite(v) ? v : fallback;
 }
 
 function makeRng(ctx, label) {
@@ -335,6 +375,7 @@ export class WeaponInstance {
     this.ammoId = ammoId || null;
     this.ammoIdx = ammoId ? ammoIndex(ammoId) : ammoForCaliber(def.cal);
     if (this.ammoIdx < 0) this.ammoIdx = ammoForCaliber(def.cal);
+    if (!Number.isFinite(this.ammoIdx) || this.ammoIdx < 0) this.ammoIdx = 0;
     this.magCount = def.mag;
     this.chambered = true;
     this.durability = 1;
@@ -378,11 +419,27 @@ export class WeaponSystem {
 
     this.reloading = false;
     this.reloadEndsAt = 0;
+    this.reloadDuration = 0;
     this.swapEndsAt = 0;
 
+    /* Наружный контракт: накопленная за кадр дельта отдачи. */
     this.recoilPitch = 0;
     this.recoilYaw = 0;
     this.bloom = 0;
+
+    /* Внутреннее состояние пружины. */
+    this._kickPitch = 0;
+    this._kickYaw = 0;
+    this._kickVelP = 0;
+    this._kickVelY = 0;
+
+    /* Читать ввод самостоятельно. Все хуки идемпотентны, поэтому это
+     * безопасно даже если игрок дублирует их из своей подсистемы. */
+    this.autoInput = true;
+
+    /* Пулевая симуляция вместо мгновенного хитскана. */
+    this.useProjectiles = true;
+    this.projectiles = null;
 
     this.reserve = Object.create(null);
     this.shotsFired = 0;
@@ -395,6 +452,22 @@ export class WeaponSystem {
     this._tmp = new THREE.Vector3();
     this._pelletDir = new THREE.Vector3();
     this._shellPos = new THREE.Vector3();
+
+    /* Преаллоцированные аргументы для ProjectileSim.spawn(). */
+    this._spawnOpts = {
+      origin: this._origin,
+      dir: this._pelletDir,
+      speed: 800,
+      damage: 30,
+      penetration: 1,
+      dragK: 0.3,
+      maxRange: 400,
+      dropoff: 0.5,
+      weapon: null,
+      ammoIndex: 0,
+      shooter: null,
+      tracer: false,
+    };
 
     /* Переиспользуемые пейлоады событий: обработчики читают их синхронно. */
     this._fireEvent = {
@@ -411,22 +484,24 @@ export class WeaponSystem {
     this._reloadEvent = { weapon: null, phase: "start", duration: 0 };
     this._magEvent = { weapon: null, left: 0, position: this._origin };
     this._jamEvent = { weapon: null, kind: "jam", position: this._origin };
+    this._recoilOut = { x: 0, y: 0, z: 0 };
 
     this._handlers = null;
     this.viewmodel = null;
     this._weaponStateEvent = null;
+    this._stateDirty = true;
+    this._audioResumed = false;
   }
 
   init(ctx) {
     this.ctx = ctx;
     this.rng = makeRng(ctx, "weapons");
     this._initViewmodel(ctx);
+    this.projectiles = new ProjectileSim(ctx);
     this.setWeapon("primary", "m4a1", null);
     this.setWeapon("holster", "pm", null);
     this.equip("primary");
-    this.reserve["556m855"] = 120;
-    this.reserve["9x18_pst"] = 48;
-    this.reserve["545_bp"] = 90;
+    this._seedReserve();
 
     const ev = ctx && ctx.events;
     if (ev && typeof ev.on === "function") {
@@ -440,8 +515,13 @@ export class WeaponSystem {
             self.reloading = false;
             self.recoilPitch = 0;
             self.recoilYaw = 0;
+            self._kickPitch = 0;
+            self._kickYaw = 0;
+            self._kickVelP = 0;
+            self._kickVelY = 0;
             self.bloom = 0;
-            self._emitState();
+            self.projectiles?.clear?.();
+            self._emitState(true);
           },
         ],
         [
@@ -449,7 +529,8 @@ export class WeaponSystem {
           function onEnd() {
             self.enabled = false;
             self.triggerDown = false;
-            self._emitState();
+            self.projectiles?.clear?.();
+            self._emitState(true);
           },
         ],
         [
@@ -463,7 +544,20 @@ export class WeaponSystem {
         ev.on(this._handlers[i][0], this._handlers[i][1]);
     }
     this._syncFromInventory();
-    this._emitState();
+    this._emitState(true);
+  }
+
+  /* Разрешаем канонические идентификаторы патронов через таблицу, а не строками. */
+  _seedReserve() {
+    for (let i = 0; i < START_RESERVE.length; i++) {
+      const cal = START_RESERVE[i][0];
+      const count = START_RESERVE[i][1];
+      const idx = ammoForCaliber(cal);
+      if (!Number.isFinite(idx) || idx < 0) continue;
+      const id = ammoField("id", idx, null);
+      if (typeof id !== "string" || !id) continue;
+      this.reserve[id] = (this.reserve[id] || 0) + count;
+    }
   }
 
   _normalizeWeaponId(id) {
@@ -502,7 +596,10 @@ export class WeaponSystem {
     }
   }
 
-  _emitState() {
+  /* Событие состояния слалось каждый кадр из update(). Теперь только по флагу. */
+  _emitState(force) {
+    if (!force && !this._stateDirty) return;
+    this._stateDirty = false;
     const o =
       this._weaponStateEvent ||
       (this._weaponStateEvent = {
@@ -543,7 +640,7 @@ export class WeaponSystem {
     o.inMag = w.magCount;
     o.chamber = w.chambered;
     o.capacity = w.def.mag;
-    o.ammoName = AMMO.id[w.ammoIdx] || w.def.cal;
+    o.ammoName = ammoField("id", w.ammoIdx, w.def.cal) || w.def.cal;
     o.modeShort = String(w.mode || "").toUpperCase();
     o.heat = Math.round((w.heat / MAX_HEAT) * 100);
     o.dur = Math.round(w.durability * 100);
@@ -560,12 +657,14 @@ export class WeaponSystem {
     if (weaponId === null) {
       this.slots[slot] = null;
       if (this.slot === slot) this.weapon = null;
+      this._stateDirty = true;
       this._emitState();
       return null;
     }
     const inst = new WeaponInstance(this._normalizeWeaponId(weaponId), ammoId);
     this.slots[slot] = inst;
     if (this.slot === slot) this.weapon = inst;
+    this._stateDirty = true;
     this._emitState();
     return inst;
   }
@@ -585,6 +684,7 @@ export class WeaponSystem {
       this.viewmodel?.setActive?.(vmId);
       this.viewmodel?.play?.("draw");
     }
+    this._stateDirty = true;
     this._emitState();
     return true;
   }
@@ -604,6 +704,7 @@ export class WeaponSystem {
     w.modeIndex = (w.modeIndex + 1) % w.def.modes.length;
     w.mode = w.def.modes[w.modeIndex];
     w.burstLeft = 0;
+    this._stateDirty = true;
     this._emitState();
     return w.mode;
   }
@@ -618,13 +719,15 @@ export class WeaponSystem {
 
   /* Сколько патронов этого типа осталось в разгрузке. */
   _reserveFor(ammoIdx) {
-    const id = AMMO.id[ammoIdx];
+    const id = ammoField("id", ammoIdx, null);
+    if (typeof id !== "string") return 0;
     const n = this.reserve[id];
     return n === undefined ? 0 : n;
   }
 
   _takeReserve(ammoIdx, want) {
-    const id = AMMO.id[ammoIdx];
+    const id = ammoField("id", ammoIdx, null);
+    if (typeof id !== "string") return 0;
     const have = this.reserve[id] === undefined ? 0 : this.reserve[id];
     const take = have < want ? have : want;
     this.reserve[id] = have - take;
@@ -666,6 +769,19 @@ export class WeaponSystem {
   _emit(name, payload) {
     const ev = this.ctx && this.ctx.events;
     if (ev && typeof ev.emit === "function") ev.emit(name, payload);
+  }
+
+  /* AudioContext стартует suspended до жеста пользователя, и это тихо
+   * съедает ВСЮ процедурную стрельбу. Один раз пинаем его на первом выстреле. */
+  _wakeAudio() {
+    if (this._audioResumed) return;
+    this._audioResumed = true;
+    const audio = this.ctx?.peek?.("audio");
+    if (!audio) return;
+    try {
+      if (typeof audio.resume === "function") audio.resume();
+      else if (audio.ctx && typeof audio.ctx.resume === "function") audio.ctx.resume();
+    } catch (e) { /* политика автоплея, не наша забота */ }
   }
 
   /* --- Управление спусковым крючком --- */
@@ -828,6 +944,15 @@ export class WeaponSystem {
     const phys = this._physics();
     const ammoIdx = w.ammoIdx;
 
+    this._wakeAudio();
+
+    /* Баллистические параметры патрона из таблицы penetration.js. */
+    const muzzle = ammoField("speed", ammoIdx, 800);
+    const dmg = ammoField("damage", ammoIdx, 30);
+    const pen = ammoField("pen", ammoIdx, 1);
+    const tracer = !!ammoField("tracer", ammoIdx, 0);
+    const sim = this.useProjectiles ? this.projectiles : null;
+
     /* Снятие патрона: стреляет тот, что в патроннике, следующий идёт из магазина. */
     w.chambered = false;
     if (w.magCount > 0) {
@@ -858,16 +983,36 @@ export class WeaponSystem {
       }
       this._pelletDir.set(px, py, pz);
 
-      if (phys && typeof phys.penetrate === "function") {
+      /* Основной путь: настоящий снаряд со временем полёта и просадкой.
+       * ProjectileSim сам отдаёт терминальную баллистику в physics при
+       * соприкосновении, поэтому пробитие остаётся в одном месте. */
+      let spawned = false;
+      if (sim) {
+        const o = this._spawnOpts;
+        o.speed = muzzle;
+        o.damage = dmg;
+        o.penetration = pen;
+        o.dragK = 0.3;
+        o.maxRange = 400;
+        o.dropoff = 0.5;
+        o.weapon = w.id;
+        o.ammoIndex = ammoIdx;
+        o.shooter = this.shooter || null;
+        o.tracer = tracer && p === 0;
+        spawned = !!sim.spawn(o);
+      }
+
+      /* Резервный хитскан, если симуляции нет. */
+      if (!spawned && phys && typeof phys.penetrate === "function") {
         phys.penetrate(this._origin, this._pelletDir, ammoIdx, this.shooter);
       }
     }
 
-    /* Отдача, нагрев и растущий разброс. */
+    /* Отдача, нагрев и растущий разброс. Импульс идёт в СКОРОСТЬ пружины. */
     const ergoK = clamp(1.35 - def.ergo * 0.007, 0.45, 1.35);
     const adsK = this.ads ? 0.72 : 1;
-    this.recoilPitch += def.rv * ergoK * adsK;
-    this.recoilYaw += (this.rng() * 2 - 1) * def.rh * ergoK * adsK;
+    this._kickVelP += def.rv * ergoK * adsK * RECOIL_K * 0.06;
+    this._kickVelY += (this.rng() * 2 - 1) * def.rh * ergoK * adsK * RECOIL_K * 0.06;
     this.bloom = Math.min(this.bloom + def.spread * 0.32, def.spread * 2.6);
     w.heat = Math.min(w.heat + HEAT_PER_SHOT, MAX_HEAT);
     this.shotsFired++;
@@ -882,7 +1027,9 @@ export class WeaponSystem {
       w.jammed = true;
     w.durability = Math.max(0.35, w.durability - 0.00035);
 
-    /* События. Пейлоады переиспользуются, обработчики читают их синхронно. */
+    /* События. Пейлоады переиспользуются, обработчики читают их синхронно.
+     * weapon:fire — канонический вход для src/audio/weapons.js, поэтому
+     * прямого дублирующего вызова микшера здесь нет. */
     const fe = this._fireEvent;
     fe.weapon = w.id;
     fe.seed = (this.shotsFired * 2654435761) >>> 0;
@@ -891,7 +1038,7 @@ export class WeaponSystem {
     fe.cal = def.cal;
     fe.mode = w.mode;
     this._emit("weapon:fire", fe);
-    this.viewmodel?.addRecoil?.(def.rv * DEG * 0.1, this.recoilYaw * DEG * 0.1, this.shotsFired <= 1);
+    this.viewmodel?.addRecoil?.(def.rv * DEG * 0.1, this._kickYaw * DEG * 0.1, this.shotsFired <= 1);
 
     this._shellPos.set(
       this._origin.x + rx * 0.28,
@@ -900,6 +1047,7 @@ export class WeaponSystem {
     );
     this._shellEvent.cal = def.cal;
     this._emit("weapon:shell", this._shellEvent);
+    this._stateDirty = true;
     this._emitState();
   }
 
@@ -915,6 +1063,7 @@ export class WeaponSystem {
     const dur = w.def.reload * speed;
     this.reloading = true;
     this.reloadEndsAt = this.time + dur;
+    this.reloadDuration = dur;
     this.triggerLatch = true;
     w.burstLeft = 0;
 
@@ -924,6 +1073,7 @@ export class WeaponSystem {
     this._emit("weapon:reload", this._reloadEvent);
     this._emit("weapon:reload:start", this._reloadEvent);
     this.viewmodel?.play?.(w.ammoLeft <= 1 ? "reloadEmpty" : "reloadTac");
+    this._stateDirty = true;
     this._emitState();
     return true;
   }
@@ -946,6 +1096,7 @@ export class WeaponSystem {
     this._reloadEvent.duration = 0;
     this._emit("weapon:reload", this._reloadEvent);
     this._emit("weapon:reload:end", this._reloadEvent);
+    this._stateDirty = true;
     this._emitState();
   }
 
@@ -955,6 +1106,7 @@ export class WeaponSystem {
     this._magEvent.weapon = w.id;
     this._magEvent.left = w.ammoLeft;
     this._emit("weapon:magcheck", this._magEvent);
+    this._stateDirty = true;
     this._emitState();
     return w.ammoLeft;
   }
@@ -970,6 +1122,7 @@ export class WeaponSystem {
     this._reloadEvent.duration = w.def.chamber;
     this._emit("weapon:reload", this._reloadEvent);
     this._emit("weapon:reload:clear", this._reloadEvent);
+    this._stateDirty = true;
     this._emitState();
     return true;
   }
@@ -993,7 +1146,9 @@ export class WeaponSystem {
     return false;
   }
 
-  /* Игрок забирает накопленную отдачу раз в кадр и обнуляет её. */
+  /* Игрок забирает накопленную отдачу раз в кадр и обнуляет её.
+   * Значение — дельта пружины за кадр, поэтому камера подбрасывает
+   * и сама возвращается на место. */
   pullRecoil(out) {
     const pitch = this.recoilPitch;
     const yaw = this.recoilYaw;
@@ -1007,9 +1162,65 @@ export class WeaponSystem {
     return pitch;
   }
 
+  getRecoilState() {
+    const o = this._recoilOut;
+    o.x = this._kickPitch;
+    o.y = this._kickYaw;
+    o.z = 0;
+    return o;
+  }
+
+  /* Снаряды интегрируются на фиксированном шаге (120 Гц по ARCHITECTURE),
+   * поэтому полёт пули не зависит от частоты кадров. Раньше этого метода
+   * не существовало вовсе, и симуляция не могла шагать даже теоретически. */
+  fixedUpdate(h, ctx) {
+    if (ctx) this.ctx = ctx;
+    if (this.projectiles) this.projectiles.fixedUpdate(h);
+  }
+
   update(dt, ctx) {
     if (ctx) this.ctx = ctx;
     this.time += dt;
+
+    /* Пружина отдачи: интегрируем и отдаём дельту наружу. */
+    if (dt > 0) {
+      const accP = -RECOIL_K * this._kickPitch - RECOIL_D * this._kickVelP;
+      const accY = -RECOIL_K * this._kickYaw - RECOIL_D * this._kickVelY;
+      this._kickVelP += accP * dt;
+      this._kickVelY += accY * dt;
+      const prevP = this._kickPitch;
+      const prevY = this._kickYaw;
+      this._kickPitch += this._kickVelP * dt;
+      this._kickYaw += this._kickVelY * dt;
+      if (Math.abs(this._kickPitch) < 1e-5 && Math.abs(this._kickVelP) < 1e-4) {
+        this._kickPitch = 0;
+        this._kickVelP = 0;
+      }
+      if (Math.abs(this._kickYaw) < 1e-5 && Math.abs(this._kickVelY) < 1e-4) {
+        this._kickYaw = 0;
+        this._kickVelY = 0;
+      }
+      this.recoilPitch += this._kickPitch - prevP;
+      this.recoilYaw += this._kickYaw - prevY;
+    }
+
+    /* Спуск, прицеливание и перезарядка с реального ввода. Все вызовы
+     * идемпотентны, поэтому дублирование из PlayerSystem безвредно.
+     * swapWeapon сознательно НЕ вешаем: core/input.js держит на нём Tab,
+     * который принадлежит инвентарю. */
+    if (this.autoInput && this.enabled) {
+      const input = this.ctx && this.ctx.input;
+      if (input) {
+        if (typeof input.fire === "boolean") this.setTrigger(input.fire);
+        if (typeof input.ads === "boolean") this.setAds(input.ads);
+        if (typeof input.actionPressed === "function") {
+          if (input.actionPressed("reload")) {
+            if (this.weapon && this.weapon.jammed) this.clearJam();
+            else this.reload();
+          }
+        }
+      }
+    }
 
     const w = this.weapon;
     if (w) {
@@ -1097,7 +1308,9 @@ export class WeaponSystem {
     o.reserve = this._reserveFor(w.ammoIdx);
     o.jammed = w.jammed;
     o.reloading = this.reloading;
-    o.reloadProgress = this.reloading ? 1 - Math.max(0, (this.reloadEndsAt - this.time) / Math.max(0.001, this._reloadEvent.duration || 1)) : 0;
+    o.reloadProgress = this.reloading
+      ? 1 - Math.max(0, (this.reloadEndsAt - this.time) / Math.max(0.001, this.reloadDuration || 1))
+      : 0;
     o.heat = w.heat / MAX_HEAT;
     o.cal = w.def.cal;
     o.ads = this.ads;
@@ -1119,6 +1332,8 @@ export class WeaponSystem {
     this.slots.holster = null;
     this.weapon = null;
     this._phys = null;
+    this.projectiles?.dispose?.();
+    this.projectiles = null;
     this.viewmodel?.dispose?.();
     this.viewmodel = null;
     this.ctx = null;
