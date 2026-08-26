@@ -6,15 +6,19 @@
 
 import * as SettingsModule from './settingsMenu.js'
 
-/* Если в проекте уже есть src/core/state.js — импортируйте STATE оттуда,
- * значения строк совпадают один в один. */
-export const STATE = {
-  BOOT: 'BOOT',
-  MENU: 'MENU',
-  LOADING: 'LOADING',
-  GAMEPLAY: 'GAMEPLAY',
-  RESULT: 'RESULT',
-}
+/* Единственный источник истины по состояниям — src/core/engine.js.
+ * Значения строк ОБЯЗАНЫ совпадать с ядром посимвольно (нижний регистр):
+ * engine.setState() пишет строку в data-game-state и сверяет её со списками
+ * состояний систем из src/main.js. Любое расхождение (RESULT вместо RESULTS
+ * или верхний регистр) глушит подсистемы и вешает движок. */
+export const STATE = Object.freeze({
+  BOOT: 'boot',
+  MENU: 'menu',
+  LOADING: 'loading',
+  GAMEPLAY: 'gameplay',
+  PAUSED: 'paused',
+  RESULTS: 'results',
+})
 
 export const ESC_SCREEN = {
   PAUSE: 'pause',
@@ -1005,7 +1009,7 @@ export class EscapeMenuSystem {
       const factory = this.options.settingsFactory
       this.settingsMenu = typeof factory === 'function'
         ? factory(this.ctx)
-        : new SettingsMenu(this.ctx, {
+        : new SettingsModule.SettingsMenu(this.ctx, {
             zIndex: 9600,
             onClose: () => this._emit('settings:closed', {}),
           })
