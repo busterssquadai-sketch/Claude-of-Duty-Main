@@ -1097,6 +1097,47 @@ export class EscapeMenuSystem {
     this._deserted = false
   }
 
+  /* --------------------------------------------------------- снос DOM-оверлея */
+  /* Единственная точка удаления DOM. Вызывается из resumeGameplay() и
+   * destroyOverlay() — раньше метод отсутствовал в классе, и любой выход из
+   * ESC-меню падал с TypeError: this._teardownDom is not a function, унося с
+   * собой стейт-машину движка. */
+  _teardownDom() {
+    /* Реальная ссылка на корневой узел — this.root (создаётся в _render()).
+     * Остальные имена оставлены как фаллбэк для прежних ревизий модуля. */
+    const container =
+      this.root ||
+      this.overlay ||
+      this.element ||
+      this.dom ||
+      this.container ||
+      this.menuElement
+
+    if (container) {
+      if (typeof container.remove === 'function') container.remove()
+      else if (container.parentNode) container.parentNode.removeChild(container)
+    }
+
+    /* Гасим таймеры: иначе отсчёт возврата продолжает тикать без DOM и
+     * способен вызвать desertRaid() уже после закрытия меню. */
+    this._stopGraceCountdown()
+    this._stopStopwatch()
+
+    this.root = null
+    this.overlay = null
+    this.element = null
+    this.dom = null
+    this.container = null
+    this.menuElement = null
+
+    /* Сбрасываем кэш экрана и флаг подписки на клавиатуру, чтобы следующий
+     * openMenu() заново отрисовал разметку и повесил слушатели на новый узел,
+     * а не показал пустой оверлей. */
+    this.screen = null
+    this._kbBound = false
+    this.open = false
+  }
+
   destroy() {
     this.destroyed = true
     this.destroyOverlay()
