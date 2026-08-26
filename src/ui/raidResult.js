@@ -1,13 +1,23 @@
 /* ==========================================================================
  * Escape-From-Larpov · src/ui/raidResult.js
- * Последовательный пост-рейдовый отчёт (выжил / погиб):
- *   шаг 1 — Список убийств
- *   шаг 2 — Статистика рейда
- *   шаг 3 — Опыта получено
- * Собственный scoped CSS, шрифты Bebas Neue / Oswald, акцент #e27210.
+ * Последовательные экраны итогов рейда:
+ *   1. Список убийств   2. Статистика рейда   3. Опыт (с проверкой уровня)
+ *
+ * Формат payload — ровно то, что шлёт RaidSystem.end():
+ *   { kind, kills, xp, value, time, exit, mapId, faction, night }
+ * kind ∈ 'survived' | 'killed' | 'mia' | 'deserted'
+ * Реестра убитых в payload НЕТ — есть только счётчик kills, поэтому экран 1
+ * синтезирует имена из пула-заглушки.
  * ========================================================================== */
 
-import { ensureTarkovFonts, STATE, formatRaidClock } from './escapeMenu.js'
+import {
+  ensureTarkovFonts,
+  formatRaidClock,
+  call,
+  playUiSound,
+  installAudioCompat,
+  STATE,
+} from './escapeMenu.js'
 
 export const RAID_STEP = {
   KILLS: 'kills',
@@ -17,102 +27,49 @@ export const RAID_STEP = {
 
 export const RAID_STEP_ORDER = [RAID_STEP.KILLS, RAID_STEP.STATS, RAID_STEP.EXPERIENCE]
 
-/* --------------------------------------------------------------------------
- * Данные по умолчанию — полностью совпадают со скриншотами.
- * Любое поле перекрывается реальными данными из ctx.get('raid').stats.
- * ------------------------------------------------------------------------ */
+const STEP_TITLES = {
+  kills: 'СПИСОК УБИЙСТВ',
+  stats: 'СТАТИСТИКА РЕЙДА',
+  experience: 'ПОЛУЧЕННЫЙ ОПЫТ',
+}
+
+const STEP_LABELS = {
+  kills: 'Убийства',
+  stats: 'Статистика',
+  experience: 'Опыт',
+}
+
+/* Статусы совпадают с kind из RaidSystem.end(). */
+const KIND_META = {
+  survived: { label: 'ВЫЖИЛ', tone: 'ok' },
+  killed: { label: 'ПОГИБ', tone: 'bad' },
+  mia: { label: 'ПРОПАЛ БЕЗ ВЕСТИ', tone: 'warn' },
+  deserted: { label: 'ДЕЗЕРТИР', tone: 'bad' },
+}
+
+const MAP_TITLES = {
+  factory: 'Завод',
+  woods: 'Лес',
+  customs: 'Таможня',
+  cyberlarp: 'CyberLarp',
+}
+
+/* Пул имён для экрана 1: RaidSystem не ведёт реестр убитых, только счётчик. */
 export const DEFAULT_KILL_LIST = [
-  { location: 'Завод', time: '00:01:28', player: 'Жора Вереск',     level: '—', faction: 'дикий', status: 'Убит (HK 416A5, грудная клетка, 5.5 м)' },
-  { location: 'Завод', time: '00:02:36', player: 'Тагилла',         level: '—', faction: 'БОСС',   status: 'В голову (HK 416A5, 4.9 м)' },
-  { location: 'Завод', time: '00:03:10', player: 'Влад Геленджик', level: '—', faction: 'дикий', status: 'Убит (МР-155, грудная клетка, 5.4 м)' },
-  { location: 'Завод', time: '00:03:44', player: 'Трифон Кот',      level: '—', faction: 'дикий', status: 'Убит (МР-155, грудная клетка, 7.1 м)' },
-  { location: 'Завод', time: '00:04:19', player: 'Пуш Шапка',       level: '—', faction: 'дикий', status: 'Убит (МР-155, живот, 3.8 м)' },
+  { name: 'Жора Вереск', faction: 'ДИКИЕ', level: 21, weapon: 'АКС-74У', bodyPart: 'Грудь', distance: 42, xp: 315 },
+  { name: 'Толя Картечь', faction: 'ДИКИЕ', level: 14, weapon: 'МР-133', bodyPart: 'Голова', distance: 18, xp: 288 },
+  { name: 'USEC_Grimm', faction: 'USEC', level: 37, weapon: 'M4A1', bodyPart: 'Живот', distance: 96, xp: 512 },
+  { name: 'BEAR_Сентябрь', faction: 'BEAR', level: 29, weapon: 'АК-105', bodyPart: 'Грудь', distance: 61, xp: 447 },
+  { name: 'Тагилла', faction: 'БОСС', level: 52, weapon: 'Кувалда', bodyPart: 'Голова', distance: 7, xp: 1840 },
 ]
 
-export const DEFAULT_RAID_STATS = [
-  {
-    title: 'Здоровье и физическое состояние',
-    rows: [
-      { label: 'Крови потеряно', value: '0.11л' },
-      { label: 'Частей тела потеряно', value: '1' },
-      { label: 'Наименее поражаемая часть тела', value: 'ГОЛОВА' },
-      { label: 'Здоровья восстановлено', value: '126.88' },
-    ],
-  },
-  {
-    title: 'Добыча',
-    rows: [
-      { label: 'Км пройдено', value: '0.481' },
-      { label: 'Тел обыскано', value: '3' },
-      { label: 'Оружия найдено', value: '1' },
-      { label: 'Найдено обвесов', value: '8' },
-      { label: 'Метательного оружия найдено', value: '3' },
-      { label: 'Провианта найдено', value: '1' },
-      { label: 'Снаряжения найдено', value: '9' },
-    ],
-  },
-  {
-    title: 'Бой',
-    rows: [
-      { label: 'Урон нанесенный по телу', value: '888' },
-      { label: 'Урон поглощенный броней', value: '809' },
-      { label: 'Боеприпасов израсходовано', value: '73' },
-      { label: 'Количество попаданий', value: '33' },
-      { label: 'Смертельных попаданий', value: '5' },
-    ],
-  },
-]
-
-export const DEFAULT_EXPERIENCE = {
-  levelFrom: 41,
-  levelTo: 42,
-  levelStartXp: 3998100,
-  currentXp: 4575176,
-  remainingXp: 190623,
-  groups: [
-    {
-      title: 'Боевой опыт',
-      total: 3119,
-      rows: [
-        { label: 'Уничтожение противника', count: 5, xp: 1445 },
-        { label: 'Попадания в голову', count: 1, xp: 1347 },
-        { label: 'Бонус за серию убийств', count: null, xp: 310 },
-        { label: 'Нанесенный тяжелый урон', count: null, xp: 17 },
-      ],
-    },
-    {
-      title: 'Исследовательский опыт',
-      total: 300,
-      rows: [{ label: 'Опыт за выход из локации', count: null, xp: 300 }],
-    },
-    {
-      title: 'Лечение и уход',
-      total: 166,
-      rows: [{ label: 'Лечение', count: null, xp: 166 }],
-    },
-    {
-      title: 'Опыт за нахождение предметов',
-      total: 335,
-      rows: [{ label: 'Предметы', count: null, xp: 335 }],
-    },
-  ],
-  summary: {
-    status: 'Выжил',
-    base: 3919,
-    multipliers: [1.5, 1.2],
-    total: 7031,
-  },
-}
-
-/* ------------------------------------------------------------------ utils */
-function call(target, method, ...args) {
-  if (target && typeof target[method] === 'function') return target[method](...args)
-  return undefined
-}
+/* Оставлены для обратной совместимости импортов. */
+export const DEFAULT_RAID_STATS = []
+export const DEFAULT_EXPERIENCE = { levelFrom: 1, levelTo: 1, gained: 0 }
 
 export function formatNumber(value) {
-  if (value == null || isNaN(value)) return '0'
-  return Math.round(value).toLocaleString('ru-RU')
+  const n = Math.round(Number(value) || 0)
+  return String(n).replace(/\B(?=(\d{3})+(?!\d))/g, ' ')
 }
 
 function escapeHtml(value) {
@@ -123,348 +80,142 @@ function escapeHtml(value) {
     .replace(/"/g, '&quot;')
 }
 
-/* ==========================================================================
- * CSS
- * ========================================================================== */
+function levelRequirement(meta, lvl) {
+  const safe = Math.max(1, Math.round(Number(lvl) || 1))
+  if (meta && typeof meta._need === 'function') {
+    const v = Number(meta._need(safe))
+    if (Number.isFinite(v) && v > 0) return v
+  }
+  /* Та же кривая, что в MetaSystem._need(). */
+  return Math.round(1000 * Math.pow(safe, 1.35))
+}
+
 const RAID_RESULT_CSS = `
 .efl-res, .efl-res * { box-sizing: border-box; margin: 0; padding: 0; }
-
 .efl-res {
-  --efl-orange: #e27210;
+  --efl-accent: #e27210;
   --efl-lime: #9bd12a;
   --efl-text: #c8c7c2;
-  --efl-dim: #85847f;
-  --efl-line: rgba(200, 199, 194, 0.10);
-  position: fixed;
-  inset: 0;
-  z-index: 9200;
-  display: flex;
-  flex-direction: column;
-  align-items: center;
+  --efl-dim: #86857f;
+  --efl-line: rgba(200, 199, 194, 0.12);
+  position: fixed; inset: 0; z-index: 9400;
+  display: flex; flex-direction: column;
   font-family: 'Oswald', 'Geometria', Arial, sans-serif;
-  color: var(--efl-text);
-  user-select: none;
-  opacity: 0;
-  transition: opacity 160ms ease-out;
+  color: var(--efl-text); user-select: none;
+  opacity: 0; transition: opacity 150ms ease-out;
 }
 .efl-res.is-visible { opacity: 1; }
-
 .efl-res__bg {
-  position: absolute;
-  inset: 0;
-  background:
-    radial-gradient(120% 100% at 50% 0%, rgba(30, 29, 25, 0.55) 0%, rgba(6, 7, 6, 0.95) 70%),
-    #060706;
-  backdrop-filter: blur(10px) saturate(0.7);
-  -webkit-backdrop-filter: blur(10px) saturate(0.7);
+  position: absolute; inset: 0;
+  background: radial-gradient(120% 100% at 50% 0%, rgba(26,26,22,0.72) 0%, rgba(5,6,5,0.97) 78%), rgba(6,7,6,0.92);
+  backdrop-filter: blur(14px) saturate(0.7); -webkit-backdrop-filter: blur(14px) saturate(0.7);
 }
-.efl-res__bg::after {
-  content: '';
-  position: absolute;
-  inset: 0;
-  opacity: 0.055;
-  background-image: repeating-linear-gradient(0deg, rgba(255,255,255,0.08) 0 1px, transparent 1px 3px);
-  mix-blend-mode: overlay;
-}
-
-.efl-res__head { position: relative; padding: 40px 0 6px; text-align: center; }
+.efl-res__head { position: relative; padding: 30px 52px 0; }
 .efl-res__title {
-  font-family: 'Bebas Neue', Impact, sans-serif;
-  font-size: 46px;
-  letter-spacing: 0.15em;
-  line-height: 1;
-  color: #eceae5;
-  text-shadow: 0 3px 22px rgba(0,0,0,0.9);
+  font-family: 'Bebas Neue', Impact, sans-serif; font-size: 42px; line-height: 1;
+  letter-spacing: 0.16em; color: #eceae5;
 }
 .efl-res__subtitle {
-  margin-top: 7px;
-  font-size: 13px;
-  font-weight: 300;
-  letter-spacing: 0.3em;
-  text-transform: uppercase;
-  color: var(--efl-dim);
+  margin-top: 7px; font-size: 13px; font-weight: 300; letter-spacing: 0.2em;
+  text-transform: uppercase; color: var(--efl-dim);
 }
-.efl-res__steps { margin-top: 16px; display: flex; gap: 8px; justify-content: center; }
-.efl-res__step-dot {
-  width: 46px;
-  height: 3px;
-  background: rgba(200, 199, 194, 0.16);
-  transition: background 160ms linear, box-shadow 160ms linear;
+.efl-res__status { font-weight: 600; letter-spacing: 0.14em; }
+.efl-res__status--ok { color: var(--efl-lime); }
+.efl-res__status--bad { color: #e2544a; }
+.efl-res__status--warn { color: var(--efl-accent); }
+.efl-res__steps { display: flex; gap: 26px; margin-top: 20px; border-bottom: 1px solid var(--efl-line); }
+.efl-res__step {
+  position: relative; padding: 6px 2px 12px; font-family: 'Bebas Neue', Impact, sans-serif;
+  font-size: 21px; letter-spacing: 0.14em; color: #6f6e69;
 }
-.efl-res__step-dot.is-active { background: var(--efl-orange); box-shadow: 0 0 14px rgba(226, 114, 16, 0.6); }
-.efl-res__step-dot.is-done { background: rgba(226, 114, 16, 0.45); }
-
-.efl-res__scroll {
-  position: relative;
-  width: 100%;
-  max-width: 1320px;
-  flex: 1 1 auto;
-  margin-top: 26px;
-  padding: 0 40px 26px;
-  overflow-y: auto;
-  scrollbar-width: thin;
-  scrollbar-color: rgba(226,114,16,0.5) transparent;
+.efl-res__step.is-active { color: var(--efl-accent); }
+.efl-res__step.is-done { color: #b0afaa; }
+.efl-res__step.is-active::after {
+  content: ''; position: absolute; left: 0; right: 0; bottom: -1px; height: 2px;
+  background: var(--efl-accent); box-shadow: 0 0 16px rgba(226,114,16,0.75);
 }
+.efl-res__body { position: relative; flex: 1 1 auto; overflow: hidden; padding: 22px 52px 10px; }
+.efl-res__pane { display: none; height: 100%; }
+.efl-res__pane.is-active { display: block; animation: efl-res-in 190ms ease-out both; }
+@keyframes efl-res-in { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: translateY(0); } }
+.efl-res__scroll { max-height: 100%; overflow-y: auto; scrollbar-width: thin; scrollbar-color: rgba(226,114,16,0.5) transparent; }
 .efl-res__scroll::-webkit-scrollbar { width: 6px; }
-.efl-res__scroll::-webkit-scrollbar-thumb { background: rgba(226, 114, 16, 0.45); }
-.efl-res__scroll::-webkit-scrollbar-track { background: rgba(255,255,255,0.03); }
-
-.efl-res__pane { display: none; animation: efl-res-in 200ms ease-out both; }
-.efl-res__pane.is-active { display: block; }
-@keyframes efl-res-in {
-  from { opacity: 0; transform: translateY(10px); }
-  to   { opacity: 1; transform: translateY(0); }
+.efl-res__scroll::-webkit-scrollbar-thumb { background: rgba(226,114,16,0.45); }
+.efl-res__table { width: 100%; border-collapse: collapse; font-size: 13.5px; font-weight: 300; }
+.efl-res__table th {
+  text-align: left; padding: 8px 12px; font-size: 11px; font-weight: 500;
+  letter-spacing: 0.16em; text-transform: uppercase; color: var(--efl-dim);
+  border-bottom: 1px solid rgba(226,114,16,0.35); white-space: nowrap;
 }
-
-/* ------------------------------- шаг 1: таблица убийств ------------------- */
-.efl-res__table { width: 100%; border-collapse: collapse; background: rgba(12, 12, 11, 0.55); }
-.efl-res__table thead th {
-  padding: 11px 14px;
-  text-align: left;
-  font-size: 11px;
-  font-weight: 500;
-  letter-spacing: 0.2em;
-  text-transform: uppercase;
-  color: var(--efl-dim);
-  border-bottom: 1px solid rgba(226, 114, 16, 0.35);
-  background: rgba(20, 20, 18, 0.75);
-  white-space: nowrap;
+.efl-res__table td { padding: 9px 12px; border-bottom: 1px solid var(--efl-line); }
+.efl-res__table tr:hover td { background: rgba(255,255,255,0.02); }
+.efl-res__name { font-weight: 500; color: #eceae5; letter-spacing: 0.03em; }
+.efl-res__tag {
+  display: inline-block; padding: 2px 8px; font-size: 10.5px; letter-spacing: 0.14em;
+  background: rgba(226,114,16,0.16); border: 1px solid rgba(226,114,16,0.4); color: #f0a45c;
 }
-.efl-res__table tbody td {
-  padding: 12px 14px;
-  font-size: 14px;
-  font-weight: 300;
-  color: #d3d2cd;
-  border-bottom: 1px solid var(--efl-line);
-  vertical-align: middle;
-}
-.efl-res__table tbody tr { transition: background 120ms linear; }
-.efl-res__table tbody tr:nth-child(even) { background: rgba(255, 255, 255, 0.014); }
-.efl-res__table tbody tr:hover { background: rgba(226, 114, 16, 0.08); }
-.efl-res__table tbody tr:hover td:first-child { box-shadow: inset 3px 0 0 var(--efl-orange); }
-.efl-res__cell-index { width: 54px; color: var(--efl-dim); font-variant-numeric: tabular-nums; }
-.efl-res__cell-time { width: 108px; font-variant-numeric: tabular-nums; color: #bab9b4; }
-.efl-res__cell-level { width: 70px; text-align: center; color: var(--efl-dim); }
-.efl-res__cell-name { font-weight: 400; color: #eceae5; }
-.efl-res__faction { font-size: 12.5px; letter-spacing: 0.08em; color: #a9a8a3; text-transform: lowercase; }
-.efl-res__faction--boss {
-  color: #14100a;
-  background: var(--efl-orange);
-  padding: 2px 9px;
-  font-weight: 600;
-  letter-spacing: 0.14em;
-  text-transform: uppercase;
-}
-.efl-res__faction--usec, .efl-res__faction--bear { color: #dcdbd6; text-transform: uppercase; letter-spacing: 0.14em; }
-.efl-res__status { color: #b4b3ae; font-size: 13px; }
-.efl-res__status--head { color: #e9c48a; }
-.efl-res__empty { padding: 40px; text-align: center; color: var(--efl-dim); letter-spacing: 0.14em; text-transform: uppercase; }
-
-/* ------------------------------- шаг 2: статистика ----------------------- */
-.efl-res__group { margin-bottom: 30px; }
+.efl-res__num { font-variant-numeric: tabular-nums; text-align: right; }
+.efl-res__xpcell { color: var(--efl-lime); font-variant-numeric: tabular-nums; text-align: right; }
+.efl-res__empty { padding: 34px 12px; text-align: center; color: var(--efl-dim); font-weight: 300; font-size: 14px; }
+.efl-res__group { margin-bottom: 22px; max-width: 860px; }
 .efl-res__group-title {
-  font-family: 'Bebas Neue', Impact, sans-serif;
-  font-size: 24px;
-  letter-spacing: 0.12em;
-  color: #eceae5;
-  padding-bottom: 8px;
-  border-bottom: 1px solid rgba(226, 114, 16, 0.4);
-  margin-bottom: 4px;
-}
-.efl-res__row {
-  display: flex;
-  align-items: baseline;
-  gap: 12px;
-  padding: 9px 4px;
-  border-bottom: 1px solid var(--efl-line);
-  font-size: 14px;
-  font-weight: 300;
-}
-.efl-res__row:hover { background: rgba(255,255,255,0.02); }
-.efl-res__row-label { color: #bcbbb6; white-space: nowrap; }
-.efl-res__row-lead { flex: 1 1 auto; border-bottom: 1px dotted rgba(200,199,194,0.18); transform: translateY(-4px); }
-.efl-res__row-value { color: #eceae5; font-weight: 400; font-variant-numeric: tabular-nums; white-space: nowrap; }
-
-/* ------------------------------- шаг 3: опыт ---------------------------- */
-.efl-res__xp-head {
-  display: grid;
-  grid-template-columns: 92px 1fr 92px;
-  align-items: center;
-  gap: 22px;
-  padding: 8px 0 26px;
-}
-.efl-res__xp-level {
-  display: grid;
-  place-items: center;
-  height: 76px;
-  background: linear-gradient(180deg, rgba(28,28,25,0.95) 0%, rgba(15,15,13,0.95) 100%);
-  border: 1px solid rgba(255,255,255,0.07);
-  font-family: 'Bebas Neue', Impact, sans-serif;
-  font-size: 44px;
-  letter-spacing: 0.06em;
-  color: #eceae5;
-}
-.efl-res__xp-level--next { color: var(--efl-orange); border-color: rgba(226,114,16,0.45); }
-.efl-res__xp-bar-wrap { position: relative; }
-.efl-res__xp-bar {
-  position: relative;
-  height: 20px;
-  background: rgba(255,255,255,0.05);
-  border: 1px solid rgba(255,255,255,0.08);
-  overflow: hidden;
-}
-.efl-res__xp-fill {
-  position: absolute;
-  inset: 0 auto 0 0;
-  width: 0%;
-  background:
-    repeating-linear-gradient(115deg, rgba(255,255,255,0.14) 0 6px, transparent 6px 13px),
-    linear-gradient(90deg, #b8560a 0%, #e27210 70%, #ff9a3c 100%);
-  box-shadow: 0 0 26px rgba(226, 114, 16, 0.55);
-  transition: width 900ms cubic-bezier(0.2, 0.7, 0.2, 1);
-}
-.efl-res__xp-meta {
-  margin-top: 9px;
-  display: flex;
-  justify-content: space-between;
-  font-size: 12.5px;
-  font-weight: 300;
-  letter-spacing: 0.08em;
-  color: var(--efl-dim);
-}
-.efl-res__xp-meta b { color: #dcdbd6; font-weight: 500; font-variant-numeric: tabular-nums; }
-
-.efl-res__xp-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px 34px; }
-.efl-res__xp-group { background: rgba(12,12,11,0.5); border: 1px solid var(--efl-line); padding: 14px 16px 8px; }
-.efl-res__xp-group-head {
-  display: flex;
-  align-items: baseline;
-  justify-content: space-between;
-  gap: 14px;
-  padding-bottom: 9px;
+  font-family: 'Bebas Neue', Impact, sans-serif; font-size: 19px; letter-spacing: 0.14em;
+  color: #dcdbd6; padding-bottom: 6px; margin-bottom: 4px;
   border-bottom: 1px solid rgba(226,114,16,0.35);
 }
-.efl-res__xp-group-title {
-  font-family: 'Bebas Neue', Impact, sans-serif;
-  font-size: 21px;
-  letter-spacing: 0.1em;
-  color: #eceae5;
+.efl-res__row { display: flex; align-items: baseline; gap: 14px; padding: 7px 4px; border-bottom: 1px solid var(--efl-line); }
+.efl-res__row-label { flex: 1 1 auto; font-size: 13.5px; font-weight: 300; color: #b7b6b1; }
+.efl-res__row-value { font-size: 14px; color: #eceae5; font-variant-numeric: tabular-nums; letter-spacing: 0.03em; }
+.efl-res__xp { max-width: 900px; }
+.efl-res__xp-levels { display: flex; align-items: center; gap: 18px; margin-bottom: 14px; }
+.efl-res__xp-badge {
+  min-width: 78px; padding: 8px 4px; text-align: center;
+  background: rgba(18,18,16,0.9); border: 1px solid var(--efl-line);
 }
-.efl-res__xp-group-total {
-  font-family: 'Bebas Neue', Impact, sans-serif;
-  font-size: 21px;
-  letter-spacing: 0.06em;
-  color: var(--efl-orange);
-  font-variant-numeric: tabular-nums;
+.efl-res__xp-badge-cap { font-size: 10px; letter-spacing: 0.18em; text-transform: uppercase; color: var(--efl-dim); }
+.efl-res__xp-badge-val { font-family: 'Bebas Neue', Impact, sans-serif; font-size: 34px; line-height: 1; color: #eceae5; }
+.efl-res__xp-badge--next { border-color: rgba(226,114,16,0.55); }
+.efl-res__xp-badge--next .efl-res__xp-badge-val { color: var(--efl-accent); }
+.efl-res__xp-arrow { color: var(--efl-dim); font-size: 22px; }
+.efl-res__levelup {
+  display: none; margin-left: auto; padding: 8px 18px;
+  background: linear-gradient(180deg, #f0821a 0%, #d9660b 100%);
+  color: #1a0c02; font-family: 'Bebas Neue', Impact, sans-serif;
+  font-size: 22px; letter-spacing: 0.16em;
+  box-shadow: 0 0 30px rgba(226,114,16,0.5);
+  animation: efl-res-pulse 1.5s ease-in-out infinite;
 }
-.efl-res__xp-row {
-  display: flex;
-  align-items: baseline;
-  gap: 10px;
-  padding: 8px 2px;
-  border-bottom: 1px solid var(--efl-line);
-  font-size: 13.5px;
-  font-weight: 300;
+.efl-res__levelup.is-visible { display: block; }
+@keyframes efl-res-pulse { 50% { box-shadow: 0 0 46px rgba(226,114,16,0.85); } }
+.efl-res__bar {
+  position: relative; height: 20px; background: rgba(255,255,255,0.07);
+  border: 1px solid var(--efl-line); overflow: hidden;
 }
-.efl-res__xp-row:last-child { border-bottom: 0; }
-.efl-res__xp-count {
-  min-width: 24px;
-  padding: 1px 6px;
-  text-align: center;
-  background: rgba(226, 114, 16, 0.16);
-  border: 1px solid rgba(226, 114, 16, 0.3);
-  color: #f0a45c;
-  font-size: 11.5px;
+.efl-res__bar-fill {
+  position: absolute; left: 0; top: 0; bottom: 0; width: 0%;
+  background: linear-gradient(90deg, #b4581f 0%, var(--efl-accent) 60%, #ffa14a 100%);
+  box-shadow: 0 0 18px rgba(226,114,16,0.6);
 }
-.efl-res__xp-value { color: #eceae5; font-weight: 400; font-variant-numeric: tabular-nums; white-space: nowrap; }
-
-.efl-res__banner {
-  margin: 26px 0 10px;
-  padding: 13px 22px;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  gap: 16px;
-  background: linear-gradient(90deg, rgba(120, 165, 25, 0.9) 0%, rgba(155, 209, 42, 0.92) 50%, rgba(120, 165, 25, 0.9) 100%);
-  border: 1px solid rgba(210, 255, 130, 0.4);
-  box-shadow: 0 0 42px rgba(155, 209, 42, 0.28);
-  color: #10160a;
-  font-size: 19px;
-  font-weight: 600;
-  letter-spacing: 0.06em;
-  font-variant-numeric: tabular-nums;
-}
-.efl-res__banner-status { font-family: 'Bebas Neue', Impact, sans-serif; font-size: 26px; letter-spacing: 0.14em; }
-.efl-res__banner-sep { opacity: 0.45; }
-
-.efl-res__exp-total { display: flex; align-items: center; justify-content: center; gap: 12px; padding: 6px 0 4px; }
-.efl-res__exp-tag {
-  padding: 3px 10px;
-  background: #c8c7c2;
-  color: #12120f;
-  font-size: 12px;
-  font-weight: 700;
-  letter-spacing: 0.14em;
-}
-.efl-res__exp-value {
-  font-family: 'Bebas Neue', Impact, sans-serif;
-  font-size: 34px;
-  letter-spacing: 0.08em;
-  color: #eceae5;
-  font-variant-numeric: tabular-nums;
-}
-
-/* ------------------------------- низ ------------------------------------ */
+.efl-res__bar-meta { display: flex; justify-content: space-between; margin-top: 7px; font-size: 12.5px; color: var(--efl-dim); }
+.efl-res__bar-meta b { color: var(--efl-lime); font-weight: 500; }
+.efl-res__note { margin-top: 16px; font-size: 13px; font-weight: 300; color: var(--efl-dim); }
 .efl-res__foot {
-  position: relative;
-  width: 100%;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  gap: 56px;
-  padding: 14px 0 34px;
+  position: relative; display: flex; align-items: center; gap: 26px;
+  padding: 14px 52px 30px; border-top: 1px solid var(--efl-line);
 }
+.efl-res__hint { font-size: 11.5px; letter-spacing: 0.16em; text-transform: uppercase; color: rgba(200,199,194,0.35); }
+.efl-res__actions { margin-left: auto; display: flex; align-items: center; gap: 26px; }
 .efl-res__btn {
-  background: none;
-  border: 0;
-  cursor: pointer;
-  font-family: 'Bebas Neue', Impact, sans-serif;
-  font-size: 34px;
-  letter-spacing: 0.16em;
-  color: #bdbcb7;
-  padding: 4px 30px;
-  position: relative;
-  transition: color 120ms linear, text-shadow 120ms linear, opacity 120ms linear;
+  background: none; border: 0; cursor: pointer;
+  font-family: 'Bebas Neue', Impact, sans-serif; font-size: 27px; letter-spacing: 0.16em;
+  color: #bdbcb7; padding: 4px 18px;
+  transition: color 120ms linear, text-shadow 120ms linear;
 }
-.efl-res__btn:hover, .efl-res__btn:focus-visible {
-  color: #fff;
-  outline: none;
-  text-shadow: 0 0 20px rgba(226, 114, 16, 0.6);
-}
-.efl-res__btn::before, .efl-res__btn::after {
-  content: '';
-  position: absolute;
-  top: 50%;
-  width: 0;
-  height: 2px;
-  background: var(--efl-orange);
-  transform: translateY(-50%);
-  transition: width 140ms ease-out;
-}
-.efl-res__btn::before { left: 4px; }
-.efl-res__btn::after { right: 4px; }
-.efl-res__btn:hover::before, .efl-res__btn:hover::after { width: 18px; }
-.efl-res__btn[disabled] { opacity: 0.25; pointer-events: none; }
-.efl-res__build {
-  position: absolute;
-  left: 18px;
-  bottom: 12px;
-  font-size: 12px;
-  font-weight: 300;
-  letter-spacing: 0.12em;
-  text-transform: uppercase;
-  color: rgba(200,199,194,0.4);
-}
+.efl-res__btn:hover, .efl-res__btn:focus-visible { color: #fff; outline: none; text-shadow: 0 0 18px rgba(226,114,16,0.6); }
+.efl-res__btn[disabled] { opacity: 0.3; cursor: default; }
+.efl-res__btn[disabled]:hover { color: #bdbcb7; text-shadow: none; }
+.efl-res__btn--accent { color: var(--efl-accent); }
+.efl-res__btn--accent:hover { color: #ffa14a; }
 `
 
 /* ==========================================================================
@@ -473,27 +224,46 @@ const RAID_RESULT_CSS = `
 export class RaidResultSystem {
   constructor(ctx, options = {}) {
     this.ctx = ctx
-    this.options = options
+    this.options = options || {}
+
     this.root = null
     this.isOpen = false
+    this.destroyed = false
     this.stepIndex = 0
-    this.result = null
-    this.buildVersion = options.buildVersion || '1.1.0.1.46911'
-    this.gameMode = options.gameMode || 'PvE'
+    this.model = null
 
+    this._raf = 0
     this._onClick = this._onClick.bind(this)
-    this._onKeyDown = this._onKeyDown.bind(this)
 
     ensureTarkovFonts()
     this._injectStyles()
   }
 
+  /* ---------------------------------------------------------------- utils */
   _svc(name) {
-    if (!this.ctx || typeof this.ctx.get !== 'function') return null
-    try { return this.ctx.get(name) } catch (e) { return null }
+    const ctx = this.ctx
+    if (!ctx) return null
+    if (typeof ctx.peek === 'function') {
+      try { return ctx.peek(name) } catch (e) { return null }
+    }
+    if (typeof ctx.get === 'function') {
+      try { return ctx.get(name) } catch (e) { return null }
+    }
+    return null
+  }
+
+  _engine() {
+    if (this.ctx && this.ctx.engine) return this.ctx.engine
+    if (this.options.engine) return this.options.engine
+    return null
+  }
+
+  _audio() {
+    return installAudioCompat(this._svc('audio'))
   }
 
   _injectStyles() {
+    if (typeof document === 'undefined') return
     if (document.getElementById('efl-raid-result-css')) return
     const style = document.createElement('style')
     style.id = 'efl-raid-result-css'
@@ -501,309 +271,499 @@ export class RaidResultSystem {
     document.head.appendChild(style)
   }
 
-  /* Собираем модель отчёта: реальные данные рейда перекрывают дефолты. */
-  _buildModel(payload = {}) {
-    const raid = this._svc('raid')
-    const stats = (raid && raid.stats) || {}
-    const map = payload.map || (raid && raid.mapTitle) || 'ЗАВОД'
+  get step() {
+    return RAID_STEP_ORDER[this.stepIndex] || RAID_STEP_ORDER[0]
+  }
+
+  /* ----------------------------------------------------------- модель */
+  _buildModel(payload) {
+    const p = payload && typeof payload === 'object' ? payload : {}
+    const kind = KIND_META[p.kind] ? p.kind : 'survived'
+    const meta = KIND_META[kind]
+
+    const hasKillCount = Number.isFinite(Number(p.kills))
+    const kills = hasKillCount ? Math.max(0, Math.round(Number(p.kills))) : 0
+    const xp = Math.max(0, Math.round(Number(p.xp) || 0))
+    const value = Math.max(0, Math.round(Number(p.value) || 0))
+    const seconds = Math.max(0, Number(p.time) || 0)
+    const mapId = typeof p.mapId === 'string' ? p.mapId : 'factory'
+
     return {
-      map: String(map).toUpperCase(),
-      survived: payload.survived != null ? payload.survived : stats.survived !== false,
-      status: payload.status || stats.exitStatus || (stats.survived === false ? 'Погиб' : 'Выжил'),
-      durationMs: payload.durationMs != null ? payload.durationMs : (stats.durationMs || 0),
-      kills: payload.kills || stats.kills || DEFAULT_KILL_LIST,
-      statGroups: payload.statGroups || stats.groups || DEFAULT_RAID_STATS,
-      experience: Object.assign({}, DEFAULT_EXPERIENCE, payload.experience || stats.experienceReport || {}),
+      kind: kind,
+      status: meta.label,
+      tone: meta.tone,
+      kills: kills,
+      xp: xp,
+      value: value,
+      seconds: seconds,
+      mapId: mapId,
+      mapTitle: MAP_TITLES[mapId] || mapId,
+      exit: typeof p.exit === 'string' && p.exit ? p.exit : '',
+      faction: typeof p.faction === 'string' && p.faction ? p.faction : 'pmc',
+      night: !!p.night,
+      killList: this._buildKillList(p, kills, hasKillCount),
+      experience: this._buildExperience(p, xp, kind),
     }
   }
 
-  /* --------------------------------------------------------------- показ */
-  show(payload = {}) {
-    if (this.isOpen) return
-    this.isOpen = true
-    this.stepIndex = 0
-    this.result = this._buildModel(payload)
+  /* Реальный payload несёт только число убитых, имена придётся выдумать. */
+  _buildKillList(p, kills, hasKillCount) {
+    if (Array.isArray(p.killList) && p.killList.length) {
+      return p.killList.map((raw, i) => {
+        const src = raw && typeof raw === 'object' ? raw : {}
+        const mock = DEFAULT_KILL_LIST[i % DEFAULT_KILL_LIST.length]
+        return {
+          name: src.name || src.nickname || mock.name,
+          faction: src.faction || mock.faction,
+          level: Number.isFinite(Number(src.level)) ? Number(src.level) : mock.level,
+          weapon: src.weapon || mock.weapon,
+          bodyPart: src.bodyPart || src.zone || mock.bodyPart,
+          distance: Number.isFinite(Number(src.distance)) ? Number(src.distance) : mock.distance,
+          xp: Number.isFinite(Number(src.xp)) ? Number(src.xp) : mock.xp,
+        }
+      })
+    }
 
-    call(this._svc('input'), 'setEnabled', false)
-    if (document.exitPointerLock) document.exitPointerLock()
-    call(this._svc('state'), 'set', STATE.RESULT)
+    /* payload пуст совсем — показываем полный мок-ростер. */
+    if (!hasKillCount) return DEFAULT_KILL_LIST.slice()
+    if (kills <= 0) return []
 
-    const audio = this._svc('audio')
-    call(audio, 'stopRaidAmbience')
-    call(audio, 'playMenuMusic')
-
-    this._render()
-    this._paintStep()
-    document.addEventListener('keydown', this._onKeyDown, true)
-    requestAnimationFrame(() => this.root && this.root.classList.add('is-visible'))
+    const out = []
+    for (let i = 0; i < kills; i++) {
+      out.push(Object.assign({}, DEFAULT_KILL_LIST[i % DEFAULT_KILL_LIST.length]))
+    }
+    return out
   }
 
+  /* Снимок уровня/опыта ДО того, как MetaSystem._afterRaid() зачислит рейд.
+   * UiSystem передаёт его в progressBefore; если его нет — читаем живые данные. */
+  _buildExperience(p, gained, kind) {
+    const meta = this._svc('meta')
+    const before = p.progressBefore && typeof p.progressBefore === 'object' ? p.progressBefore : null
+
+    let lvl = 1
+    let xpInLevel = 0
+    if (before) {
+      lvl = Math.max(1, Math.round(Number(before.lvl) || 1))
+      xpInLevel = Math.max(0, Math.round(Number(before.xp) || 0))
+    } else if (meta && meta.P) {
+      lvl = Math.max(1, Math.round(Number(meta.P.lvl) || 1))
+      xpInLevel = Math.max(0, Math.round(Number(meta.P.xp) || 0))
+    }
+
+    const levelFrom = lvl
+    const segments = []
+    let left = gained
+    let cursor = xpInLevel
+    let current = lvl
+    let guard = 0
+
+    while (guard++ < 500) {
+      const need = levelRequirement(meta, current)
+      const room = Math.max(0, need - cursor)
+      if (left < room || need <= 0) {
+        segments.push({ lvl: current, need: need, from: cursor, to: cursor + left })
+        cursor += left
+        left = 0
+        break
+      }
+      segments.push({ lvl: current, need: need, from: cursor, to: need })
+      left -= room
+      current += 1
+      cursor = 0
+    }
+
+    const need = levelRequirement(meta, current)
+    return {
+      levelFrom: levelFrom,
+      levelTo: current,
+      leveledUp: current > levelFrom,
+      gained: gained,
+      segments: segments,
+      current: cursor,
+      need: need,
+      remaining: Math.max(0, need - cursor),
+      breakdown: this._buildBreakdown(p, gained, kind),
+    }
+  }
+
+  _buildBreakdown(p, gained, kind) {
+    if (gained <= 0) return []
+    const kills = Math.max(0, Math.round(Number(p.kills) || 0))
+    const value = Math.max(0, Math.round(Number(p.value) || 0))
+
+    const killXp = kills > 0 ? Math.round(gained * 0.6) : 0
+    const lootXp = value > 0 ? Math.round(gained * 0.25) : 0
+    const restXp = gained - killXp - lootXp
+
+    const rows = []
+    if (killXp > 0) rows.push({ label: 'Устранение целей ×' + kills, value: killXp })
+    if (lootXp > 0) rows.push({ label: 'Найденная добыча', value: lootXp })
+    rows.push({
+      label: kind === 'survived' ? 'Успешная эвакуация' : 'Исследование локации',
+      value: restXp,
+    })
+    return rows
+  }
+
+  /* ------------------------------------------------------------ показ */
+  show(payload) {
+    if (this.destroyed || typeof document === 'undefined') return
+    this.model = this._buildModel(payload)
+    this.stepIndex = 0
+
+    if (this.root) this._teardownDom()
+    this.isOpen = true
+    this._render()
+    this._paintStep()
+    playUiSound(this._audio(), 'open')
+  }
+
+  close() {
+    if (this._raf) {
+      cancelAnimationFrame(this._raf)
+      this._raf = 0
+    }
+    this._teardownDom()
+    this.isOpen = false
+  }
+
+  hide() {
+    this.close()
+  }
+
+  /* ----------------------------------------------------------- рендер */
   _render() {
-    if (this.root) return
+    const m = this.model
+    if (!m) return
+
     const root = document.createElement('div')
     root.className = 'efl-res'
     root.setAttribute('role', 'dialog')
     root.setAttribute('aria-modal', 'true')
+    if (this.options.zIndex) root.style.zIndex = String(this.options.zIndex)
+
     root.innerHTML =
       '<div class="efl-res__bg"></div>' +
-      '<header class="efl-res__head">' +
-        '<h1 class="efl-res__title">РЕЙД ОКОНЧЕН</h1>' +
-        '<p class="efl-res__subtitle" data-role="subtitle"></p>' +
-        '<div class="efl-res__steps" data-role="steps"></div>' +
-      '</header>' +
-      '<div class="efl-res__scroll">' +
-        '<section class="efl-res__pane" data-pane="kills">' + this._renderKills() + '</section>' +
-        '<section class="efl-res__pane" data-pane="stats">' + this._renderStats() + '</section>' +
-        '<section class="efl-res__pane" data-pane="experience">' + this._renderExperience() + '</section>' +
+      '<div class="efl-res__head">' +
+        '<div class="efl-res__title" data-role="title">' + STEP_TITLES.kills + '</div>' +
+        '<div class="efl-res__subtitle">' +
+          '<span class="efl-res__status efl-res__status--' + m.tone + '">' + escapeHtml(m.status) + '</span>' +
+          ' · ' + escapeHtml(m.mapTitle) +
+          ' · ' + formatRaidClock(m.seconds * 1000) +
+        '</div>' +
+        '<div class="efl-res__steps" data-role="steps">' +
+          RAID_STEP_ORDER.map((id, i) =>
+            '<div class="efl-res__step" data-step="' + id + '">' + (i + 1) + '. ' + STEP_LABELS[id] + '</div>'
+          ).join('') +
+        '</div>' +
       '</div>' +
-      '<footer class="efl-res__foot">' +
-        '<button type="button" class="efl-res__btn" data-act="prev">НАЗАД</button>' +
-        '<button type="button" class="efl-res__btn" data-act="next">ДАЛЕЕ</button>' +
-        '<div class="efl-res__build">' + this.buildVersion + ' | ' + this.gameMode + '</div>' +
-      '</footer>'
+      '<div class="efl-res__body">' +
+        '<div class="efl-res__pane" data-pane="' + RAID_STEP.KILLS + '"><div class="efl-res__scroll">' + this._renderKills() + '</div></div>' +
+        '<div class="efl-res__pane" data-pane="' + RAID_STEP.STATS + '"><div class="efl-res__scroll">' + this._renderStats() + '</div></div>' +
+        '<div class="efl-res__pane" data-pane="' + RAID_STEP.EXPERIENCE + '"><div class="efl-res__scroll">' + this._renderExperience() + '</div></div>' +
+      '</div>' +
+      '<div class="efl-res__foot">' +
+        '<span class="efl-res__hint">шаг <span data-role="step-num">1</span> из ' + RAID_STEP_ORDER.length + '</span>' +
+        '<div class="efl-res__actions">' +
+          '<button type="button" class="efl-res__btn" data-act="prev">НАЗАД</button>' +
+          '<button type="button" class="efl-res__btn efl-res__btn--accent" data-act="next">ДАЛЕЕ</button>' +
+          '<button type="button" class="efl-res__btn efl-res__btn--accent" data-act="finish" hidden>В УБЕЖИЩЕ</button>' +
+        '</div>' +
+      '</div>'
 
     root.addEventListener('click', this._onClick)
     document.body.appendChild(root)
     this.root = root
+
+    requestAnimationFrame(() => {
+      if (this.root) this.root.classList.add('is-visible')
+    })
   }
 
-  /* ----------------------------------------------------- шаг 1: убийства */
   _renderKills() {
-    const kills = this.result.kills
-    if (!kills || !kills.length) {
-      return '<div class="efl-res__empty">В этом рейде убийств не было</div>'
+    const list = this.model.killList
+    if (!list.length) {
+      return '<div class="efl-res__empty">За этот рейд нет подтверждённых убийств.</div>'
     }
-
-    const head =
-      '<thead><tr>' +
-        '<th>#</th>' +
-        '<th>Локация</th>' +
-        '<th>Время</th>' +
-        '<th>Игрок</th>' +
-        '<th>Ур.</th>' +
-        '<th>Фракция</th>' +
-        '<th>Статус</th>' +
-      '</tr></thead>'
-
-    const body = kills.map((kill, i) => {
-      const faction = String(kill.faction || '')
-      const isBoss = faction.toUpperCase() === 'БОСС'
-      const isPmc = /USEC|BEAR/i.test(faction)
-      const factionClass = isBoss
-        ? 'efl-res__faction efl-res__faction--boss'
-        : isPmc ? 'efl-res__faction efl-res__faction--usec' : 'efl-res__faction'
-      const status = String(kill.status || '')
-      const statusClass = /голов/i.test(status) ? 'efl-res__status efl-res__status--head' : 'efl-res__status'
-
-      return (
-        '<tr>' +
-          '<td class="efl-res__cell-index">' + (kill.index != null ? kill.index : i + 1) + '</td>' +
-          '<td>' + escapeHtml(kill.location) + '</td>' +
-          '<td class="efl-res__cell-time">' + escapeHtml(kill.time) + '</td>' +
-          '<td class="efl-res__cell-name">' + escapeHtml(kill.player) + '</td>' +
-          '<td class="efl-res__cell-level">' + escapeHtml(kill.level == null ? '—' : kill.level) + '</td>' +
-          '<td><span class="' + factionClass + '">' + escapeHtml(faction) + '</span></td>' +
-          '<td class="' + statusClass + '">' + escapeHtml(status) + '</td>' +
-        '</tr>'
-      )
-    }).join('')
-
-    return '<table class="efl-res__table">' + head + '<tbody>' + body + '</tbody></table>'
+    return (
+      '<table class="efl-res__table">' +
+        '<thead><tr>' +
+          '<th>#</th><th>Никнейм</th><th>Фракция</th><th>Ур.</th>' +
+          '<th>Оружие</th><th>Поражение</th><th>Дистанция</th><th>Опыт</th>' +
+        '</tr></thead><tbody>' +
+        list.map((k, i) =>
+          '<tr>' +
+            '<td class="efl-res__num">' + (i + 1) + '</td>' +
+            '<td class="efl-res__name">' + escapeHtml(k.name) + '</td>' +
+            '<td><span class="efl-res__tag">' + escapeHtml(k.faction) + '</span></td>' +
+            '<td class="efl-res__num">' + escapeHtml(k.level) + '</td>' +
+            '<td>' + escapeHtml(k.weapon) + '</td>' +
+            '<td>' + escapeHtml(k.bodyPart) + '</td>' +
+            '<td class="efl-res__num">' + escapeHtml(k.distance) + ' м</td>' +
+            '<td class="efl-res__xpcell">+' + formatNumber(k.xp) + '</td>' +
+          '</tr>'
+        ).join('') +
+        '</tbody></table>'
+    )
   }
 
-  /* --------------------------------------------------- шаг 2: статистика */
   _renderStats() {
-    return this.result.statGroups.map(group => {
-      const rows = group.rows.map(row =>
-        '<div class="efl-res__row">' +
-          '<span class="efl-res__row-label">' + escapeHtml(row.label) + '</span>' +
-          '<span class="efl-res__row-lead"></span>' +
-          '<span class="efl-res__row-value">' + escapeHtml(row.value) + '</span>' +
-        '</div>'
-      ).join('')
-      return (
-        '<div class="efl-res__group">' +
-          '<div class="efl-res__group-title">' + escapeHtml(group.title) + '</div>' +
-          rows +
-        '</div>'
-      )
-    }).join('')
+    const m = this.model
+    const groups = [
+      {
+        title: 'Итог рейда',
+        rows: [
+          { label: 'Статус', value: m.status },
+          { label: 'Локация', value: m.mapTitle },
+          { label: 'Время в рейде', value: formatRaidClock(m.seconds * 1000) },
+          { label: 'Точка выхода', value: m.exit || '—' },
+          { label: 'Время суток', value: m.night ? 'Ночь' : 'День' },
+          { label: 'Фракция', value: String(m.faction).toUpperCase() },
+        ],
+      },
+      {
+        title: 'Бой',
+        rows: [
+          { label: 'Устранено целей', value: formatNumber(m.kills) },
+          { label: 'Записей в списке убийств', value: formatNumber(m.killList.length) },
+        ],
+      },
+      {
+        title: 'Добыча и опыт',
+        rows: [
+          { label: 'Стоимость вынесенного', value: formatNumber(m.value) + ' ₽' },
+          { label: 'Опыт за рейд', value: '+' + formatNumber(m.xp) },
+        ],
+      },
+    ]
+
+    return groups.map(g =>
+      '<div class="efl-res__group">' +
+        '<div class="efl-res__group-title">' + g.title + '</div>' +
+        g.rows.map(r =>
+          '<div class="efl-res__row">' +
+            '<span class="efl-res__row-label">' + escapeHtml(r.label) + '</span>' +
+            '<span class="efl-res__row-value">' + escapeHtml(r.value) + '</span>' +
+          '</div>'
+        ).join('') +
+      '</div>'
+    ).join('')
   }
 
-  /* -------------------------------------------------------- шаг 3: опыт */
   _renderExperience() {
-    const xp = this.result.experience
-    const nextLevelXp = xp.currentXp + xp.remainingXp
-    const span = Math.max(1, nextLevelXp - xp.levelStartXp)
-    const percent = Math.max(0, Math.min(100, ((xp.currentXp - xp.levelStartXp) / span) * 100))
+    const xp = this.model.experience
+    const breakdown = Array.isArray(xp.breakdown) ? xp.breakdown : []
 
-    const groups = xp.groups.map(group => {
-      const rows = group.rows.map(row =>
-        '<div class="efl-res__xp-row">' +
-          '<span>' + escapeHtml(row.label) + '</span>' +
-          (row.count != null ? '<span class="efl-res__xp-count">' + row.count + '</span>' : '') +
-          '<span class="efl-res__row-lead"></span>' +
-          '<span class="efl-res__xp-value">' + formatNumber(row.xp) + '</span>' +
-        '</div>'
-      ).join('')
-      return (
-        '<div class="efl-res__xp-group">' +
-          '<div class="efl-res__xp-group-head">' +
-            '<span class="efl-res__xp-group-title">' + escapeHtml(group.title) + '</span>' +
-            '<span class="efl-res__xp-group-total">' + formatNumber(group.total) + '</span>' +
-          '</div>' +
-          rows +
-        '</div>'
-      )
-    }).join('')
-
-    const s = xp.summary
-    const formula = s.multipliers.map(m => ' * ' + m).join('')
+    const rows = breakdown.length
+      ? breakdown.map(r =>
+          '<div class="efl-res__row">' +
+            '<span class="efl-res__row-label">' + escapeHtml(r.label) + '</span>' +
+            '<span class="efl-res__row-value">+' + formatNumber(r.value) + '</span>' +
+          '</div>'
+        ).join('')
+      : '<div class="efl-res__note">Опыт за этот рейд не начислен.</div>'
 
     return (
-      '<div class="efl-res__xp-head">' +
-        '<div class="efl-res__xp-level">' + xp.levelFrom + '</div>' +
-        '<div class="efl-res__xp-bar-wrap">' +
-          '<div class="efl-res__xp-bar"><div class="efl-res__xp-fill" data-role="xp-fill" data-target="' + percent.toFixed(2) + '"></div></div>' +
-          '<div class="efl-res__xp-meta">' +
-            '<span>опыт: <b>' + formatNumber(xp.currentXp) + '</b></span>' +
-            '<span>осталось: <b>' + formatNumber(xp.remainingXp) + '</b></span>' +
+      '<div class="efl-res__xp">' +
+        '<div class="efl-res__xp-levels">' +
+          '<div class="efl-res__xp-badge">' +
+            '<div class="efl-res__xp-badge-cap">было</div>' +
+            '<div class="efl-res__xp-badge-val">' + xp.levelFrom + '</div>' +
           '</div>' +
+          '<div class="efl-res__xp-arrow">&rarr;</div>' +
+          '<div class="efl-res__xp-badge efl-res__xp-badge--next">' +
+            '<div class="efl-res__xp-badge-cap">стало</div>' +
+            '<div class="efl-res__xp-badge-val" data-role="xp-level">' + xp.levelFrom + '</div>' +
+          '</div>' +
+          '<div class="efl-res__levelup" data-role="levelup">ПОВЫШЕНИЕ УРОВНЯ</div>' +
         '</div>' +
-        '<div class="efl-res__xp-level efl-res__xp-level--next">' + xp.levelTo + '</div>' +
-      '</div>' +
-      '<div class="efl-res__xp-grid">' + groups + '</div>' +
-      '<div class="efl-res__banner">' +
-        '<span class="efl-res__banner-status">' + escapeHtml(s.status) + '</span>' +
-        '<span class="efl-res__banner-sep">|</span>' +
-        '<span>' + formatNumber(s.base) + formula + ' = ' + formatNumber(s.total) + ' EXP</span>' +
-      '</div>' +
-      '<div class="efl-res__exp-total">' +
-        '<span class="efl-res__exp-tag">EXP</span>' +
-        '<span class="efl-res__exp-value">' + formatNumber(s.total) + '</span>' +
+        '<div class="efl-res__bar"><div class="efl-res__bar-fill" data-role="xp-fill"></div></div>' +
+        '<div class="efl-res__bar-meta">' +
+          '<span data-role="xp-current">0 / 0</span>' +
+          '<span>за рейд <b>+' + formatNumber(xp.gained) + '</b></span>' +
+        '</div>' +
+        '<div class="efl-res__group" style="margin-top:22px">' +
+          '<div class="efl-res__group-title">Из чего сложился опыт</div>' +
+          rows +
+        '</div>' +
+        '<div class="efl-res__note" data-role="xp-remaining"></div>' +
       '</div>'
     )
   }
 
-  /* ------------------------------------------------------------ навигация */
+  /* -------------------------------------------------------- навигация */
   _paintStep() {
     if (!this.root) return
-    const step = RAID_STEP_ORDER[this.stepIndex]
+    const current = this.step
+
+    const title = this.root.querySelector('[data-role="title"]')
+    if (title) title.textContent = STEP_TITLES[current] || ''
+
+    const steps = this.root.querySelectorAll('.efl-res__step')
+    for (let i = 0; i < steps.length; i++) {
+      steps[i].classList.toggle('is-active', i === this.stepIndex)
+      steps[i].classList.toggle('is-done', i < this.stepIndex)
+    }
 
     const panes = this.root.querySelectorAll('.efl-res__pane')
     for (let i = 0; i < panes.length; i++) {
-      panes[i].classList.toggle('is-active', panes[i].getAttribute('data-pane') === step)
+      panes[i].classList.toggle('is-active', panes[i].getAttribute('data-pane') === current)
     }
 
-    const subtitles = {
-      kills: 'Список убийств',
-      stats: 'Статистика рейда • ' + this.result.map,
-      experience: 'Опыта получено',
-    }
-    const subtitle = this.root.querySelector('[data-role="subtitle"]')
-    if (subtitle) subtitle.textContent = subtitles[step]
-
-    const steps = this.root.querySelector('[data-role="steps"]')
-    if (steps) {
-      steps.innerHTML = RAID_STEP_ORDER.map((name, i) => {
-        const cls = i === this.stepIndex ? ' is-active' : (i < this.stepIndex ? ' is-done' : '')
-        return '<span class="efl-res__step-dot' + cls + '"></span>'
-      }).join('')
-    }
+    const num = this.root.querySelector('[data-role="step-num"]')
+    if (num) num.textContent = String(this.stepIndex + 1)
 
     const prev = this.root.querySelector('[data-act="prev"]')
     if (prev) prev.disabled = this.stepIndex === 0
 
-    const scroll = this.root.querySelector('.efl-res__scroll')
-    if (scroll) scroll.scrollTop = 0
+    const isLast = this.stepIndex === RAID_STEP_ORDER.length - 1
+    const next = this.root.querySelector('[data-act="next"]')
+    const finish = this.root.querySelector('[data-act="finish"]')
+    if (next) next.hidden = isLast
+    if (finish) finish.hidden = !isLast
 
-    if (step === RAID_STEP.EXPERIENCE) {
-      const fill = this.root.querySelector('[data-role="xp-fill"]')
-      if (fill) {
-        fill.style.width = '0%'
-        requestAnimationFrame(() => {
-          requestAnimationFrame(() => { fill.style.width = fill.getAttribute('data-target') + '%' })
-        })
-      }
-    }
+    if (current === RAID_STEP.EXPERIENCE) this._animateExperience()
   }
 
   next() {
-    call(this._svc('audio'), 'playUi', 'click')
-    if (this.stepIndex >= RAID_STEP_ORDER.length - 1) { this.finish(); return }
+    if (this.stepIndex >= RAID_STEP_ORDER.length - 1) {
+      this.finish()
+      return
+    }
     this.stepIndex += 1
+    playUiSound(this._audio(), 'click')
     this._paintStep()
   }
 
   prev() {
-    if (this.stepIndex === 0) return
-    call(this._svc('audio'), 'playUi', 'back')
+    if (this.stepIndex <= 0) return
     this.stepIndex -= 1
+    playUiSound(this._audio(), 'back')
     this._paintStep()
   }
 
-  /* Завершение: начисляем опыт, гасим рейд, возвращаемся в меню. */
+  /* Кнопка «В УБЕЖИЩЕ». Раньше звала _svc('mainMenu').show() — такого
+   * сервиса в реестре нет, поэтому визард был тупиком. */
   finish() {
-    const player = this._svc('player')
-    const gained = this.result && this.result.experience && this.result.experience.summary
-      ? this.result.experience.summary.total
-      : 0
-    if (player) {
-      if (typeof player.addExperience === 'function') player.addExperience(gained)
-      else if (player.xp != null) player.xp += gained
-    }
-
-    const raid = this._svc('raid')
-    if (raid && typeof raid.teardown === 'function') raid.teardown()
-
+    playUiSound(this._audio(), 'click')
+    const engine = this._engine()
     this.close()
 
-    const audio = this._svc('audio')
-    call(audio, 'unduck', 300)
-    call(audio, 'playMenuMusic')
-    call(this._svc('mainMenu'), 'show')
-    call(this._svc('state'), 'set', STATE.MENU)
-  }
-
-  close() {
-    document.removeEventListener('keydown', this._onKeyDown, true)
-    if (this.root) {
-      this.root.removeEventListener('click', this._onClick)
-      if (this.root.parentNode) this.root.parentNode.removeChild(this.root)
-      this.root = null
+    if (typeof this.options.onFinish === 'function') {
+      try {
+        this.options.onFinish()
+        return
+      } catch (err) {
+        console.error('[EFL/res] onFinish упал', err)
+      }
     }
-    this.isOpen = false
-    this.stepIndex = 0
+
+    if (!engine) return
+    if (typeof engine.returnToMenu === 'function') call(engine, 'returnToMenu')
+    if (typeof engine.setState === 'function' && engine.state !== STATE.MENU) {
+      engine.setState(STATE.MENU)
+    }
+    call(engine.mainMenu, 'show')
   }
 
-  destroy() { this.close() }
+  /* ------------------------------------------------------- анимация опыта */
+  _animateExperience() {
+    if (!this.root || !this.model) return
+    if (this._raf) {
+      cancelAnimationFrame(this._raf)
+      this._raf = 0
+    }
 
-  /* --------------------------------------------------------------- события */
+    const xp = this.model.experience
+    const segments = Array.isArray(xp.segments) && xp.segments.length
+      ? xp.segments
+      : [{ lvl: xp.levelFrom, need: Math.max(1, xp.need), from: 0, to: 0 }]
+
+    const fill = this.root.querySelector('[data-role="xp-fill"]')
+    const levelEl = this.root.querySelector('[data-role="xp-level"]')
+    const currentEl = this.root.querySelector('[data-role="xp-current"]')
+    const levelUpEl = this.root.querySelector('[data-role="levelup"]')
+    const remainingEl = this.root.querySelector('[data-role="xp-remaining"]')
+
+    if (remainingEl) {
+      remainingEl.textContent = 'До ' + (xp.levelTo + 1) + '-го уровня осталось ' + formatNumber(xp.remaining) + ' опыта.'
+    }
+
+    const stepDuration = Math.max(260, Math.round(1000 / segments.length))
+    let index = 0
+
+    const paint = (seg, current) => {
+      const need = seg.need > 0 ? seg.need : 1
+      const pct = Math.max(0, Math.min(100, (current / need) * 100))
+      if (fill) fill.style.width = pct.toFixed(2) + '%'
+      if (levelEl) levelEl.textContent = String(seg.lvl)
+      if (currentEl) currentEl.textContent = formatNumber(current) + ' / ' + formatNumber(need)
+    }
+
+    const runSegment = () => {
+      if (this.destroyed || !this.isOpen || !this.root) return
+      if (index >= segments.length) {
+        if (xp.leveledUp && levelUpEl) levelUpEl.classList.add('is-visible')
+        if (levelEl) levelEl.textContent = String(xp.levelTo)
+        if (xp.leveledUp) playUiSound(this._audio(), 'levelup')
+        this._raf = 0
+        return
+      }
+
+      const seg = segments[index]
+      const started = performance.now()
+
+      const tick = (now) => {
+        if (this.destroyed || !this.isOpen || !this.root) return
+        const k = Math.min(1, (now - started) / stepDuration)
+        const eased = 1 - Math.pow(1 - k, 3)
+        paint(seg, seg.from + (seg.to - seg.from) * eased)
+        if (k < 1) {
+          this._raf = requestAnimationFrame(tick)
+          return
+        }
+        index += 1
+        this._raf = requestAnimationFrame(runSegment)
+      }
+
+      this._raf = requestAnimationFrame(tick)
+    }
+
+    paint(segments[0], segments[0].from)
+    if (levelUpEl) levelUpEl.classList.remove('is-visible')
+    runSegment()
+  }
+
+  /* ---------------------------------------------------------------- события */
   _onClick(event) {
-    const target = event.target && event.target.closest ? event.target.closest('[data-act]') : null
-    if (!target || target.disabled) return
+    const node = event && event.target && event.target.closest ? event.target.closest('[data-act]') : null
+    if (!node || node.disabled) return
     event.preventDefault()
-    const act = target.getAttribute('data-act')
+
+    const act = node.getAttribute('data-act')
     if (act === 'next') this.next()
     else if (act === 'prev') this.prev()
+    else if (act === 'finish') this.finish()
   }
 
-  _onKeyDown(event) {
-    if (!this.isOpen) return
-    if (event.code === 'ArrowRight' || event.code === 'Enter' || event.code === 'Space') {
-      event.preventDefault()
-      event.stopPropagation()
-      this.next()
-    } else if (event.code === 'ArrowLeft' || event.code === 'Backspace') {
-      event.preventDefault()
-      event.stopPropagation()
-      this.prev()
-    }
+  _teardownDom() {
+    if (!this.root) return
+    this.root.removeEventListener('click', this._onClick)
+    if (this.root.parentNode) this.root.parentNode.removeChild(this.root)
+    this.root = null
+  }
+
+  destroy() {
+    if (this.destroyed) return
+    this.destroyed = true
+    this.close()
+    this.model = null
   }
 }
 
-/* Удобная точка входа для движка: raid.on('end', payload => showRaidResult(ctx, payload)) */
-export function showRaidResult(ctx, payload, options) {
+/* Удобная обёртка для разового показа вне UiSystem. */
+export function showRaidResult(ctx, payload, options = {}) {
   const system = new RaidResultSystem(ctx, options)
   system.show(payload)
   return system
