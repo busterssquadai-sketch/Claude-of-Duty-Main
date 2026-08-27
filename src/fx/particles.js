@@ -166,6 +166,12 @@ export const PARTICLE_FRAG = /* glsl */ `
 precision highp float;
 
 uniform sampler2D uSprite;
+// Sprite-atlas texel size (1/width, 1/height). This has to be declared HERE as
+// well as in the vertex stage: the #ifdef LIT block below reads it for the
+// density-gradient taps, and a fragment shader that uses a uniform it never
+// declared does not link — 'uSpriteTexel' : undeclared identifier. The value is
+// supplied by ParticleLayer (see this.uniforms.uSpriteTexel).
+uniform vec2 uSpriteTexel;
 uniform sampler2D uDepth;
 uniform vec2 uRes;
 uniform vec2 uSoftEnable;
