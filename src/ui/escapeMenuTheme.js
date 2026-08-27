@@ -135,15 +135,40 @@ export const ESCAPE_MENU_CSS = `
 .efl-esc__big:active { transform: scale(0.985); }
 .efl-esc__big--danger:hover { color: #ff6a4d; text-shadow: 0 0 22px rgba(192, 57, 43, 0.6); }
 
+/* НИКАКОГО position:absolute.
+ *
+ * Здесь стояло \`position:absolute; left:0; right:0; bottom:74px\`, из-за чего
+ * футер с кнопками полностью выпадал из потока .efl-esc__screen. Плашка
+ * .efl-esc__alert течёт в обычном потоке сверху вниз, и на экране
+ * дезертирства её нижняя кромка доходила до пришпиленных кнопок — текст
+ * наезжал на текст. Футер снова в потоке и прижимается к низу через
+ * margin-top:auto, поэтому перекрытие невозможно ни при какой высоте окна. */
 .efl-esc__footer {
-  position: absolute;
-  left: 0;
-  right: 0;
-  bottom: 74px;
+  position: relative;
+  width: 100%;
   display: flex;
   flex-direction: column;
   align-items: center;
   gap: 14px;
+  margin-top: auto;
+}
+
+/* Нижняя группа экрана дезертирства: красная плашка предупреждения сверху,
+ * кнопки выбора под ней. Оба элемента — дети ОДНОГО flex-контейнера, поэтому
+ * поток раскладывает их строго друг под другом, а расстояние задаёт gap. */
+.efl-desertion-footer {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 24px;
+  width: 100%;
+  margin-top: auto;
+}
+/* Внутри группы зазором владеет gap. Собственные отступы детей гасим, иначе
+ * margin-top:auto у футера растащил бы плашку и кнопки по краям экрана. */
+.efl-desertion-footer > .efl-esc__alert,
+.efl-desertion-footer > .efl-esc__footer {
+  margin-top: 0;
 }
 
 .efl-esc__build {
@@ -326,24 +351,9 @@ export const ESCAPE_MENU_CSS = `
 }
 .efl-esc__alert--center { grid-template-columns: 52px 1fr; max-width: 940px; text-align: left; }
 
-.efl-esc__grace {
-  margin-top: 14px;
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  font-size: 13px;
-  letter-spacing: 0.16em;
-  text-transform: uppercase;
-  color: rgba(200, 199, 194, 0.6);
-}
-.efl-esc__grace-value {
-  font-family: 'Bebas Neue', Impact, sans-serif;
-  font-size: 26px;
-  letter-spacing: 0.08em;
-  color: var(--efl-orange);
-}
-.efl-esc__grace-value.is-critical { color: #ff5a3c; animation: efl-blink 700ms steps(2, start) infinite; }
-@keyframes efl-blink { 50% { opacity: 0.25; } }
+/* Стили .efl-esc__grace / .efl-esc__grace-value / @keyframes efl-blink удалены
+ * вместе с блоком автокика: мигающий счётчик обратного отсчёта больше не
+ * существует, и мёртвым правилам в теме делать нечего. */
 
 .efl-esc__result { display: flex; flex-direction: column; align-items: center; margin-top: 22px; }
 .efl-esc__result-figure { position: relative; display: flex; align-items: flex-start; gap: 18px; }

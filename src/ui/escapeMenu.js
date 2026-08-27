@@ -641,6 +641,19 @@ export class EscapeMenuSystem {
     )
   }
 
+  /**
+   * Экран подтверждения выхода.
+   *
+   * Плашка предупреждения и кнопки выбора лежат в ОДНОМ flex-контейнере
+   * .efl-desertion-footer, поэтому наложение невозможно в принципе: поток
+   * раскладывает их строго друг под другом, а расстояние задаёт gap:24px.
+   *
+   * Раньше .efl-esc__alert тёк в общем потоке секции, а .efl-esc__footer был
+   * выдернут из потока через `position:absolute; bottom:74px` — и красный блок
+   * садился прямо на «ПОКИНУТЬ РЕЙД»/«НАЗАД». Между ними стоял ещё и
+   * вестигиальный .efl-esc__grace от вырезанного таймера автокика; он удалён,
+   * потому что третий элемент только мешал требуемой геометрии.
+   */
   _renderAbandonScreen() {
     const map = this.currentMap
     const shot = map.thumbnail
@@ -667,25 +680,21 @@ export class EscapeMenuSystem {
             '</div>' +
           '</div>' +
         '</div>' +
-        '<div class="efl-esc__alert">' +
-          '<div class="efl-esc__alert-icon">' + ICON_ALERT + '</div>' +
-          '<div>' +
-            '<div class="efl-esc__alert-title">Внимание: досрочный выход из рейда</div>' +
-            '<div class="efl-esc__alert-text">' +
-              'Покинув рейд без эвакуации, вы теряете всё снаряжение с тела, кроме содержимого ' +
-              'защитного контейнера, и получаете статус дезертира. Опыт за рейд не начисляется.' +
+        '<div class="efl-desertion-footer">' +
+          '<div class="efl-esc__alert">' +
+            '<div class="efl-esc__alert-icon">' + ICON_ALERT + '</div>' +
+            '<div>' +
+              '<div class="efl-esc__alert-title">Внимание: досрочный выход из рейда</div>' +
+              '<div class="efl-esc__alert-text">' +
+                'Покинув рейд без эвакуации, вы теряете всё снаряжение с тела, кроме содержимого ' +
+                'защитного контейнера, и получаете статус дезертира. Опыт за рейд не начисляется.' +
+              '</div>' +
             '</div>' +
           '</div>' +
-        '</div>' +
-        /* Автоматического выхода больше нет: таймер удалён целиком.
-         * Блок оставлен ради существующей вёрстки escapeMenuTheme.css. */
-        '<div class="efl-esc__grace">' +
-          '<span>автоматического выхода нет</span>' +
-          '<span class="efl-esc__grace-value">решение за вами</span>' +
-        '</div>' +
-        '<div class="efl-esc__footer">' +
-          '<button type="button" class="efl-esc__big efl-esc__big--danger" data-act="confirm-desert">ПОКИНУТЬ РЕЙД</button>' +
-          '<button type="button" class="efl-esc__big" data-act="back">НАЗАД</button>' +
+          '<div class="efl-esc__footer">' +
+            '<button type="button" class="efl-esc__big efl-esc__big--danger" data-act="confirm-desert">ПОКИНУТЬ РЕЙД</button>' +
+            '<button type="button" class="efl-esc__big" data-act="back">НАЗАД</button>' +
+          '</div>' +
         '</div>' +
         '<div class="efl-esc__build">' + this._buildString() + '</div>' +
       '</section>'
