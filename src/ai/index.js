@@ -21,6 +21,10 @@ const STRAFE_SPEED = 2.35;
 const STRAFE_MIN_T = 0.45;
 const STRAFE_MAX_T = 1.30;
 
+/* Верхняя граница uint32. Держим константой: она нужна и в детерминированном
+ * пути, и в аварийном фолбэке на Math.random. */
+const UINT32_MAX = 4294967295;
+
 /* Бюджеты по умолчанию, если EFL.budgets не заполнен целиком. */
 const BUDGET_FALLBACK = { bots: 12, botsUpdatedPerFrame: 4, pathRequestsPerFrame: 2 };
 
@@ -82,6 +86,67 @@ export class AiSystem {
   }
 
   /* ---------- безопасные обёртки над чужими подсистемами ---------- */
+
+  /**
+   * 32-битный сид для события weapon:fire.
+   *
+   * Прежний код звал this.rng.uint32() напрямую. У Rng (src/core/rng.js)
+   * такого метода НЕТ: uint32 он отдаёт как u32(). Поэтому первый же выстрел
+   * бота в S_COMBAT ронял весь главный цикл на
+   *   TypeError: this.rng.uint32 is not a function
+   * прямо внутри AiSystem._combat, то есть внутри Engine.step().
+   *
+   * Порядок предпочтений важен именно в таком виде:
+   *   1. u32()    — родной контракт Rng. Детерминированный, поэтому
+   *                 capture-режим продолжает давать байт-в-байт одинаковые
+   *                 кадры. Ради этого он и стоит первым, а не Math.random.
+   *   2. uint32() — если сид придёт из чужого генератора с таким контрактом.
+   *   3. float()  — минимальный общий знаменатель любого PRNG.
+   *   4. Math.random — аварийный нативный фолбэк.
+   *
+   * Каждая ветка обёрнута так, что ни отсутствие метода, ни исключение
+   * внутри него не могут остановить Engine.step().
+   */
+  _seed32() {
+    const rng = this.rng;
+
+    if (rng) {
+      if (typeof rng.u32 === 'function') {
+        try {
+          return rng.u32() >>> 0;
+        } catch (err) {
+          this._warnOnce('seed:u32', 'rng.u32() бросил исключение, ищем фолбэк: ' + err.message);
+        }
+      }
+
+      if (typeof rng.uint32 === 'function') {
+        try {
+          return rng.uint32() >>> 0;
+        } catch (err) {
+          this._warnOnce('seed:uint32', 'rng.uint32() бросил исключение, ищем фолбэк: ' + err.message);
+        }
+      }
+
+      if (typeof rng.float === 'function') {
+        try {
+          const f = rng.float();
+          if (Number.isFinite(f)) return Math.floor(f * UINT32_MAX) >>> 0;
+          this._warnOnce('seed:float:nan', 'rng.float() вернул не число — сид уходит в Math.random');
+        } catch (err) {
+          this._warnOnce('seed:float', 'rng.float() бросил исключение, ищем фолбэк: ' + err.message);
+        }
+      }
+
+      this._warnOnce(
+        'seed:missing',
+        'у rng нет ни u32(), ни uint32(), ни float() — сид выстрела уходит в Math.random (детерминизм потерян)'
+      );
+    } else {
+      this._warnOnce('seed:norng', 'rng не инициализирован — сид выстрела уходит в Math.random');
+    }
+
+    return Math.floor(Math.random() * UINT32_MAX) >>> 0;
+  }
 
   _wep(id) {
     const it = this.items;
@@ -506,7 +571,9 @@ export class AiSystem {
     this._v.normalize();
 
     this._shoot(this._eye, this._v, bot.ammoIdx, bot);
-    this.ctx.events.emit('weapon:fire', { weapon: bot.wepId, origin: this._eye, dir: this._v, seed: this.rng.uint32(), bot: true });
+    /* Сид берём через _seed32(), а НЕ через this.rng.uint32(): у Rng нет
+     * метода uint32(), и прямой вызов ронял Engine.step() на первом выстреле. */
+    this.ctx.events.emit('weapon:fire', { weapon: bot.wepId, origin: this._eye, dir: this._v, seed: this._seed32(), bot: true });
     bot.mag--;
     bot.burst = bot.burst > 0 ? bot.burst - 1 : this.rng.int(2, 5);
     bot.fireT = bot.burst > 0 ? 60 / rpm : 0.35 + this.rng.float() * 0.9;
