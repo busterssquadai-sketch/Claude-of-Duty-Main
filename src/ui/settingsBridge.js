@@ -17,6 +17,9 @@
  * Итог: ВСЕ вызовы уходили в null через безопасный call() и молча исчезали.
  * Ползунки двигались, картинка не менялась — ровно то самое «мёртвое» меню.
  *
+ * Гораздо хуже было там, где вызов ВСЁ-ТАКИ доезжал: панель писала
+ * сырые значения ПОВЕРХ живых проходов рендера — см. пункт 7.
+ *
  * Этот мост:
  *   1. переопределяет SettingsMenu.prototype._svc правильным резолвером;
  *   2. добавляет пресет качества (graphics.quality -> render.setQuality);
@@ -26,7 +29,20 @@
  *   5. прокидывает инверсию вертикали и чувствительность в сырой обработчик
  *      мышиного дельта (core/input.js) и в config;
  *   6. гарантирует, что холодный десатурированный грейдинг Emilia доезжает
- *      до ShaderPass-ов композера.
+ *      до ShaderPass-ов композера;
+ *   7. ЗАЩИЩАЕТ ЖИВЫЕ СЛОТЫ РЕНДЕРА. SettingsMenu.applyField делал
+ *      `renderer.taa = value !== 'off'` и `renderer.ssr = intensity > 0`, то есть
+ *      клал булево значение поверх экземпляров Taa и Ssr, созданных в
+ *      RenderSystem.init(). Конструктор SettingsMenu вызывает applyAll(),
+ *      то есть это происходило на UiSystem.init(), ДО первого кадра — и
+ *      первый же render() падал в
+ *        TypeError: this.taa?.reset is not a function
+ *      в RenderSystem._ensureProbe. Optional chaining здесь не спасает:
+ *      `?.` коротит только null/undefined, а `true` — не ни то ни другое,
+ *      у него просто нет .reset. С SSR было то же самое чуть позже:
+ *      `false?.setSize()` в resize(). Теперь оба слота — аксессоры:
+ *      живой проход переживает запись, а значение настройки уезжает в
+ *      render.aaMode / render.ssrMode.
  *
  * Патч ставится в applyTarkovBootstrap() ДО того, как UiSystem создаст
  * экземпляр SettingsMenu, поэтому конструкторный applyAll() уже рабочий.
@@ -101,8 +117,150 @@ function engineOf(ctx) {
   return null
 }
 
+/* -------------------------------------------------------------------------- */
+/* Защита живых слотов рендера                                                */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * Сброс истории TAA по любому доступному контракту, в порядке предпочтения:
+ *   1. родной reset()        — src/render/taa.js: this._needsReset = true;
+ *   2. поля накопления      — TAARenderPass/SSAARenderPass из three не имеют
+ *                              reset(), у них accumulate/sampleStep;
+ *   3. _needsReset напрямую — если метод потеряли, а поле осталось.
+ * @returns {boolean} сброс действительно выполнен.
+ */
+export function resetTaaLike(taa) {
+  if (!taa || typeof taa !== 'object') return false
+
+  if (typeof taa.reset === 'function') {
+    try {
+      taa.reset()
+      return true
+    } catch (err) {
+      if (typeof console !== 'undefined') {
+        console.warn('[EFL/settings] taa.reset() бросил исключение', err)
+      }
+    }
+  }
+
+  let handled = false
+  if ('accumulate' in taa) {
+    taa.accumulate = false
+    handled = true
+  }
+  if ('sampleStep' in taa) {
+    taa.sampleStep = 0
+    handled = true
+  }
+  if ('_needsReset' in taa) {
+    taa._needsReset = true
+    handled = true
+  }
+  if (typeof taa.clear === 'function') {
+    safeCall(taa, 'clear')
+    handled = true
+  }
+  return handled
+}
+
+/* Контракт, который RenderSystem требует от содержимого this.taa:
+ * render() / setSize() / nextJitter() / reset() / previousTexture / dispose(). */
+function isTaaPass(v) {
+  return (
+    !!v &&
+    typeof v === 'object' &&
+    typeof v.render === 'function' &&
+    typeof v.setSize === 'function' &&
+    typeof v.nextJitter === 'function'
+  )
+}
+
+/* this.ssr: render() / setSize() / dispose() / .texture. */
+function isSsrPass(v) {
+  return !!v && typeof v === 'object' && typeof v.render === 'function' && typeof v.setSize === 'function'
+}
+
+const SLOT_FLAG = '__eflRenderSlotsGuarded'
+
+function describeValue(v) {
+  if (typeof v === 'object') return '[' + (Array.isArray(v) ? 'array' : 'object') + ']'
+  if (typeof v === 'string') return "'" + v + "'"
+  return String(v)
+}
+
+/**
+ * Превращает поле-слот в аксессор, который держит ТОЛЬКО живой проход
+ * или null. Любая другая запись (boolean из панели настроек, чужой объект
+ * из другого пайплайна) трактуется как НАМЕРЕНИЕ и уезжает в modeKey,
+ * не трогая проход. Именно это делает `this.taa?.reset()` в index.js
+ * безопасным ПО ПОСТРОЕНИЮ в обоих его точках вызова.
+ */
+function defineSlotGuard(host, name, isPass, modeKey, label) {
+  const desc = Object.getOwnPropertyDescriptor(host, name)
+  if (desc && (typeof desc.get === 'function' || typeof desc.set === 'function')) return
+
+  let slot = null
+  if (desc) {
+    if (isPass(desc.value)) {
+      slot = desc.value
+    } else if (desc.value !== null && desc.value !== undefined && typeof console !== 'undefined') {
+      console.error(
+        '[EFL/settings] render.' + name + ' уже был перезатёрт (' + describeValue(desc.value) +
+          ') до установки защиты — проход потерян, слот обнулён'
+      )
+    }
+  }
+
+  Object.defineProperty(host, name, {
+    configurable: true,
+    enumerable: true,
+    get() {
+      return slot
+    },
+    set(v) {
+      if (v === null || v === undefined) {
+        slot = null
+        return
+      }
+      if (isPass(v)) {
+        slot = v
+        return
+      }
+      host[modeKey] = v
+      if (name === 'taa') resetTaaLike(slot)
+      if (typeof console !== 'undefined') {
+        console.warn(
+          '[EFL/settings] запись ' + describeValue(v) + ' в render.' + name + ' отклонена: слот держит ' +
+            label + '. Значение ушло в render.' + modeKey
+        )
+      }
+    },
+  })
+}
+
+/**
+ * Ставит защиту на taa/ssr один раз на экземпляр. Вызывается из renderOf(),
+ * через который проходит АБСОЛЮТНО любое обращение панели настроек к
+ * рендеру (_svc('renderer') -> resolveSettingsService -> renderOf), так что
+ * ставится она ГАРАНТИРОВАННО РАНЬШЕ первого же присваивания.
+ */
+export function guardRenderSlots(render) {
+  if (!render || typeof render !== 'object') return render
+  if (render[SLOT_FLAG]) return render
+  try {
+    Object.defineProperty(render, SLOT_FLAG, { value: true, enumerable: false, configurable: true })
+    defineSlotGuard(render, 'taa', isTaaPass, 'aaMode', 'живой TAA-проход (src/render/taa.js)')
+    defineSlotGuard(render, 'ssr', isSsrPass, 'ssrMode', 'живой SSR-проход (src/render/ssr.js)')
+  } catch (err) {
+    if (typeof console !== 'undefined') {
+      console.warn('[EFL/settings] защита слотов рендера не установлена', err)
+    }
+  }
+  return render
+}
+
 function renderOf(ctx) {
-  return fromRegistry(ctx, 'render')
+  return guardRenderSlots(fromRegistry(ctx, 'render'))
 }
 
 function postfxOf(ctx) {
@@ -201,6 +359,64 @@ export function applyQualityPreset(ctx, value) {
   const engine = engineOf(ctx)
   if (engine && typeof engine.resize === 'function') safeCall(engine, 'resize')
   return preset
+}
+
+/* -------------------------------------------------------------------------- */
+/* Сглаживание и отражения                                                    */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * graphics.antialiasing. Родной обработчик делал `renderer.taa = value !== 'off'`
+ * и убивал проход. Здесь проход не трогаем вообще: пишем режим в aaMode
+ * и сбрасываем историю, чтобы смена настроек не тянула старые кадры.
+ *
+ * Полное выключение/включение в рантайме — это пересборка цепочки (джиттер
+ * камеры, FXAA-фолбэк, sharpen в композите), и ей владеет RenderSystem через
+ * пресет качества (q.taa), а не панель настроек. Молча делать вид, что
+ * переключатель работает, хуже, чем сказать это в лог.
+ */
+export function applyAntialiasing(ctx, value) {
+  if (value === undefined || value === null) return null
+  const render = renderOf(ctx)
+  const mode = typeof value === 'string' ? value : value ? 'taa_high' : 'off'
+  const on = mode !== 'off'
+
+  if (render) {
+    render.aaMode = mode
+    resetTaaLike(render.taa)
+    if (on && !render.taa && typeof console !== 'undefined') {
+      console.info(
+        '[EFL/settings] TAA-проход не собран текущим пресетом качества: ' + mode +
+          ' записан в render.aaMode, фактическое включение — через graphics.quality'
+      )
+    }
+  }
+
+  safeCall(postfxOf(ctx), 'setTaa', on)
+  return mode
+}
+
+/** Интенсивность SSR по имени пресета панели. */
+export const SSR_INTENSITY = { off: 0, low: 0.35, medium: 0.6, high: 0.85, ultra: 1 }
+
+/**
+ * graphics.ssr. Ровно та же болезнь, что у TAA: родной обработчик кладёт
+ * `renderer.ssr = intensity > 0` поверх экземпляра Ssr, а потом resize() идёт
+ * в `false?.setSize()`. Значение держим в ssrMode/ssrIntensity.
+ */
+export function applyReflections(ctx, value) {
+  if (value === undefined || value === null) return null
+  const render = renderOf(ctx)
+  const known = typeof value === 'string' && SSR_INTENSITY[value] !== undefined
+  const intensity = typeof value === 'number' ? value : known ? SSR_INTENSITY[value] : value ? 1 : 0
+
+  if (render) {
+    render.ssrMode = typeof value === 'string' ? value : intensity > 0 ? 'high' : 'off'
+    render.ssrIntensity = intensity
+  }
+
+  safeCall(postfxOf(ctx), 'setSsr', intensity)
+  return intensity
 }
 
 /* -------------------------------------------------------------------------- */
@@ -417,6 +633,16 @@ export function applySettingsBridge() {
         applyScreenMode(ctx, value, this._interactive === true)
         return this
 
+      /* Родные ветки этих двух путей затирали живые проходы рендера
+       * булевыми значениями, так что до originalApplyField не доходим. */
+      case 'graphics.antialiasing':
+        applyAntialiasing(ctx, value)
+        return this
+
+      case 'graphics.ssr':
+        applyReflections(ctx, value)
+        return this
+
       case 'controls.invertY':
         applyInvertY(ctx, value)
         return this
@@ -473,6 +699,8 @@ export function applySettingsBridge() {
     const game = s.game || {}
 
     applyQualityPreset(ctx, graphics.quality)
+    applyAntialiasing(ctx, graphics.antialiasing)
+    applyReflections(ctx, graphics.ssr)
     applyFov(ctx, game.fov)
     applyInvertY(ctx, controls.invertY)
     applySensitivity(ctx, controls.sensitivity)
