@@ -1,32 +1,60 @@
 /* ==========================================================================
  * Escape-From-Larpov · src/ui/lobbyWizard.js
  *
- * Визард выхода в рейд: от главного меню до высадки, 5 шагов.
+ * ПУБЛИЧНАЯ ТОЧКА ВХОДА визарда высадки и МОСТ в главное меню.
  *
- *   1. ВЫБЕРИТЕ ПЕРСОНАЖА        — ДИКИЙ / ЧВК
- *   2. ВЫБЕРИТЕ МЕСТО ДИСЛОКАЦИИ  — локации + сжатые часы 1:9
- *   3. ТРЕНИРОВОЧНЫЙ РЕЖИМ ИГРЫ     — чекбокс + модалка шестерёнки
- *   4. ПОДТВЕРЖДЕНИЕ              — силуэт во всю высоту + ГОТОВ
- *   5. ВЫСАДКА НА МЕСТО ДИСЛОКАЦИИ — преварм перед STATE.GAMEPLAY
+ * Пять шагов пути от главного меню до рейда живут в ./lobbyWizard/wizard.js:
  *
- * Шаг 5 НЕ дублирует логику преварма: src/core/raidPrewarm.js уже умеет
- * пред-пулить трассеры, прогревать геометрию оружия и компилировать шейдерные
- * конвейеры — визард лишь даёт ему экран и хуки прогресса.
+ *   1. ВЫБЕРИТЕ ПЕРСОНАЖА         — ДИКИЙ / ЧВК, колонки с описаниями
+ *   2. ВЫБЕРИТЕ МЕСТО ДИСЛОКАЦИИ  — ЗАВОД / ТАМОЖНЯ / ЛЕС / РАЗВЯЗКА /
+ *                                   ЛАБОРАТОРИЯ плюс сжатые часы 1:9
+ *   3. ТРЕНИРОВОЧНЫЙ РЕЖИМ ИГРЫ   — чекбокс и модалка шестерёнки
+ *   4. ПОДТВЕРЖДЕНИЕ              — силуэт во всю высоту и ГОТОВ
+ *   5. ВЫСАДКА НА МЕСТО ДИСЛОКАЦИИ — runRaidPrewarm() перед STATE.GAMEPLAY
  *
- * ВАЖНО про порядок: engine.startRaid() сознательно НЕ используется. Он
- * уходит в enterGameplay() сразу после raid.start(), то есть до компиляции
- * шейдеров — ровно тот фриз при первом выстреле, от которого мы избавляемся.
- * Поэтому цепочка собрана вручную: enterLoading → raid.start внутри
- * afterTerrain → преварм докрутился → enterGameplay.
+ * РАЗДЕЛЕНИЕ ОТВЕТСТВЕННОСТИ. Здесь сознательно нет ни одного шага: класс
+ * лежит в ./lobbyWizard/wizard.js, данные, бренд и часы — в
+ * ./lobbyWizard/data.js, весь CSS — в ./lobbyWizard/style.js, процедурный
+ * SVG — в ./lobbyWizard/art.js. Второй экземпляр класса в этом файле означал
+ * бы две расходящиеся копии одного экрана, поэтому модуль держит ровно
+ * четыре вещи:
  *
- * Подсистемы берутся только через ctx.peek() — get() бросает исключение на
- * незарегистрированный id, а в меню боевые системы ещё не подняты.
- * Прямых импортов world/raid/ai здесь нет — запрет ARCHITECTURE.md.
+ *   - реэкспорт публичной поверхности для внешних импортёров;
+ *   - жизненный цикл единственного живого визарда (activeWizard);
+ *   - resolveMenuRoot() — поиск контейнера меню, который надо повернуть;
+ *   - делегированный мост с клика «ПОБЕГ ИЗ ЛАРПОВА» в openLobbyWizard().
+ *
+ * ЗАЧЕМ МОСТ ПЕРЕХВАТЫВАЕТ КЛИК. Штатный обработчик меню уходит в
+ * engine.startRaid(), а тот выставляет STATE.GAMEPLAY сразу после
+ * raid.start() — то есть ДО компиляции шейдеров и до пре-пула трассеров.
+ * Ровно это давало многосекундный стоп на первом выстреле и на первой
+ * очереди бота. Поэтому слушатель висит в фазе ПЕРЕХВАТА и гасит событие, а
+ * высадкой дальше правит шаг 5: он ждёт runRaidPrewarm() и только потом
+ * отдаёт движку enterGameplay().
+ *
+ * ARCHITECTURE.md. Правило 1: этот файл живёт в src/ui/ и не трогает чужие
+ * каталоги. Правило 2: чужие подсистемы не импортируются — world, raid, ai,
+ * inventory и meta визард берёт через ctx.peek() в рантайме. Наружу отсюда
+ * торчит только STATE из core/engine.js, где он и заморожен, — строковые
+ * литералы состояний в src/ui/ запрещены.
  * ========================================================================== */
 
 import { STATE } from '../core/engine.js'
-import { runRaidPrewarm, PREWARM_STAGES } from '../core/raidPrewarm.js'
-import {
+import { LobbyWizard } from './lobbyWizard/wizard.js'
+import { NS, removeStyles } from './lobbyWizard/style.js'
+
+/* --------------------------------------------------------------------------
+ * Публичная поверхность модуля.
+ *
+ * Внешние импортёры (dev-харнессы, ui/preview.mjs, будущие кнопки меню)
+ * должны видеть визард целиком через один путь, не зная о внутреннем
+ * каталоге ./lobbyWizard/. Реэкспорт держит этот контракт.
+ * ----------------------------------------------------------------------- */
+
+export { LobbyWizard }
+export { STEPS } from './lobbyWizard/wizard.js'
+export { NS, STYLE_ID, Z_INDEX, ensureStyles, removeStyles } from './lobbyWizard/style.js'
+export {
 	BRAND,
 	rebrandText,
 	applyGlobalRebranding,
@@ -35,6 +63,7 @@ import {
 	MAP_CATALOGUE,
 	REAL_SECONDS_PER_GAME_MINUTE,
 	CLOCK_FACTOR,
+	DAY_SECONDS,
 	HALF_DAY_SECONDS,
 	gameClockSeconds,
 	formatClock,
@@ -48,55 +77,92 @@ import {
 	optionLabel,
 	defaultOfflineConfig
 } from './lobbyWizard/data.js'
-import { NS, ensureStyles, removeStyles } from './lobbyWizard/style.js'
-import {
-	el,
-	button,
-	svg,
-	call,
-	silhouetteSvg,
-	mapThumbSvg,
-	deployBackdropSvg,
-	gearIcon,
-	clockIcon,
-	peopleIcon,
-	gridIcon,
-	alertIcon,
-	daylightIcon
-} from './lobbyWizard/art.js'
 
-/* ------------------------------------------------------------------- шаги */
+/* ------------------------------------------------------------- константы */
 
-const STEPS = [
-	{ id: 'character', title: 'ВЫБЕРИТЕ ПЕРСОНАЖА' },
-	{ id: 'location', title: 'ВЫБЕРИТЕ МЕСТО ДИСЛОКАЦИИ' },
-	{ id: 'training', title: 'ТРЕНИРОВОЧНЫЙ РЕЖИМ ИГРЫ' },
-	{ id: 'confirm', title: 'ПОДТВЕРЖДЕНИЕ' },
-	{ id: 'deploy', title: 'ВЫСАДКА НА МЕСТО ДИСЛОКАЦИИ' }
-]
-
-const SLOT_LABELS = [
-	{ slot: 'primary', label: 'ОСНОВНОЕ ОРУЖИЕ' },
-	{ slot: 'secondary', label: 'ВТОРИЧНОЕ ОРУЖИЕ' },
-	{ slot: 'holster', label: 'КОБУРА' },
-	{ slot: 'helmet', label: 'ШЛЕМ' },
-	{ slot: 'armor', label: 'БРОНЕЖИЛЕТ' },
-	{ slot: 'rig', label: 'РАЗГРУЗКА' },
-	{ slot: 'backpack', label: 'РЮКЗАК' }
-]
-
-/* Корни чужих оверлеев — клики внутри них визард не перехватывает. */
+/* Корни чужих оверлеев и самого визарда — клики внутри них мост не трогает. */
 const SKIP_ROOTS = '.efl-esc, .efl-set, #eftInv, .' + NS
+
+/* Кандидаты в контейнер главного меню, если инстанс не отдал свой узел. */
 const MENU_SELECTORS = ['.efl-mm', '.efl-menu', '#eflMainMenu', '[data-efl-main-menu]']
-const LAUNCH_RE = /побег\s+из\s+ларпова|escape\s+from\s+larpov|побег\s+из\s+таркова/i
+
+/*
+ * Подпись кнопки запуска рейда.
+ *
+ * Ловим и ребрендированную, и исходную форму: applyGlobalRebranding() и
+ * core/branding.js переписывают живой DOM меню, но на первом клике
+ * ребрендинг мог ещё не дойти до этого узла, а MENU_ITEMS в mainMenu.js
+ * по-прежнему отдаёт английский заголовок. Пропустить клик из-за падежа
+ * нельзя — игрок останется на неработающей кнопке.
+ */
+const LAUNCH_RE = /побег\s+из\s+(ларпова|таркова)|escape\s+from\s+(larpov|tarkov)/i
+
+/* Машинные метки действия: MENU_ACTION.RAID из mainMenu.js — это 'raid'. */
 const LAUNCH_ACTS = /^(play|raid|deploy|start|startraid|launch|escape)$/i
+
+const LAUNCH_ATTRS = [
+	'data-act',
+	'data-action',
+	'data-nav',
+	'data-screen',
+	'data-menu',
+	'data-role',
+	'data-view',
+	'id',
+	'aria-label'
+]
+
+/* Сколько родителей проходим от кликнутого узла вверх. */
 const MAX_WALK = 8
 
+/* Длиннее этого текст считаем контейнером, а не подписью кнопки. */
+const MAX_LABEL = 60
+
+/* --------------------------------------------------------------- хелперы */
+
+function logWarn(message, err) {
+	if (typeof console === 'undefined') return
+	if (err) console.warn('[EFL/lobby] ' + message, err)
+	else console.warn('[EFL/lobby] ' + message)
+}
+
+function logError(message, err) {
+	if (typeof console === 'undefined') return
+	console.error('[EFL/lobby] ' + message, err)
+}
+
+/** Движок из аргумента, иначе дев-хендл из main.js. */
+function resolveEngine(engine) {
+	if (engine) return engine
+	if (typeof window !== 'undefined' && window.__ENGINE__) return window.__ENGINE__
+	return null
+}
+
 /**
- * Ищет контейнер главного меню, который надо крутить.
- * MainMenuSystem монтируется в document.body из main.js, поэтому сначала смотрим
- * поля инстанса, потом поднимаемся от кликнутого узла до прямого
- * ребёнка body, и только потом пробуем селекторы.
+ * Пускать визард можно только со стартового экрана.
+ *
+ * Молчащий движок (дев-харнесс без state) не блокируем: там визард
+ * поднимают вручную.
+ */
+function stateAllowsWizard(engine) {
+	if (!engine || typeof engine.state !== 'string') return true
+	return engine.state === STATE.MENU || engine.state === STATE.BOOT
+}
+
+function attrOf(node, name) {
+	if (!node || typeof node.getAttribute !== 'function') return null
+	const raw = node.getAttribute(name)
+	return raw == null ? null : String(raw)
+}
+
+/**
+ * Ищет контейнер главного меню, который надо повернуть на 90° влево.
+ *
+ * MainMenuSystem монтируется в document.body из main.js, поэтому сначала
+ * смотрим поля инстанса, потом поднимаемся от кликнутого узла до прямого
+ * ребёнка body, и только потом пробуем селекторы. Порядок важен: селектор
+ * может поймать вложенную панель вместо корня, и тогда повернётся половина
+ * экрана.
  */
 export function resolveMenuRoot(instance, fromNode) {
 	const fields = ['root', 'el', 'node', 'container', 'dom', 'wrap', 'overlay']
@@ -104,7 +170,7 @@ export function resolveMenuRoot(instance, fromNode) {
 		const candidate = instance ? instance[fields[i]] : null
 		if (candidate && candidate.nodeType === 1) return candidate
 	}
-	if (fromNode && fromNode.nodeType === 1 && document.body) {
+	if (fromNode && fromNode.nodeType === 1 && typeof document !== 'undefined' && document.body) {
 		let node = fromNode
 		let guard = 0
 		while (node && node.parentNode && node.parentNode !== document.body && guard < 24) {
@@ -113,6 +179,7 @@ export function resolveMenuRoot(instance, fromNode) {
 		}
 		if (node && node.nodeType === 1 && node.parentNode === document.body) return node
 	}
+	if (typeof document === 'undefined') return null
 	for (let i = 0; i < MENU_SELECTORS.length; i++) {
 		const found = document.querySelector(MENU_SELECTORS[i])
 		if (found) return found
@@ -121,989 +188,231 @@ export function resolveMenuRoot(instance, fromNode) {
 }
 
 /* ====================================================================== */
-/*                              LobbyWizard                               */
-/* ====================================================================== */
-
-export class LobbyWizard {
-	constructor(engine, opts) {
-		const o = opts || {}
-		this.engine = engine || null
-		this.ctx = engine && engine.ctx ? engine.ctx : null
-		this.menuRoot = o.menuRoot || null
-		this.mount = o.mount || document.body
-
-		this.index = 0
-		this.busy = false
-		this.deployed = false
-		this.destroyed = false
-
-		this.state = {
-			faction: 'pmc',
-			mapId: 'factory',
-			clockSlot: 0,
-			night: false,
-			training: true,
-			offline: defaultOfflineConfig()
-		}
-
-		this.catalogue = MAP_CATALOGUE.map(function (m) { return Object.assign({}, m) })
-
-		this.root = null
-		this.bodyEl = null
-		this.titleEl = null
-		this.pips = []
-		this.nextBtn = null
-		this.backBtn = null
-		this.hintEl = null
-		this.modal = null
-
-		this.clockNodes = []
-		this.clockRaf = 0
-		this.clockCache = ['', '']
-		this.watchTimer = 0
-		this.watchStart = 0
-		this.watchEl = null
-		this.stageNodes = {}
-		this.statusEl = null
-		this.fillEl = null
-
-		this._onKeyDown = this._onKeyDown.bind(this)
-		this._tickClock = this._tickClock.bind(this)
-	}
-
-	/* ------------------------------------------------------- доступ к данным */
-
-	_peek(id) {
-		if (!this.ctx || typeof this.ctx.peek !== 'function') return null
-		try {
-			return this.ctx.peek(id) || null
-		} catch (err) {
-			return null
-		}
-	}
-
-	/**
-	 * Сверяет презентационный каталог с реальной таблицей карт движка.
-	 * Если у локации нет билдера — она гаснет как НЕДОСТУПНО, а не роняет рейд.
-	 */
-	_syncCatalogue() {
-		const world = this._peek('world')
-		const table = world ? (world.constructor && world.constructor.MAPS ? world.constructor.MAPS : world.MAPS) : null
-		if (table) {
-			for (let i = 0; i < this.catalogue.length; i++) {
-				const entry = this.catalogue[i]
-				const real = table[entry.id]
-				entry.available = entry.available && !!real
-				if (real && typeof real.dur === 'number') entry.duration = real.dur
-				if (real && typeof real.duration === 'number') entry.duration = real.duration
-			}
-		}
-		if (!this._unlocked(this._map())) {
-			for (let i = 0; i < this.catalogue.length; i++) {
-				if (this._unlocked(this.catalogue[i])) {
-					this.state.mapId = this.catalogue[i].id
-					break
-				}
-			}
-		}
-	}
-
-	/** Лежит ли предмет на теле — нужно для пропуска в Лабораторию. */
-	_hasItem(id) {
-		const inv = this._peek('inv')
-		if (!inv || !inv.all) return false
-		const all = inv.all
-		for (let i = 0; i < all.length; i++) {
-			const it = all[i]
-			if (!it || it.id !== id) continue
-			if (typeof inv.onBody === 'function' && !inv.onBody(it)) continue
-			return true
-		}
-		return false
-	}
-
-	_unlocked(map) {
-		if (!map || !map.available) return false
-		if (map.needCard && !this._hasItem(map.needCard)) return false
-		return true
-	}
-
-	_map() {
-		for (let i = 0; i < this.catalogue.length; i++) {
-			if (this.catalogue[i].id === this.state.mapId) return this.catalogue[i]
-		}
-		return this.catalogue[0]
-	}
-
-	_faction() {
-		return findFaction(this.state.faction)
-	}
-
-	_clockSeconds(slot) {
-		return gameClockSeconds(Date.now(), slot === 1 ? HALF_DAY_SECONDS : 0)
-	}
-
-	/* ---------------------------------------------------------------- показ */
-
-	async show() {
-		if (this.destroyed || this.root) return this
-		ensureStyles()
-		this._syncCatalogue()
-		await this._rotateMenuOut()
-		if (this.destroyed) return this
-		this._buildShell()
-		this._renderStep()
-		return this
-	}
-
-	/** Поворот меню на 90° влево. Ждём transitionend, но с таймаутом. */
-	_rotateMenuOut() {
-		const root = this.menuRoot
-		if (!root || !root.classList) return Promise.resolve()
-		root.classList.add(NS + '-menu-rotate')
-		/* Раздельные кадры, иначе браузер склеит оба класса и анимации не будет. */
-		return new Promise(function (resolve) {
-			requestAnimationFrame(function () {
-				requestAnimationFrame(function () {
-					let settled = false
-					const finish = function () {
-						if (settled) return
-						settled = true
-						root.removeEventListener('transitionend', finish)
-						resolve()
-					}
-					root.addEventListener('transitionend', finish)
-					setTimeout(finish, 760)
-					root.classList.add(NS + '-menu-out')
-				})
-			})
-		})
-	}
-
-	_rotateMenuIn() {
-		const root = this.menuRoot
-		if (!root || !root.classList) return
-		root.classList.remove(NS + '-menu-out')
-		const cls = NS + '-menu-rotate'
-		setTimeout(function () {
-			if (root.classList) root.classList.remove(cls)
-		}, 700)
-	}
-
-	_buildShell() {
-		const root = el('div', NS)
-		root.setAttribute('role', 'dialog')
-		root.setAttribute('aria-modal', 'true')
-
-		const head = el('div', NS + '-head')
-		this.titleEl = el('div', NS + '-title', STEPS[0].title)
-		head.appendChild(this.titleEl)
-		head.appendChild(el('div', NS + '-zone', BRAND.ruUpper + ' · ' + BRAND.zone))
-
-		const steps = el('div', NS + '-steps')
-		this.pips = []
-		for (let i = 0; i < STEPS.length; i++) {
-			const pip = el('div', NS + '-pip')
-			steps.appendChild(pip)
-			this.pips.push(pip)
-		}
-		head.appendChild(steps)
-
-		this.bodyEl = el('div', NS + '-body')
-
-		const foot = el('div', NS + '-foot')
-		this.hintEl = el('div', NS + '-hint', '')
-		const self = this
-		this.nextBtn = button(NS + '-nav primary', 'ДАЛЕЕ', function () { self.next() })
-		this.backBtn = button(NS + '-nav', 'НАЗАД', function () { self.back() })
-		foot.appendChild(this.hintEl)
-		foot.appendChild(this.nextBtn)
-		foot.appendChild(this.backBtn)
-
-		root.appendChild(head)
-		root.appendChild(this.bodyEl)
-		root.appendChild(foot)
-
-		this.root = root
-		this.mount.appendChild(root)
-		document.addEventListener('keydown', this._onKeyDown, true)
-
-		/* Глобальный ребрендинг по живому DOM меню и визарда. */
-		applyGlobalRebranding(this.menuRoot || document.body)
-
-		requestAnimationFrame(function () {
-			if (self.root) self.root.classList.add(NS + '-in')
-		})
-	}
-
-	_onKeyDown(e) {
-		if (!this.root || this.busy) return
-		if (e.key === 'Escape') {
-			e.preventDefault()
-			e.stopPropagation()
-			if (this.modal) this._closeOfflineModal()
-			else this.close({ restoreMenu: true })
-			return
-		}
-		if (this.modal) return
-		if (e.key === 'Enter') {
-			e.preventDefault()
-			this.next()
-		}
-	}
-
-	/* -------------------------------------------------------------- рендер */
-
-	_renderStep() {
-		if (!this.root) return
-		const step = STEPS[this.index]
-		this._stopClock()
-		this.titleEl.textContent = step.title
-		this.bodyEl.textContent = ''
-		this.bodyEl.scrollTop = 0
-		this.hintEl.textContent = ''
-
-		for (let i = 0; i < this.pips.length; i++) {
-			this.pips[i].className = NS + '-pip' + (i === this.index ? ' on' : i < this.index ? ' done' : '')
-		}
-
-		if (step.id === 'character') this._stepCharacter()
-		else if (step.id === 'location') this._stepLocation()
-		else if (step.id === 'training') this._stepTraining()
-		else if (step.id === 'confirm') this._stepConfirm()
-		else this._stepDeploy()
-
-		const last = step.id === 'deploy'
-		const confirm = step.id === 'confirm'
-		this.nextBtn.style.display = last ? 'none' : ''
-		this.backBtn.style.display = last ? 'none' : ''
-		this.nextBtn.textContent = confirm ? 'ГОТОВ' : 'ДАЛЕЕ'
-		this.nextBtn.className = NS + '-nav primary' + (confirm ? ' ready' : '')
-		this.nextBtn.disabled = !this._canAdvance()
-	}
-
-	/* ──────────────────────────────── шаг 1: персонаж ────── */
-
-	_stepCharacter() {
-		const wrap = el('div', NS + '-chars')
-		const self = this
-		for (let i = 0; i < FACTIONS.length; i++) {
-			const f = FACTIONS[i]
-			const card = button(NS + '-char' + (f.id === this.state.faction ? ' sel' : ''), null, function () {
-				if (self.state.faction === f.id) return
-				self.state.faction = f.id
-				self._renderStep()
-			})
-			const art = el('div', NS + '-char-art')
-			art.appendChild(svg(silhouetteSvg(f.id, f.accent)))
-			card.appendChild(art)
-			card.appendChild(el('div', NS + '-char-name', f.label))
-			card.appendChild(el('div', NS + '-char-tag', f.tag))
-			card.appendChild(el('div', NS + '-char-desc', rebrandText(f.desc)))
-			wrap.appendChild(card)
-		}
-		this.bodyEl.appendChild(wrap)
-	}
-
-	/* ───────────────────────── шаг 2: локация и время ────── */
-
-	_stepLocation() {
-		const wrap = el('div', NS + '-loc')
-		const maps = el('div', NS + '-maps')
-		const self = this
-
-		for (let i = 0; i < this.catalogue.length; i++) {
-			const map = this.catalogue[i]
-			const unlocked = this._unlocked(map)
-			const cls = NS + '-map' + (map.id === this.state.mapId ? ' sel' : '') + (unlocked ? '' : ' locked')
-			const card = button(cls, null, function () {
-				if (!unlocked) {
-					self.hintEl.textContent = map.available ? 'ДЛЯ ВЫСАДКИ НУЖЕН ПРОПУСК' : 'ЛОКАЦИЯ ВРЕМЕННО НЕДОСТУПНА'
-					return
-				}
-				self.state.mapId = map.id
-				self._renderStep()
-			})
-			card.appendChild(el('div', NS + '-map-name', map.label))
-			card.appendChild(el('div', NS + '-map-sub', map.en + ' · ' + formatDuration(map.duration)))
-			if (!map.available) card.appendChild(el('div', NS + '-map-lock', 'НЕДОСТУПНО'))
-			else if (map.needCard && !this._hasItem(map.needCard)) card.appendChild(el('div', NS + '-map-lock', 'НУЖЕН ПРОПУСК'))
-			maps.appendChild(card)
-		}
-
-		const detail = el('div', NS + '-detail')
-		wrap.appendChild(maps)
-		wrap.appendChild(detail)
-		this.bodyEl.appendChild(wrap)
-		this._renderMapDetail(detail)
-	}
-
-	/** При клике на локацию впрыскивается превью, длительность и метаданные. */
-	_renderMapDetail(host) {
-		const map = this._map()
-		host.textContent = ''
-		host.appendChild(el('div', NS + '-detail-title', 'Настройки сервера'))
-
-		const thumb = el('div', NS + '-thumb')
-		thumb.appendChild(svg(mapThumbSvg(map)))
-		host.appendChild(thumb)
-
-		host.appendChild(el('div', NS + '-detail-name', map.label))
-		host.appendChild(el('div', NS + '-detail-desc', rebrandText(map.desc)))
-
-		const meta = el('div', NS + '-detail-meta')
-		const rows = [
-			[clockIcon(), formatDuration(map.duration)],
-			[daylightIcon(this.state.night), map.weather],
-			[peopleIcon(), map.players],
-			[gridIcon(), map.size ? map.size + ' М' : '—']
-		]
-		for (let i = 0; i < rows.length; i++) {
-			const chip = el('div', NS + '-chip')
-			chip.appendChild(svg(rows[i][0]))
-			chip.appendChild(el('span', null, rows[i][1]))
-			meta.appendChild(chip)
-		}
-		host.appendChild(meta)
-
-		host.appendChild(el('div', NS + '-clock-head', 'ВЫБЕРИТЕ ВРЕМЯ СУТОК:'))
-		const clocks = el('div', NS + '-clocks')
-		this.clockNodes = []
-		this.clockCache = ['', '']
-		const self = this
-
-		for (let slot = 0; slot < 2; slot++) {
-			const captured = slot
-			const seconds = this._clockSeconds(captured)
-			const night = isNightSeconds(seconds)
-			const card = button(NS + '-clock' + (captured === this.state.clockSlot ? ' sel' : ''), null, function () {
-				self.state.clockSlot = captured
-				self.state.night = isNightSeconds(self._clockSeconds(captured))
-				self._renderStep()
-			})
-			card.appendChild(el('div', NS + '-box'))
-			const val = el('div', NS + '-clock-val', formatClock(seconds))
-			card.appendChild(val)
-			const tag = el('div', NS + '-clock-tag')
-			const icon = svg(daylightIcon(night))
-			tag.appendChild(icon)
-			const tagText = el('span', null, night ? 'НОЧЬ' : 'ДЕНЬ')
-			tag.appendChild(tagText)
-			card.appendChild(tag)
-			clocks.appendChild(card)
-			this.clockNodes.push({ slot: captured, val: val, tag: tagText, icon: icon, host: tag, night: night })
-		}
-
-		host.appendChild(clocks)
-		host.appendChild(el(
-			'div',
-			NS + '-clock-note',
-			'Сжатие времени 1:' + REAL_SECONDS_PER_GAME_MINUTE + ' · 1 минута в рейде = ' +
-				REAL_SECONDS_PER_GAME_MINUTE + ' секунд реального времени (×' + CLOCK_FACTOR.toFixed(2) + ')'
-		))
-
-		this.state.night = isNightSeconds(this._clockSeconds(this.state.clockSlot))
-		this._startClock()
-	}
-
-	_startClock() {
-		if (this.clockRaf || !this.clockNodes.length) return
-		this.clockRaf = requestAnimationFrame(this._tickClock)
-	}
-
-	_stopClock() {
-		if (this.clockRaf) cancelAnimationFrame(this.clockRaf)
-		this.clockRaf = 0
-		this.clockNodes = []
-	}
-
-	/** Тик часов. Запись в DOM только когда строка изменилась — нуль аллокаций впустую. */
-	_tickClock() {
-		if (!this.root || !this.clockNodes.length) {
-			this.clockRaf = 0
-			return
-		}
-		const now = Date.now()
-		for (let i = 0; i < this.clockNodes.length; i++) {
-			const node = this.clockNodes[i]
-			const seconds = gameClockSeconds(now, node.slot === 1 ? HALF_DAY_SECONDS : 0)
-			const text = formatClock(seconds)
-			if (text !== this.clockCache[i]) {
-				this.clockCache[i] = text
-				node.val.textContent = text
-				const night = isNightSeconds(seconds)
-				if (night !== node.night) {
-					node.night = night
-					node.tag.textContent = night ? 'НОЧЬ' : 'ДЕНЬ'
-					const fresh = svg(daylightIcon(night))
-					node.host.replaceChild(fresh, node.icon)
-					node.icon = fresh
-					if (node.slot === this.state.clockSlot) this.state.night = night
-				}
-			}
-		}
-		this.clockRaf = requestAnimationFrame(this._tickClock)
-	}
-
-	/* ─────────────────── шаг 3: тренировочный режим ────── */
-
-	_stepTraining() {
-		const wrap = el('div', NS + '-offline')
-		const cfg = this.state.offline
-		const self = this
-
-		wrap.appendChild(el(
-			'div',
-			NS + '-lede',
-			'Тренировочный режим запускает рейд локально, без сетевых игроков. Настройки ниже влияют только на эту высадку.'
-		))
-
-		const row = el('div', NS + '-toggle-row')
-		const check = button(NS + '-check' + (this.state.training ? ' on' : ''), null, function () {
-			self.state.training = !self.state.training
-			self._renderStep()
-		})
-		check.appendChild(el('span', NS + '-box'))
-		check.appendChild(el('span', null, 'Включить тренировочный режим для этого рейда'))
-		row.appendChild(check)
-
-		const gear = button(NS + '-gear', null, function () { self._openOfflineModal() })
-		gear.appendChild(svg(gearIcon()))
-		gear.appendChild(el('span', null, 'НАСТРОЙКИ РЕЙДА'))
-		gear.disabled = !this.state.training
-		row.appendChild(gear)
-		wrap.appendChild(row)
-
-		const rows = el('div', NS + '-rows')
-		const dim = this.state.training ? '' : ' dim'
-		const summary = [
-			['Кооперативный режим', this.state.training ? 'Выключен' : '—'],
-			['Количество ИИ', optionLabel(AI_COUNT_OPTIONS, cfg.aiCount)],
-			['Сложность ИИ', optionLabel(AI_DIFFICULTY_OPTIONS, cfg.aiDifficulty)],
-			['Вкл. Боссов', cfg.bosses ? 'Да' : 'Нет'],
-			['Отключить расход воды и энергии', cfg.noDrain ? 'Да' : 'Нет'],
-			['Время', formatClock(this._clockSeconds(this.state.clockSlot)) + ' · ' + (this.state.night ? 'Ночь' : 'День')],
-			['Течение времени', '×' + CLOCK_FACTOR.toFixed(2) + ' — как в онлайне'],
-			['Локация', this._map().label]
-		]
-		for (let i = 0; i < summary.length; i++) {
-			const line = el('div', NS + '-row' + (i > 0 && i < 5 ? dim : ''))
-			line.appendChild(el('span', null, summary[i][0]))
-			line.appendChild(el('span', NS + '-row-val', summary[i][1]))
-			rows.appendChild(line)
-		}
-		wrap.appendChild(rows)
-
-		if (this.state.training) {
-			const warn = el('div', NS + '-warn')
-			warn.appendChild(svg(alertIcon()))
-			const text = el('div')
-			text.appendChild(el('b', null, 'Внимание!'))
-			text.appendChild(el('span', null, 'В тренировочном режиме не предусмотрено сохранение прогресса!'))
-			warn.appendChild(text)
-			wrap.appendChild(warn)
-		}
-
-		this.bodyEl.appendChild(wrap)
-	}
-
-	_openOfflineModal() {
-		if (this.modal || !this.state.training) return
-		const cfg = this.state.offline
-		const self = this
-
-		const wrap = el('div', NS + '-modal-wrap')
-		const modal = el('div', NS + '-modal')
-		const bar = el('div', NS + '-modal-bar')
-		bar.appendChild(el('span', null, 'Настройки тренировочного режима'))
-		bar.appendChild(button(NS + '-x', '×', function () { self._closeOfflineModal() }))
-		modal.appendChild(bar)
-
-		const inner = el('div', NS + '-modal-in')
-		inner.appendChild(el('div', NS + '-modal-h', 'Настройки ИИ'))
-
-		const select = function (label, options, current, onPick) {
-			const field = el('div', NS + '-field')
-			field.appendChild(el('div', NS + '-field-l', label))
-			const sel = el('select', NS + '-sel')
-			for (let i = 0; i < options.length; i++) {
-				const opt = document.createElement('option')
-				opt.value = options[i].value
-				opt.textContent = options[i].label
-				if (options[i].value === current) opt.selected = true
-				sel.appendChild(opt)
-			}
-			sel.addEventListener('change', function () { onPick(sel.value) })
-			field.appendChild(sel)
-			return field
-		}
-
-		const toggle = function (label, current, onPick) {
-			const field = el('div', NS + '-field')
-			field.appendChild(el('div', NS + '-field-l', label))
-			const btn = button(NS + '-check' + (current ? ' on' : ''), null, function () {
-				const next = !btn.classList.contains('on')
-				btn.classList.toggle('on', next)
-				onPick(next)
-			})
-			btn.appendChild(el('span', NS + '-box'))
-			btn.appendChild(el('span', null, current ? 'Включено' : 'Выключено'))
-			field.appendChild(btn)
-			return field
-		}
-
-		inner.appendChild(select('Количество ИИ', AI_COUNT_OPTIONS, cfg.aiCount, function (v) { cfg.aiCount = v }))
-		inner.appendChild(select('Сложность ИИ', AI_DIFFICULTY_OPTIONS, cfg.aiDifficulty, function (v) { cfg.aiDifficulty = v }))
-		inner.appendChild(toggle('Вкл. Боссов', cfg.bosses, function (v) { cfg.bosses = v }))
-		inner.appendChild(toggle('Отключить расход воды и энергии', cfg.noDrain, function (v) { cfg.noDrain = v }))
-
-		modal.appendChild(inner)
-		wrap.appendChild(modal)
-		wrap.addEventListener('click', function (e) {
-			if (e.target === wrap) self._closeOfflineModal()
-		})
-
-		this.root.appendChild(wrap)
-		this.modal = wrap
-	}
-
-	_closeOfflineModal() {
-		if (!this.modal) return
-		if (this.modal.parentNode) this.modal.parentNode.removeChild(this.modal)
-		this.modal = null
-		this._renderStep()
-	}
-
-	/* ────────────────────── шаг 4: подтверждение ────── */
-
-	_loadoutRows() {
-		const inv = this._peek('inv')
-		const items = this._peek('items')
-		const out = []
-		if (this.state.faction === 'scav') {
-			out.push(['Снаряжение', 'Случайный набор Дикого'])
-			out.push(['Выдача', 'На точке высадки'])
-			return out
-		}
-		if (!inv || typeof inv.slotItem !== 'function') {
-			out.push(['Снаряжение', 'Стандартный набор ЧВК'])
-			return out
-		}
-		for (let i = 0; i < SLOT_LABELS.length; i++) {
-			const entry = SLOT_LABELS[i]
-			const it = call(inv, 'slotItem', entry.slot)
-			if (!it) continue
-			const name = it.name || it.title || it.id || '—'
-			out.push([entry.label, rebrandText(name)])
-		}
-		if (!out.length) out.push(['Снаряжение', 'Слоты пусты'])
-		if (items && typeof items.price === 'function' && inv.all) {
-			let total = 0
-			for (let i = 0; i < inv.all.length; i++) {
-				const it = inv.all[i]
-				if (!it) continue
-				if (typeof inv.onBody === 'function' && !inv.onBody(it)) continue
-				const price = call(items, 'price', it.id)
-				if (typeof price === 'number') total += price
-			}
-			if (total > 0) out.push(['Страховая ценность', Math.round(total).toLocaleString('ru-RU') + ' ₽'])
-		}
-		return out
-	}
-
-	_stepConfirm() {
-		const faction = this._faction()
-		const map = this._map()
-		const wrap = el('div', NS + '-confirm')
-
-		const left = el('div')
-		const raidPanel = el('div', NS + '-panel')
-		raidPanel.appendChild(el('div', NS + '-panel-h', 'Параметры рейда'))
-		const raidRows = [
-			['Локация', map.label],
-			['Длительность', formatDuration(map.duration)],
-			['Игроков', map.players],
-			['Тренировка', this.state.training ? 'Включена' : 'Выключена'],
-			['Сложность ИИ', optionLabel(AI_DIFFICULTY_OPTIONS, this.state.offline.aiDifficulty)],
-			['Боссы', this.state.offline.bosses ? 'Да' : 'Нет']
-		]
-		for (let i = 0; i < raidRows.length; i++) {
-			const kv = el('div', NS + '-kv')
-			kv.appendChild(el('span', null, raidRows[i][0]))
-			kv.appendChild(el('span', null, raidRows[i][1]))
-			raidPanel.appendChild(kv)
-		}
-		left.appendChild(raidPanel)
-
-		const middle = el('div', NS + '-silhouette')
-		const meta = this._peek('meta')
-		const level = meta && meta.P && typeof meta.P.lvl === 'number' ? meta.P.lvl : 42
-		const mainMenu = this.engine ? this.engine.mainMenu : null
-		const nickRaw = mainMenu && mainMenu.opts && mainMenu.opts.nickname
-			? mainMenu.opts.nickname
-			: mainMenu && mainMenu.nickname ? mainMenu.nickname : BRAND.shortEn
-		middle.appendChild(el('div', NS + '-badge', String(level)))
-		middle.appendChild(svg(silhouetteSvg(faction.id, faction.accent)))
-		middle.appendChild(el('div', NS + '-nick', rebrandText(String(nickRaw)) + ' · ' + faction.label))
-
-		const right = el('div')
-		const kitPanel = el('div', NS + '-panel')
-		kitPanel.appendChild(el('div', NS + '-panel-h', 'Снаряжение'))
-		const kit = this._loadoutRows()
-		for (let i = 0; i < kit.length; i++) {
-			const kv = el('div', NS + '-kv')
-			kv.appendChild(el('span', null, kit[i][0]))
-			kv.appendChild(el('span', null, kit[i][1]))
-			kitPanel.appendChild(kv)
-		}
-		right.appendChild(kitPanel)
-
-		const status = el('div', NS + '-status-bar')
-		const loc = el('div')
-		loc.appendChild(el('span', null, 'ТЕКУЩАЯ ЛОКАЦИЯ:'))
-		loc.appendChild(el('b', null, map.label))
-		const time = el('div')
-		time.appendChild(el('span', null, 'ТЕКУЩЕЕ ВРЕМЯ В ИГРЕ:'))
-		time.appendChild(el('b', null, formatClock(this._clockSeconds(this.state.clockSlot))))
-		const weather = el('div')
-		weather.appendChild(el('span', null, 'ТЕКУЩИЕ ПОГОДНЫЕ УСЛОВИЯ:'))
-		weather.appendChild(svg(daylightIcon(this.state.night)))
-		status.appendChild(loc)
-		status.appendChild(time)
-		status.appendChild(weather)
-
-		wrap.appendChild(left)
-		wrap.appendChild(middle)
-		wrap.appendChild(right)
-		wrap.appendChild(status)
-		this.bodyEl.appendChild(wrap)
-	}
-
-	/* ────────────────────────── шаг 5: высадка ────── */
-
-	_stepDeploy() {
-		const map = this._map()
-		const deploy = el('div', NS + '-deploy')
-
-		const bg = el('div', NS + '-deploy-bg')
-		bg.appendChild(svg(deployBackdropSvg(map)))
-		deploy.appendChild(bg)
-
-		const inner = el('div', NS + '-deploy-in')
-		inner.appendChild(el('div', NS + '-deploy-h', 'ВЫСАДКА НА МЕСТО ДИСЛОКАЦИИ'))
-		inner.appendChild(el(
-			'div',
-			NS + '-deploy-sub',
-			map.label + ' · ' + this._faction().label + ' · ' + formatClock(this._clockSeconds(this.state.clockSlot)) +
-				' · ' + (this.state.night ? 'НОЧЬ' : 'ДЕНЬ')
-		))
-
-		const grid = el('div', NS + '-deploy-grid')
-
-		const left = el('div')
-		const stages = el('div', NS + '-stages')
-		this.stageNodes = {}
-		for (let i = 0; i < PREWARM_STAGES.length; i++) {
-			const stage = PREWARM_STAGES[i]
-			const line = el('div', NS + '-stage')
-			line.appendChild(el('div', NS + '-stage-dot'))
-			line.appendChild(el('span', null, rebrandText(stage.label || stage.id)))
-			stages.appendChild(line)
-			this.stageNodes[stage.id] = line
-		}
-		left.appendChild(stages)
-
-		this.statusEl = el('div', NS + '-status', 'ЗАГРУЗКА ДАННЫХ...')
-		left.appendChild(this.statusEl)
-
-		const bar = el('div', NS + '-bar')
-		this.fillEl = el('div', NS + '-bar-fill')
-		bar.appendChild(this.fillEl)
-		left.appendChild(bar)
-
-		this.watchEl = el('div', NS + '-watch', 'ЗАГРУЗКА: 00:00')
-		left.appendChild(this.watchEl)
-
-		const sum = el('div', NS + '-sum')
-		sum.appendChild(el('div', NS + '-panel-h', 'Сводка локации'))
-		const sumRows = [
-			['Локация', map.label + ' / ' + map.en],
-			['Длительность', formatDuration(map.duration)],
-			['Погода', map.weather],
-			['Сжатие времени', '1:' + REAL_SECONDS_PER_GAME_MINUTE + ' (×' + CLOCK_FACTOR.toFixed(2) + ')'],
-			['Тренировка', this.state.training ? 'Включена' : 'Выключена']
-		]
-		for (let i = 0; i < sumRows.length; i++) {
-			const kv = el('div', NS + '-kv')
-			kv.appendChild(el('span', null, sumRows[i][0]))
-			kv.appendChild(el('span', null, sumRows[i][1]))
-			sum.appendChild(kv)
-		}
-		sum.appendChild(el('div', NS + '-detail-desc', rebrandText(map.desc)))
-
-		grid.appendChild(left)
-		grid.appendChild(sum)
-		inner.appendChild(grid)
-		deploy.appendChild(inner)
-		this.bodyEl.appendChild(deploy)
-
-		this._startStopwatch()
-	}
-
-	_setStage(id, label, index, total) {
-		if (this.statusEl) this.statusEl.textContent = rebrandText(label || 'ЗАГРУЗКА ДАННЫХ...')
-		const keys = Object.keys(this.stageNodes)
-		for (let i = 0; i < keys.length; i++) {
-			const node = this.stageNodes[keys[i]]
-			if (keys[i] === id) node.className = NS + '-stage on'
-			else if (node.className.indexOf('on') >= 0) node.className = NS + '-stage done'
-		}
-		if (typeof index === 'number' && typeof total === 'number' && total > 0) {
-			this._setProgress(index / total)
-		}
-	}
-
-	_setProgress(t) {
-		if (!this.fillEl) return
-		const clamped = Math.max(0, Math.min(1, Number(t) || 0))
-		this.fillEl.style.width = (clamped * 100).toFixed(1) + '%'
-	}
-
-	_startStopwatch() {
-		const self = this
-		this.watchStart = Date.now()
-		this._stopStopwatch()
-		this.watchTimer = setInterval(function () {
-			if (!self.watchEl) return
-			self.watchEl.textContent = 'ЗАГРУЗКА: ' + formatStopwatch(Date.now() - self.watchStart)
-		}, 250)
-	}
-
-	_stopStopwatch() {
-		if (this.watchTimer) clearInterval(this.watchTimer)
-		this.watchTimer = 0
-	}
-
-	/* ─────────────────── навигация и запуск ────── */
-
-	_canAdvance() {
-		const step = STEPS[this.index]
-		if (this.busy) return false
-		if (step.id === 'location') return this._unlocked(this._map())
-		return true
-	}
-
-	next() {
-		if (this.busy || !this.root) return
-		if (!this._canAdvance()) {
-			const map = this._map()
-			this.hintEl.textContent = map.available ? 'ДЛЯ ВЫСАДКИ НУЖЕН ПРОПУСК' : 'ВЫБЕРИТЕ ДОСТУПНУЮ ЛОКАЦИЮ'
-			return
-		}
-		if (STEPS[this.index].id === 'confirm') {
-			this.index++
-			this._renderStep()
-			this._deploy()
-			return
-		}
-		if (this.index >= STEPS.length - 1) return
-		this.index++
-		this._renderStep()
-	}
-
-	back() {
-		if (this.busy || !this.root) return
-		if (this.index === 0) {
-			this.close({ restoreMenu: true })
-			return
-		}
-		this.index--
-		this._renderStep()
-	}
-
-	/** Прокидывает настройки тренировки в подсистемы через опциональные сеттеры. */
-	_applyOfflineConfig() {
-		const cfg = this.state.offline
-		const engine = this.engine
-		if (engine) {
-			engine.__eflOffline = {
-				training: this.state.training,
-				aiCount: cfg.aiCount,
-				aiDifficulty: cfg.aiDifficulty,
-				bosses: cfg.bosses,
-				noDrain: cfg.noDrain,
-				mapId: this.state.mapId,
-				faction: this.state.faction,
-				night: this.state.night
-			}
-		}
-		if (!this.state.training) return
-
-		const ai = this._peek('ai')
-		if (ai) {
-			const countScale = AI_COUNT_SCALE[cfg.aiCount] || 1
-			if (typeof ai.setBotBudget === 'function') call(ai, 'setBotBudget', countScale)
-			else call(ai, 'setBotCount', countScale)
-			call(ai, 'setDifficulty', AI_DIFFICULTY_SCALE[cfg.aiDifficulty] || 1)
-			call(ai, 'setBossesEnabled', !!cfg.bosses)
-		}
-		const health = this._peek('health')
-		if (health) call(health, 'setSurvivalDrain', !cfg.noDrain)
-	}
-
-	/**
-	 * Цепочка высадки.
-	 *
-	 * enterLoading() → runRaidPrewarm() → raid.start() внутри afterTerrain →
-	 * закрытие меню → enterGameplay(). Компиляция шейдеров, пул трассеров и
-	 * прогрев геометрии оружия гарантированно завершаются ДО того, как
-	 * состояние станет STATE.GAMEPLAY — иначе первый выстрел и первая
-	 * очередь бота давали бы тот самый микрофриз.
-	 */
-	async _deploy() {
-		if (this.busy || this.deployed) return
-		this.busy = true
-		this.deployed = true
-
-		const engine = this.engine
-		const map = this._map()
-		const faction = this.state.faction
-		const night = this.state.night
-		const self = this
-
-		this._applyOfflineConfig()
-
-		/* Скаву выдаётся случайный кит через детерминированный rng движка. */
-		if (faction === 'scav') {
-			const meta = this._peek('meta')
-			const rng = this.ctx && this.ctx.rng ? call(this.ctx.rng, 'fork') || this.ctx.rng : null
-			if (meta && rng) call(meta, 'equipScavKit', rng)
-		}
-
-		call(engine, 'enterLoading')
-
-		const result = await runRaidPrewarm(engine, {
-			onStage: function (id, label, index, total) { self._setStage(id, label, index, total) },
-			onProgress: function (t) { self._setProgress(t) },
-			afterTerrain: async function () {
-				const raid = self._peek('raid')
-				if (raid) call(raid, 'start', map.id, faction, night)
-			}
-		})
-
-		if (this.destroyed) return
-
-		this._setProgress(1)
-		this._stopStopwatch()
-
-		if (result && result.ok === false && this.statusEl) {
-			this.statusEl.textContent = 'ЗАГРУЗКА ЗАВЕРШЕНА С ОГРАНИЧЕНИЯМИ'
-			const err = el('div', NS + '-err', 'Преварм не дошёл до конца: ' + rebrandText(String(result.reason || 'неизвестная причина')))
-			if (this.statusEl.parentNode) this.statusEl.parentNode.appendChild(err)
-		}
-
-		/* Главное меню гасим без destroy — оно понадобится после рейда. */
-		if (engine && engine.mainMenu) call(engine.mainMenu, 'close', { fade: 700, destroy: false })
-
-		call(engine, 'enterGameplay')
-		call(engine, 'requestPointerLock')
-
-		this.busy = false
-		this.close({ restoreMenu: false })
-	}
-
-	/* -------------------------------------------------------------- теардаун */
-
-	close(opts) {
-		const o = opts || {}
-		if (o.restoreMenu !== false) this._rotateMenuIn()
-		this.dispose()
-	}
-
-	dispose() {
-		if (this.destroyed) return
-		this.destroyed = true
-		this._stopClock()
-		this._stopStopwatch()
-		document.removeEventListener('keydown', this._onKeyDown, true)
-		if (this.modal && this.modal.parentNode) this.modal.parentNode.removeChild(this.modal)
-		this.modal = null
-		if (this.root && this.root.parentNode) this.root.parentNode.removeChild(this.root)
-		this.root = null
-		this.bodyEl = null
-		this.titleEl = null
-		this.pips = []
-		this.nextBtn = null
-		this.backBtn = null
-		this.hintEl = null
-		this.statusEl = null
-		this.fillEl = null
-		this.watchEl = null
-		this.stageNodes = {}
-		if (activeWizard === this) activeWizard = null
-	}
-}
-
-/* ====================================================================== */
-/*                        открытие и мост в меню                         */
+/*                     жизненный цикл живого визарда                      */
 /* ====================================================================== */
 
 let activeWizard = null
 let bridgeInstalled = false
+let bridgeHandler = null
 
-/** Открывает визард. Повторный вызов возвращает живой экземпляр. */
-export function openLobbyWizard(engine, opts) {
-	if (activeWizard && !activeWizard.destroyed) return activeWizard
-	const resolved = engine || (typeof window !== 'undefined' ? window.__ENGINE__ : null)
-	if (!resolved) return null
-	if (resolved.state && resolved.state !== STATE.MENU && resolved.state !== STATE.BOOT) return null
-	activeWizard = new LobbyWizard(resolved, opts)
-	activeWizard.show()
+/** Живой визард или null. Разрушенный экземпляр наружу не отдаём. */
+export function getActiveLobbyWizard() {
+	if (activeWizard && activeWizard.destroyed) activeWizard = null
 	return activeWizard
 }
 
-export function closeLobbyWizard() {
-	if (activeWizard && !activeWizard.destroyed) activeWizard.close({ restoreMenu: true })
-	activeWizard = null
+export function isLobbyWizardOpen() {
+	return !!getActiveLobbyWizard()
 }
 
+/**
+ * Открывает визард. Повторный вызов возвращает живой экземпляр.
+ *
+ * show() асинхронный (он ждёт поворот меню), поэтому промис здесь
+ * обязательно перехватывается: незакрытый reject в обработчике клика — это
+ * unhandledrejection и мёртвая кнопка без единой строки в консоли.
+ *
+ * @returns {LobbyWizard|null} экземпляр либо null, если открыть нельзя
+ */
+export function openLobbyWizard(engine, opts) {
+	const live = getActiveLobbyWizard()
+	if (live) return live
+	if (typeof document === 'undefined') return null
+
+	const o = opts || {}
+	const resolved = resolveEngine(engine)
+	if (!resolved) {
+		logWarn('движок не найден — визард высадки не открыт')
+		return null
+	}
+	if (!stateAllowsWizard(resolved)) return null
+
+	const menuRoot = o.menuRoot || resolveMenuRoot(resolved.mainMenu || null, o.fromNode || null)
+
+	let wizard = null
+	try {
+		wizard = new LobbyWizard(resolved, {
+			menuRoot: menuRoot,
+			mount: o.mount || document.body,
+			/* Единственный владелец ссылки — этот модуль. Класс сообщает о
+			 * своей смерти сам, поэтому activeWizard не переживает dispose(). */
+			onDispose: function (dead) {
+				if (activeWizard === dead) activeWizard = null
+			}
+		})
+	} catch (err) {
+		logError('LobbyWizard не создан', err)
+		return null
+	}
+
+	activeWizard = wizard
+
+	Promise.resolve()
+		.then(function () {
+			return wizard.show()
+		})
+		.catch(function (err) {
+			logError('визард высадки не отрисовался', err)
+			try {
+				wizard.dispose()
+			} catch (inner) {
+				/* теардаун не имеет права бросать поверх исходной ошибки */
+			}
+			if (activeWizard === wizard) activeWizard = null
+		})
+
+	return wizard
+}
+
+/**
+ * Закрывает визард.
+ *
+ * @param opts.restoreMenu вернуть меню поворотом обратно (по умолчанию да)
+ */
+export function closeLobbyWizard(opts) {
+	const wizard = getActiveLobbyWizard()
+	activeWizard = null
+	if (!wizard) return false
+	const o = opts || {}
+	try {
+		wizard.close({ restoreMenu: o.restoreMenu !== false })
+	} catch (err) {
+		logError('закрытие визарда упало', err)
+		try {
+			wizard.dispose()
+		} catch (inner) {
+			/* см. выше */
+		}
+		return false
+	}
+	return true
+}
+
+/* ====================================================================== */
+/*                             мост в меню                                */
+/* ====================================================================== */
+
+/** Похож ли узел на кнопку выхода в рейд. */
 function looksLikeLaunch(node) {
 	if (!node || node.nodeType !== 1) return false
-	const text = (node.textContent || '').trim()
-	if (text && text.length < 60 && LAUNCH_RE.test(text)) return true
-	const attrs = ['data-act', 'data-action', 'data-nav', 'data-screen', 'data-menu', 'data-role', 'data-view', 'id', 'aria-label']
-	for (let i = 0; i < attrs.length; i++) {
-		const raw = node.getAttribute ? node.getAttribute(attrs[i]) : null
+
+	const text = (node.textContent || '').replace(/\s+/g, ' ').trim()
+	if (text && text.length <= MAX_LABEL && LAUNCH_RE.test(text)) return true
+
+	for (let i = 0; i < LAUNCH_ATTRS.length; i++) {
+		const raw = attrOf(node, LAUNCH_ATTRS[i])
 		if (!raw) continue
-		if (LAUNCH_ACTS.test(raw.trim())) return true
-		if (LAUNCH_RE.test(raw)) return true
+		const trimmed = raw.trim()
+		if (LAUNCH_ACTS.test(trimmed)) return true
+		if (LAUNCH_RE.test(trimmed)) return true
 	}
 	return false
 }
 
+/** Ближайший вверх по дереву узел запуска рейда, либо null. */
+function findLaunchNode(target) {
+	let node = target
+	for (let i = 0; i < MAX_WALK; i++) {
+		if (!node || node.nodeType !== 1) return null
+		if (typeof document !== 'undefined' && node === document.body) return null
+		if (looksLikeLaunch(node)) return node
+		node = node.parentElement
+	}
+	return null
+}
+
+function onDocumentClick(e) {
+	if (!e || e.defaultPrevented) return
+	/* Только основная кнопка мыши: контекстное меню рейд не запускает. */
+	if (typeof e.button === 'number' && e.button !== 0) return
+	if (isLobbyWizardOpen()) return
+
+	const target = e.target
+	if (!target || target.nodeType !== 1) return
+	if (typeof target.closest === 'function' && target.closest(SKIP_ROOTS)) return
+
+	const hit = findLaunchNode(target)
+	if (!hit) return
+
+	const engine = resolveEngine(null)
+	if (!stateAllowsWizard(engine)) return
+
+	/*
+	 * Порядок намеренный: сначала пробуем открыть, гасим событие только
+	 * после успеха. Если визард почему-то не поднялся, клик уходит штатному
+	 * обработчику меню и рейд всё равно стартует через engine.startRaid() —
+	 * без преварма, но и без мёртвой кнопки.
+	 */
+	const wizard = openLobbyWizard(engine, {
+		menuRoot: resolveMenuRoot(engine ? engine.mainMenu : null, hit),
+		fromNode: hit
+	})
+	if (!wizard) return
+
+	e.preventDefault()
+	if (typeof e.stopPropagation === 'function') e.stopPropagation()
+	/* Меню вешает свой хендлер на этот же узел — глушим и соседей. */
+	if (typeof e.stopImmediatePropagation === 'function') e.stopImmediatePropagation()
+}
+
 /**
- * Ставит делегированный обработчик на клик по «ПОБЕГ ИЗ ЛАРПОВА».
+ * Ставит делегированный обработчик клика по «ПОБЕГ ИЗ ЛАРПОВА».
  *
- * Обработчик висит на фазе перехвата, чтобы опередить штатный хендлер
- * меню, который ушёл бы в startRaid() без преварма. main.js не импортирует
- * этот модуль и правится лидом, поэтому мост ставится сам при импорте.
+ * Обработчик висит на фазе ПЕРЕХВАТА, чтобы опередить штатный хендлер меню,
+ * который ушёл бы в startRaid() без преварма. Делегирование — потому что
+ * MainMenuSystem перерисовывает свой DOM целиком при смене темы, и прямая
+ * подписка на узел кнопки умерла бы вместе с ним.
+ *
+ * main.js этот модуль не импортирует и правится лидом, поэтому мост
+ * ставится сам при импорте (см. низ файла).
+ *
+ * @returns {boolean} true, если слушатель поставлен именно этим вызовом
  */
 export function applyLobbyWizardBridge() {
 	if (bridgeInstalled || typeof document === 'undefined') return false
 	bridgeInstalled = true
+	bridgeHandler = onDocumentClick
+	document.addEventListener('click', bridgeHandler, true)
+	return true
+}
 
-	document.addEventListener('click', function (e) {
-		if (activeWizard && !activeWizard.destroyed) return
-		const target = e.target
-		if (!target || target.nodeType !== 1) return
-		if (target.closest && target.closest(SKIP_ROOTS)) return
+/** Снимает мост. Нужен дев-харнессам и hot-reload. */
+export function removeLobbyWizardBridge() {
+	if (!bridgeInstalled || typeof document === 'undefined') return false
+	if (bridgeHandler) document.removeEventListener('click', bridgeHandler, true)
+	bridgeHandler = null
+	bridgeInstalled = false
+	return true
+}
 
-		let node = target
-		let hit = null
-		for (let i = 0; i < MAX_WALK && node && node !== document.body; i++) {
-			if (looksLikeLaunch(node)) {
-				hit = node
-				break
-			}
-			node = node.parentNode
-		}
+/**
+ * Полный теардаун подсистемы визарда: живой экран, мост и тег стилей.
+ *
+ * «Dispose what you create» из ARCHITECTURE.md: <style> впрыскивает
+ * ensureStyles(), значит снять его обязан этот модуль, а не сборщик мусора.
+ */
+export function disposeLobbyWizardUi() {
+	closeLobbyWizard({ restoreMenu: false })
+	removeLobbyWizardBridge()
+	removeStyles()
+}
+
+/* ------------------------------------------------------- автоустановка */
+
+applyLobbyWizardBridge()
+
+/*
+ * Дев-хендл рядом с window.__ENGINE__ из main.js: без него визард нельзя
+ * поднять из консоли, не зная пути импорта. Ничего не переопределяем, если
+ * хендл уже занят.
+ */
+if (typeof window !== 'undefined' && !window.__eflLobbyWizard) {
+	window.__eflLobbyWizard = {
+		open: openLobbyWizard,
+		close: closeLobbyWizard,
+		active: getActiveLobbyWizard,
+		dispose: disposeLobbyWizardUi
+	}
+}
+
+export default openLobbyWizard
