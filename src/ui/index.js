@@ -6,13 +6,34 @@
  * повторяет замороженный STATE из core/engine.js (всё строго в нижнем
  * регистре: 'boot' | 'menu' | 'loading' | 'gameplay' | 'paused' | 'results').
  * Строковые литералы состояний здесь запрещены.
+ *
+ * ЖИЗНЕННЫЙ ЦИКЛ ВИЗАРДА ВЫСАДКИ. Визард поворачивает главное меню на 90°
+ * и вешает на document делегированный перехватчик клика в фазе захвата. Сам он
+ * снять ни то, ни другое после рейда не может: высадка закрывает его с
+ * restoreMenu: false, и к моменту возврата в убежище экземпляра уже не
+ * существует. Значит, владелец жизненного цикла — эта система, единственная,
+ * кто видит все переходы состояний:
+ *
+ *   LOADING   — мост снимаем, визард НЕ трогаем: шаг 5 владеет экраном
+ *               высадки и сам ждёт runRaidPrewarm()
+ *   GAMEPLAY  — мост снимаем, визард гасим с restoreMenu: false
+ *   RESULTS   — то же самое: на экране итогов перехватчику нечего ловить
+ *   MENU      — restoreMenuPresentation(): плоское меню и свежий мост
  * ========================================================================== */
 
-/* Побочный импорт: ./lobbyWizard.js при загрузке сам ставит делегированный
- * мост клика по «ПОБЕГ ИЗ ЛАРПОВА» в фазе перехвата (applyLobbyWizardBridge()
- * внизу того модуля). Без этой строки визард высадки не импортирует никто и
- * все пять его экранов недостижимы из главного меню. */
-import './lobbyWizard.js'
+/* Импорт ./lobbyWizard.js обязателен сам по себе: при загрузке модуль
+ * ставит делегированный мост клика по «ПОБЕГ ИЗ ЛАРПОВА» в фазе перехвата
+ * (applyLobbyWizardBridge() внизу того файла). Без этой строки визард
+ * высадки не импортирует никто и все пять его экранов недостижимы из
+ * главного меню. Именованный импорт побочный эффект не отменяет, зато даёт
+ * управление жизненным циклом после рейда. */
+import {
+  applyLobbyWizardBridge,
+  closeLobbyWizard,
+  disposeLobbyWizardUi,
+  removeLobbyWizardBridge,
+  resetMenuTransform,
+} from './lobbyWizard.js'
 
 import {
   STATE,
@@ -25,6 +46,10 @@ import { RaidResultSystem } from './raidResult.js'
 import * as SettingsModule from './settingsMenu.js'
 
 const BUILD_VERSION = '1.1.0.1.46777'
+
+/* Поля, в которых MainMenuSystem держит свой корневой узел. Именно этот узел
+ * визард поворачивает и размывает, его же надо возвращать в плоское состояние. */
+const MENU_ROOT_FIELDS = ['root', 'el', 'node', 'container', 'dom', 'wrap', 'overlay']
 
 /* settingsMenu.js отдаёт и named, и default. Берём что есть и никогда не бросаем:
  * без меню настроек UI обязан продолжать работать. */
@@ -133,6 +158,64 @@ export class UiSystem {
     this.setHudVisible(false)
   }
 
+  /* --------------------------------------------------- визард и корень меню */
+
+  /* Реальный DOM-узел главного меню или null. mainMenu в реестре не лежит,
+   * поэтому идём через engine. Если узел не нашлся, resetMenuTransform(null)
+   * всё равно отработает по классам поворота и селекторам. */
+  _menuRootNode() {
+    const engine = this.engine
+    const menu = engine && engine.mainMenu ? engine.mainMenu : null
+    if (!menu) return null
+    for (let i = 0; i < MENU_ROOT_FIELDS.length; i++) {
+      const candidate = menu[MENU_ROOT_FIELDS[i]]
+      if (candidate && candidate.nodeType === 1) return candidate
+    }
+    return null
+  }
+
+  /**
+   * ПЛОСКОЕ МЕНЮ И ЧИСТЫЙ МОСТ.
+   *
+   * Зовётся при любом возврате в хаб: после экстракта, после смерти, после
+   * «ПОКИНУТЬ РЕЙД» и после прямого setState(STATE.MENU). Порядок шагов
+   * важен:
+   *
+   *   1. гасим возможный живой визард с restoreMenu: false — его штатный
+   *      _rotateMenuIn() ждёт 700 мс, а меню надо вернуть СРАЗУ;
+   *   2. снимаем мост, чтобы мёртвый перехватчик гарантированно ушёл с document;
+   *   3. возвращаем контейнер в rotateY(0deg) / blur(0px);
+   *   4. ставим мост заново — в меню он снова нужен, и именно свежий.
+   *
+   * @returns {number} сколько контейнеров сброшено
+   */
+  restoreMenuPresentation() {
+    closeLobbyWizard({ restoreMenu: false })
+    removeLobbyWizardBridge()
+    const count = resetMenuTransform(this._menuRootNode())
+    applyLobbyWizardBridge()
+    return count
+  }
+
+  /**
+   * Мост клика живёт только в меню.
+   *
+   * В рейде, на загрузке и на экране итогов делегированный перехватчик обязан
+   * быть снят: мёртвый визард не имеет права воровать клики по ПЕРСОНАЖ /
+   * БАРАХОЛКА / УБЕЖИЩЕ / ВЫХОД и уводить игрока в новое лобби.
+   *
+   * Закрытие идёт СТРОГО с restoreMenu: false. С дефолтным true визард позвал бы
+   * _rotateMenuIn() и вернул меню на экран прямо поверх начавшегося рейда.
+   *
+   * @param opts.keepWizard не трогать живой экземпляр (шаг 5 на LOADING)
+   */
+  _detachLobbyWizard(opts) {
+    const o = opts || {}
+    removeLobbyWizardBridge()
+    if (o.keepWizard) return
+    closeLobbyWizard({ restoreMenu: false })
+  }
+
   /* ------------------------------------------------------ переходы состояний */
   _onStateTransition(from, to) {
     try {
@@ -153,6 +236,9 @@ export class UiSystem {
       }
 
       if (to === STATE.GAMEPLAY) {
+        /* Рейд пошёл: визард больше не нужен, мост — тем более. Штатный
+         * close() шага 5 после enterGameplay() останется безвредным no-op. */
+        this._detachLobbyWizard()
         this._closeOverlays()
         this.setHudVisible(true)
         return
@@ -164,6 +250,7 @@ export class UiSystem {
          * setState() — тогда игрок оставался на пустом экране. Теперь
          * переход сам тянет сводку из RaidSystem и запускает отчёт;
          * повторный показ гасит дедуп внутри showRaidResults(). */
+        this._detachLobbyWizard()
         this.setHudVisible(false)
         const raid = this._peek('raid')
         const raidPayload = raid && typeof raid.getSummaryPayload === 'function'
@@ -180,6 +267,13 @@ export class UiSystem {
         if (this.settingsMenu && this.settingsMenu.isOpen) {
           call(this.settingsMenu, 'close', { revert: false })
         }
+
+        /* Вот где лечится повёрнутое на 90° и размытое меню после рейда.
+         * LOADING в этот сброс не попадает намеренно: там меню ОБЯЗАНО
+         * оставаться повёрнутым — на нём сейчас шаг 5 визарда, и его же
+         * закрывать нельзя: экран высадки ждёт runRaidPrewarm(). */
+        if (to === STATE.MENU) this.restoreMenuPresentation()
+        else this._detachLobbyWizard({ keepWizard: true })
       }
     } catch (err) {
       console.error('[EFL/ui] обработчик перехода состояния упал', err)
@@ -342,19 +436,48 @@ export class UiSystem {
   }
 
   /* ------------------------------------------------------------ в убежище */
+
+  /**
+   * Возврат в хаб после итогов рейда и после «ПОКИНУТЬ РЕЙД».
+   *
+   * Плоский сброс стоит ЗДЕСЬ ДВА РАЗА, и это не дублирование:
+   *
+   *   - первый вызов снимает поворот и блюр НЕМЕДЛЕННО, до любых действий
+   *     движка: игрок не должен увидеть ни одного кадра с повёрнутым меню;
+   *   - второй — после mainMenu.show(), потому что MainMenuSystem может
+   *     пересобрать свой DOM с нуля, и тогда первый сброс достанется узлу,
+   *     которого больше нет в документе.
+   *
+   * Мост снимается ДО смены состояния и ставится заново в самом конце — иначе
+   * мёртвый перехватчик переживёт рейд и первый же клик по ПЕРСОНАЖ
+   * снова уедет в лобби высадки.
+   */
   _returnToMenu() {
     this.hideRaidResults()
+
+    /* Живого визарда здесь быть не должно, но если игрок дезертировал прямо
+     * с экрана высадки, экземпляр всё ещё висит на экране. */
+    closeLobbyWizard({ restoreMenu: false })
+    removeLobbyWizardBridge()
+    resetMenuTransform(this._menuRootNode())
 
     const engine = this.engine
     if (!engine) return
 
     if (typeof engine.returnToMenu === 'function') {
       call(engine, 'returnToMenu')
-      if (engine.state === STATE.MENU) return
+      if (engine.state === STATE.MENU) {
+        resetMenuTransform(this._menuRootNode())
+        applyLobbyWizardBridge()
+        return
+      }
     }
 
     if (typeof engine.setState === 'function') engine.setState(STATE.MENU)
     call(engine.mainMenu, 'show')
+
+    resetMenuTransform(this._menuRootNode())
+    applyLobbyWizardBridge()
   }
 
   /* --------------------------------------------------------------- dispose */
@@ -363,6 +486,11 @@ export class UiSystem {
       try { this._offState() } catch (e) { /* отписка не должна ломать выгрузку */ }
     }
     this._offState = null
+
+    /* Визард высадки создан из этой системы (через мост), значит ей и
+     * хоронить: слушатель на document, <style>-тег и поворот меню не имеют
+     * права пережить UiSystem. */
+    disposeLobbyWizardUi()
 
     call(this.raidResult, 'destroy')
     call(this.escapeMenu, 'destroy')
