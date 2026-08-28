@@ -4,7 +4,43 @@
  *
  * Edge queries (`pressed`, `released`) are valid only during the frame in which
  * the transition happened — read them in update(), not fixedUpdate().
+ *
+ * ---------------------------------------------------------------------------
+ * POINTER LOCK ARBITRATION
+ *
+ * `_onMouseDown()` used to re-acquire pointer lock on ANY left click anywhere in
+ * the document as long as `enabled` was true. Full-screen DOM overlays (the
+ * inventory, the ESC menu, the settings panel) release the cursor but leave
+ * `enabled` untouched, so the first click on an inventory item re-locked the
+ * mouse in the middle of a drag and handed the look vector back to the camera.
+ * `frozen` did not help: it only zeroes `look` and gates `_onMouseMove()`.
+ *
+ * The same handler also published the button into `_pendingDown`, so `fire` went
+ * true and the weapon system pulled the trigger — clicking an item to drag it
+ * discharged the gun. `time.scale` is 0 while the inventory is open, so
+ * `WeaponSystem.time` never advanced past `nextShotAt` and the shot always
+ * passed its rate-of-fire gate.
+ *
+ * The fix is an explicit, owner-keyed suppression set. A UI surface calls
+ * `suppressPointerLock('inventory')` while it owns the cursor and
+ * `allowPointerLock('inventory')` when it hands it back. While ANY suppressor is
+ * registered:
+ *   - `requestPointerLock()` is a no-op, whoever calls it;
+ *   - `_onMouseDown()` never auto-locks and never publishes the button;
+ *   - `fire` / `firePressed` / `ads` report false.
+ *
+ * A second, independent guard keys off the DOM: pointer and keyboard events that
+ * originate inside a registered UI overlay never auto-lock and never enter the
+ * action snapshot, even if a surface forgets to register a suppressor. Belt and
+ * braces, because a stuck pointer lock is unrecoverable without an alt-tab.
  */
+
+/**
+ * Roots that own the cursor whenever they are on screen. Kept deliberately in
+ * sync with `SKIP_ROOTS` in ui/mainMenuBridge.js. `[data-efl-overlay]` lets any
+ * future surface opt in without editing core.
+ */
+export const UI_OVERLAY_SELECTOR = '#eftInv, .efl-esc, .efl-set, [data-efl-overlay]';
 
 export const ACTIONS = {
   forward: ['KeyW', 'ArrowUp'],
@@ -25,6 +61,25 @@ export const ACTIONS = {
   flashlight: ['KeyT'],
   pause: ['Escape'],
 };
+
+/** True when the event originated inside a cursor-owning UI overlay. */
+function inUiOverlay(target) {
+  if (!target || target.nodeType !== 1 || typeof target.closest !== 'function') return false;
+  try {
+    return !!target.closest(UI_OVERLAY_SELECTOR);
+  } catch (e) {
+    /* Malformed selector support in exotic engines — fail open, not closed. */
+    return false;
+  }
+}
+
+/** Text entry must reach the DOM verbatim: no preventDefault, no action snapshot. */
+function isEditableTarget(target) {
+  if (!target || target.nodeType !== 1) return false;
+  const tag = target.tagName;
+  if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return true;
+  return target.isContentEditable === true;
+}
 
 export class Input {
   constructor(canvas, config) {
@@ -47,6 +102,13 @@ export class Input {
     this.enabled = true;
     /** Set true by capture mode so scripted shots aren't fought by real input. */
     this.frozen = false;
+
+    /**
+     * Owners that currently forbid pointer lock. A Set, not a boolean, so two
+     * overlapping surfaces (inventory opened from the ESC menu) cannot have the
+     * inner one hand the cursor back while the outer one still needs it.
+     */
+    this._lockSuppressors = new Set();
 
     this.gamepadIndex = null;
     this.stick = { moveX: 0, moveY: 0, lookX: 0, lookY: 0 };
@@ -88,8 +150,54 @@ export class Input {
     this.canvas.removeEventListener('contextmenu', this._bound.contextmenu);
   }
 
+  /* ------------------------------------------------ pointer lock suppression */
+
+  /**
+   * Forbid pointer lock until `owner` gives it back. Idempotent, so a surface
+   * may call it on every show() without bookkeeping.
+   */
+  suppressPointerLock(owner = 'anonymous') {
+    this._lockSuppressors.add(owner);
+    /* Any lock still held belongs to gameplay, not to the overlay that just
+     * opened. Drop it here so callers don't each re-implement exitPointerLock. */
+    if (this.pointerLocked && typeof document !== 'undefined' && typeof document.exitPointerLock === 'function') {
+      try {
+        document.exitPointerLock();
+      } catch (e) {
+        /* already unlocked */
+      }
+    }
+    /* A suppressed frame must not carry mouse buttons into gameplay. */
+    this._pendingDown.delete('Mouse0');
+    this._pendingDown.delete('Mouse1');
+    this._pendingDown.delete('Mouse2');
+    for (const code of this.down) {
+      if (code.startsWith('Mouse')) this._pendingUp.add(code);
+    }
+    return this._lockSuppressors.size;
+  }
+
+  allowPointerLock(owner = 'anonymous') {
+    this._lockSuppressors.delete(owner);
+    return this._lockSuppressors.size;
+  }
+
+  /** True while at least one UI surface owns the cursor. */
+  get pointerLockSuppressed() {
+    return this._lockSuppressors.size > 0;
+  }
+
+  /** Diagnostic for the ESC-menu cursor arbiter and dev overlays. */
+  get pointerLockOwners() {
+    return Array.from(this._lockSuppressors);
+  }
+
   requestPointerLock() {
     if (!this.enabled) return;
+    /* THE fix for the drag-and-drop bug: while an overlay owns the cursor this
+     * is a no-op no matter who calls it — inventory, ESC menu, or a stray
+     * mousedown that leaked up to window. */
+    if (this.pointerLockSuppressed) return;
     // Chrome returns a promise that rejects if the document is not eligible
     // (headless capture, an iframe, a lock request too soon after an exit).
     // An unhandled rejection there shows up as a page error in the harness, so
@@ -102,9 +210,16 @@ export class Input {
     }
   }
 
+  /* ---------------------------------------------------------- DOM listeners */
+
   _onKeyDown(e) {
     if (!this.enabled) return;
     if (e.repeat) return;
+    /* Text fields and overlay chrome own their own keystrokes. Without this the
+     * stash search box was unusable: every character was swallowed by
+     * preventDefault and simultaneously published as a movement action, so
+     * typing "wasd" walked the player around inside the menu. */
+    if (isEditableTarget(e.target) || inUiOverlay(e.target)) return;
     // Let devtools/refresh through; swallow everything else the game binds.
     if (!e.metaKey && !e.ctrlKey) e.preventDefault();
     this._pendingDown.add(e.code);
@@ -112,17 +227,24 @@ export class Input {
 
   _onKeyUp(e) {
     if (!this.enabled) return;
+    /* Always publish the release, even from an overlay: a key pressed in
+     * gameplay and released over an overlay must not stay latched. */
     this._pendingUp.add(e.code);
   }
 
   _onMouseDown(e) {
     if (!this.enabled) return;
+
+    /* Two independent reasons to keep our hands off this click. */
+    if (this.pointerLockSuppressed || inUiOverlay(e.target)) return;
+
     if (!this.pointerLocked && e.button === 0) this.requestPointerLock();
     this._pendingDown.add(`Mouse${e.button}`);
   }
 
   _onMouseUp(e) {
     if (!this.enabled) return;
+    /* Unconditional, symmetric with _onKeyUp: never leave a button latched. */
     this._pendingUp.add(`Mouse${e.button}`);
   }
 
@@ -135,6 +257,8 @@ export class Input {
 
   _onWheel(e) {
     if (!this.enabled) return;
+    /* Scrolling the stash must not cycle the player's weapon. */
+    if (this.pointerLockSuppressed || inUiOverlay(e.target)) return;
     this._pendingWheel += Math.sign(e.deltaY);
   }
 
@@ -223,16 +347,21 @@ export class Input {
     return this._released.has(code);
   }
 
+  /*
+   * Gameplay trigger queries are gated on the suppression set. This is the single
+   * chokepoint that stops a UI click from being read as a shot, so no subsystem
+   * has to learn what an overlay is.
+   */
   get fire() {
-    return this.down.has('Mouse0');
+    return !this.pointerLockSuppressed && this.down.has('Mouse0');
   }
 
   get firePressed() {
-    return this._pressed.has('Mouse0');
+    return !this.pointerLockSuppressed && this._pressed.has('Mouse0');
   }
 
   get ads() {
-    return this.down.has('Mouse2');
+    return !this.pointerLockSuppressed && this.down.has('Mouse2');
   }
 
   /** Normalised WASD + left-stick movement, clamped to the unit disc so
