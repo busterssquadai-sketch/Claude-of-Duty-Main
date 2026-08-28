@@ -1,4 +1,5 @@
 import * as THREE from 'three';
+import { MuzzleSolver } from './muzzle.js';
 
 /**
  * Projectile ballistics.
@@ -15,25 +16,38 @@ import * as THREE from 'three';
  *
  * ORIGIN AND ALIGNMENT (REFACTOR 3)
  * ---------------------------------
- * `spawn()` is now always handed a MUZZLE origin by weapons/muzzle.js, never the
- * camera. Two consequences are load-bearing here:
+ * `spawn()` is the single chokepoint every round passes through, so it is where
+ * the muzzle rerouting lives — WeaponSystem, the dev harness and any future
+ * caller are fixed at once instead of each having to remember.
  *
- *   - the tracer payload is emitted from the barrel tip, so it has real
- *     screen-space velocity and reads as a streak going downrange instead of a
- *     bar sitting on the near plane;
- *   - every visual is oriented from `velocity.normalize()`, not from the shot's
- *     initial direction. Gravity and drag bend the path, so a tracer aligned to
- *     the launch vector visibly slides sideways on a long flight. The payload
- *     therefore carries a live `dir` plus a `quaternion` that maps +Z onto that
- *     direction, and `orientAlongVelocity()` applies it to any mesh.
+ *   1. ORIGIN. If the caller handed us an eye/camera position, MuzzleSolver
+ *      replaces it with the world-space Muzzle Device node of the active
+ *      viewmodel and converges the shot on whatever the aim ray resolved to.
+ *      See weapons/muzzle.js for why that is two rays and not one.
+ *
+ *   2. SPREAD IS PRESERVED. The incoming direction already carries the weapon's
+ *      cone of fire (recoil pattern + sway + hipfire bloom) as a deviation from
+ *      the view axis. We extract that deviation as a quaternion and re-apply it
+ *      to the converged muzzle direction. Without this step, rerouting through
+ *      the barrel would quietly turn every weapon into a laser.
+ *
+ *   3. VISUALS FOLLOW VELOCITY, NOT LAUNCH. Gravity and drag bend the path, so a
+ *      tracer aligned to the launch vector visibly slides sideways on a long
+ *      flight. The payload carries a live `dir` taken from `velocity.normalize()`
+ *      plus a `quaternion` mapping +Z onto it; `orientAlongVelocity()` applies
+ *      that to any mesh so it extends forward down the trajectory line and can
+ *      never end up broadside or pointing back at the player.
  */
 
 const GRAVITY = -9.81;
 const MAX_LIVE = 96;
 
-/** +Z is the canonical "forward" for a tracer mesh, matching CylinderGeometry
+/** +Z is the canonical "forward" for a tracer mesh, matching a CylinderGeometry
  *  rotated onto Z and every look-at convention in three.js. */
 const FORWARD = new THREE.Vector3(0, 0, 1);
+
+const _dirTmp = new THREE.Vector3();
+const _spreadTmp = new THREE.Vector3();
 
 /* PhysicsSystem exposes MASK_WORLD / MASK_ACTOR / MASK_ALL as instance fields.
  * There is no phys.MASK.BULLET -- the previous code read that, got undefined,
@@ -52,12 +66,12 @@ function bulletMask(phys) {
  *
  * @param {THREE.Object3D} obj
  * @param {{pos: THREE.Vector3, vel: THREE.Vector3}} p
- * @param {number} [length] metres; when omitted the object's z scale is left alone
+ * @param {number} [length] metres; when omitted the object's z scale is untouched
  */
 export function orientAlongVelocity(obj, p, length) {
   if (!obj || !p) return obj;
   const v = p.vel;
-  if (v.lengthSq() < 1e-10) return obj;
+  if (!v || v.lengthSq() < 1e-10) return obj;
   _dirTmp.copy(v).normalize();
   obj.position.copy(p.pos);
   obj.quaternion.setFromUnitVectors(FORWARD, _dirTmp);
@@ -65,8 +79,6 @@ export function orientAlongVelocity(obj, p, length) {
   obj.updateMatrix();
   return obj;
 }
-
-const _dirTmp = new THREE.Vector3();
 
 class Projectile {
   constructor() {
@@ -103,8 +115,19 @@ export class ProjectileSim {
     for (let i = 0; i < MAX_LIVE; i++) this.pool.push(new Projectile());
     this.live = [];
     this._physics = null;
+    this._weapons = null;
+
+    /** Refactor 3.1: every player round is rerouted through this. */
+    this.muzzle = new MuzzleSolver();
+    /** Set false to disable rerouting (used by the deterministic shot harness). */
+    this.rerouteToMuzzle = true;
+
     this._seg = new THREE.Vector3();
     this._hitDir = new THREE.Vector3();
+    this._useOrigin = new THREE.Vector3();
+    this._useDir = new THREE.Vector3();
+    this._spreadQ = new THREE.Quaternion();
+
     this._tracerFrom = new THREE.Vector3();
     this._tracerTo = new THREE.Vector3();
     this._tracerDir = new THREE.Vector3(0, 0, -1);
@@ -114,7 +137,8 @@ export class ProjectileSim {
      * Tracer payload. `from` is the MUZZLE, `dir` is velocity.normalize() and
      * `quaternion` maps +Z onto it, so a consumer can either emit velocity-
      * aligned sprites (fx/tracers.js) or drop a mesh straight onto the
-     * trajectory line without recomputing anything.
+     * trajectory line without recomputing anything. Preallocated: emitting a
+     * tracer must not allocate.
      */
     this._tracerPayload = {
       from: this._tracerFrom,
@@ -142,7 +166,7 @@ export class ProjectileSim {
       mask: undefined,
     };
 
-    this.stats = { fired: 0, impacts: 0, live: 0, dropped: 0 };
+    this.stats = { fired: 0, impacts: 0, live: 0, dropped: 0, fromMuzzle: 0, fromEye: 0 };
   }
 
   get physics() {
@@ -152,13 +176,72 @@ export class ProjectileSim {
     return this._physics;
   }
 
+  /** The player's viewmodel, if one is mounted. Lazily peeked, never cached hard. */
+  get viewmodel() {
+    if (!this._weapons && this.ctx && typeof this.ctx.peek === 'function') {
+      try { this._weapons = this.ctx.peek('weapons'); } catch (e) { this._weapons = null; }
+    }
+    const w = this._weapons;
+    return w && w.viewmodel ? w.viewmodel : null;
+  }
+
   /**
-   * @param {object} o origin (MUZZLE, see weapons/muzzle.js), dir (unit), speed,
-   *                   damage, penetration, dragK, maxRange, dropoff, weapon,
-   *                   ammoIndex, shooter, tracer
+   * Replace an eye-space origin with the real barrel tip, preserving the shot's
+   * angular deviation from the view axis.
+   *
+   * @returns {boolean} true when `_useOrigin`/`_useDir` now hold the solution
+   */
+  _rerouteToMuzzle(o) {
+    if (!this.rerouteToMuzzle) return false;
+    /* Bots emit from their own weapon node; they never had the camera bug. */
+    if (o.shooter) return false;
+    /* An explicit flag lets a caller say "this is already a muzzle position". */
+    if (o.fromMuzzle === true) return false;
+
+    const vm = this.viewmodel;
+    if (!vm || !vm.active) return false;
+    const cam = this.ctx ? this.ctx.camera : null;
+    if (!cam) return false;
+
+    const sol = this.muzzle.solve({
+      camera: cam,
+      viewmodel: vm,
+      physics: this.physics,
+    });
+    if (!sol.fromMuzzle) return false;
+
+    this._useOrigin.copy(sol.origin);
+    this._useDir.copy(sol.dir);
+
+    /* Re-apply the cone of fire. `o.dir` is the view axis rotated by spread and
+     * recoil; that same rotation must survive the move to the barrel. */
+    _spreadTmp.copy(o.dir);
+    if (_spreadTmp.lengthSq() > 1e-12) {
+      _spreadTmp.normalize();
+      /* setFromUnitVectors handles the antiparallel case internally. */
+      this._spreadQ.setFromUnitVectors(sol.eyeDir, _spreadTmp);
+      this._useDir.applyQuaternion(this._spreadQ);
+      if (this._useDir.lengthSq() < 1e-12) this._useDir.copy(sol.dir);
+      else this._useDir.normalize();
+    }
+    return true;
+  }
+
+  /**
+   * @param {object} o origin, dir (unit), speed, damage, penetration, dragK,
+   *                   maxRange, dropoff, weapon, ammoIndex, shooter, tracer.
+   *                   `origin` may be an eye position: it will be rerouted to
+   *                   the muzzle unless `fromMuzzle === true` or a `shooter` is
+   *                   present.
    */
   spawn(o) {
     if (!o || !o.origin || !o.dir) return null;
+
+    const rerouted = this._rerouteToMuzzle(o);
+    const srcOrigin = rerouted ? this._useOrigin : o.origin;
+    const srcDir = rerouted ? this._useDir : o.dir;
+    if (rerouted) this.stats.fromMuzzle++;
+    else this.stats.fromEye++;
 
     let p = null;
     for (let i = 0; i < this.pool.length; i++) {
@@ -176,12 +259,13 @@ export class ProjectileSim {
       p.alive = false;
     }
 
-    p.alive = true;
-    p.pos.copy(o.origin);
-    p.prev.copy(o.origin);
-    p.dir.copy(o.dir);
+    p.dir.copy(srcDir);
     if (p.dir.lengthSq() < 1e-12) return null;
     p.dir.normalize();
+
+    p.alive = true;
+    p.pos.copy(srcOrigin);
+    p.prev.copy(srcOrigin);
 
     const speed = Number.isFinite(o.speed) && o.speed > 1 ? o.speed : 800;
     p.vel.copy(p.dir).multiplyScalar(speed);
@@ -201,16 +285,16 @@ export class ProjectileSim {
     this.live.push(p);
     this.stats.fired++;
 
-    if (p.tracer) this._emitTracer(p, speed, o.fromMuzzle !== false);
+    if (p.tracer) this._emitTracer(p, speed, rerouted || o.fromMuzzle === true);
     return p;
   }
 
   /**
-   * One tracer per burst of rounds: MUZZLE to wherever the round will land.
+   * One tracer per round that carries one: MUZZLE to wherever it will land.
    *
-   * The direction handed downstream is `velocity.normalize()` — identical to the
-   * launch vector on this first step, but taken from the velocity so the contract
-   * is the same one `orientAlongVelocity()` uses mid-flight.
+   * The direction handed downstream comes from `velocity.normalize()` — identical
+   * to the launch vector on this first step, but read off the velocity so the
+   * contract matches what `orientAlongVelocity()` uses mid-flight.
    */
   _emitTracer(p, speed, fromMuzzle) {
     const phys = this.physics;
@@ -321,6 +405,25 @@ export class ProjectileSim {
     return orientAlongVelocity(obj, p, length);
   }
 
+  /**
+   * Touch every pooled round once so the JIT has seen the hot path and the
+   * arrays are resident before the first shot of a raid. Called by the loading
+   * screen (see core/prewarm.js and ui/lobbyWizard.js STEP 5).
+   */
+  prewarm() {
+    for (let i = 0; i < this.pool.length; i++) {
+      const p = this.pool[i];
+      p.pos.set(0, -1000, 0);
+      p.prev.copy(p.pos);
+      p.vel.set(0, 0, -1);
+      p.dir.set(0, 0, -1);
+      p.heading(this._hitDir);
+      p.alive = false;
+    }
+    this._tracerQuat.setFromUnitVectors(FORWARD, this._tracerDir);
+    return this.pool.length;
+  }
+
   _retire(p) {
     p.alive = false;
     p.weapon = null;
@@ -337,6 +440,7 @@ export class ProjectileSim {
   dispose() {
     this.clear();
     this._physics = null;
+    this._weapons = null;
     this.ctx = null;
   }
 }

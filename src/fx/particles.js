@@ -6,8 +6,8 @@ import * as THREE from 'three';
  * One instanced quad per particle. The whole simulation lives in the vertex
  * shader as a closed-form solution of
  *
- *     dv/dt = -k v + g          =>   v(t) = v0 e^-kt + g/k (1 - e^-kt)
- *                                    x(t) = x0 + (v0 - g/k)(1 - e^-kt)/k + g t / k
+ *     dv/dt = -k v + g      =>   v(t) = v0 e^-kt + g/k (1 - e^-kt)
+ *                                x(t) = x0 + (v0 - g/k)(1 - e^-kt)/k + g t / k
  *
  * plus a per-particle turbulence term, so the CPU never touches a particle
  * again after it is spawned: no per-frame simulation, no per-frame allocation,
@@ -44,8 +44,14 @@ export const SP = {
   size0: 0.2, size1: 0.3, sizeCurve: 1,
   life: 1, delay: 0, drag: 1.4, gravity: 0,
   rot: 0, spin: 0,
-  /** Velocity-aligned smear: length = size * (1 + stretch * speed). ~1 is one
-   *  frame of motion blur at 60 Hz for a centimetre-scale sprite. */
+  /**
+   * Velocity-aligned smear. Length = size * (1 + stretch * screenSpeed), where
+   * screenSpeed is the SCREEN-SPACE component of the particle's velocity in
+   * metres/second at its own view depth — not the raw 3D speed. To ask for a
+   * streak of a known length in metres, solve stretch = (len/size - 1)/speed
+   * (see fx/tracers.js stretchFor). A value of 0 disables velocity alignment
+   * and returns the sprite to the spinning-billboard path.
+   */
   stretch: 0,
   r0: 1, g0: 1, b0: 1, i0: 1,
   r1: 1, g1: 1, b1: 1, i1: 0,
@@ -131,13 +137,28 @@ void main() {
   vec2 c = position.xy;
   vec2 off;
   if ( aRot.z > 0.001 ) {
-    // velocity-aligned: +Y of the sprite runs along screen-space velocity
+    // Velocity-aligned: +Y of the sprite runs along SCREEN-SPACE velocity.
+    //
+    // The smear length scales with length( velView.xy ) -- the ON-SCREEN
+    // component -- and deliberately NOT with length( velView ), the full 3D
+    // speed. A 900 m/s round travelling down the view axis has an enormous 3D
+    // speed and almost no screen-space velocity. Scaling by the 3D speed gave
+    // it a multi-metre streak, and because `along` then degenerated (d ~ 0) the
+    // shader drew that streak along an arbitrary fallback axis: a vertical bar
+    // planted across the near plane, i.e. a bullet apparently flying at the
+    // camera's face. Motion blur is a screen-space phenomenon; treat it as one.
     vec2 d = velView.xy;
     float dl = length( d );
-    vec2 along = dl > 1e-5 ? d / dl : vec2( 0.0, 1.0 );
-    vec2 perp = vec2( -along.y, along.x );
-    float len = size * ( 1.0 + aRot.z * length( velView ) );
-    off = along * ( c.y * len ) + perp * ( c.x * size );
+    if ( dl < 1.0e-4 ) {
+      // No on-screen travel: stay a round sprite instead of smearing along an
+      // arbitrary axis.
+      off = c * size;
+    } else {
+      vec2 along = d / dl;
+      vec2 perp = vec2( -along.y, along.x );
+      float len = size * ( 1.0 + aRot.z * dl );
+      off = along * ( c.y * len ) + perp * ( c.x * size );
+    }
   } else {
     float rot = aRot.x + aRot.y * t;
     float s = sin( rot ), co = cos( rot );
