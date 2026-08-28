@@ -5,7 +5,7 @@
  * владеет экземпляром SettingsMenu (его создаёт UiSystem у себя внутри) и
  * не имеет метода открытия панели, поэтому клик уходил в пустоту.
  *
- * Мост делает три вещи и ни одна из них не требует правок разметки меню:
+ * Мост делает четыре вещи и ни одна из них не требует правок разметки меню:
  *   1. добавляет MainMenuSystem.prototype.openSettings() —
  *      он берёт готовый экземпляр у UiSystem, а если его нет,
  *      инстанцирует SettingsMenu сам и вызывает open();
@@ -14,7 +14,10 @@
  *      (НАСТРОЙКИ / SETTINGS / ОПЦИИ) и работает даже если меню
  *      перерисовывает свой DOM целиком;
  *   3. аккуратно отходит в сторону, когда клик пришёл из ESC-меню или из
- *      самой панели настроек — там свои обработчики.
+ *      самой панели настроек — там свои обработчики;
+ *   4. перекрывает легаси-подпись кнопки рейда: сразу после mount()
+ *      'ESCAPE FROM TARKOV' в пунктах меню становится «ПОБЕГ ИЗ ЛАРПОВА»,
+ *      без правок 84-килобайтного mainMenu.js.
  *
  * ВАЖНО: модуль не самоприменяется. applyMainMenuBridge() обязан быть вызван
  * из точки входа (src/main.js) ДО new MainMenuSystem() и до mount(), иначе
@@ -45,6 +48,21 @@ const SETTINGS_TOKENS = [
 ]
 const SKIP_ROOTS = '.efl-esc, .efl-set, #eftInv'
 const MAX_WALK = 8
+
+/* Ребрендинг: что ищем в подписях пунктов меню и на что меняем. */
+const LEGACY_RAID_LABEL = 'ESCAPE FROM TARKOV'
+const RAID_LABEL = 'ПОБЕГ ИЗ ЛАРПОВА'
+
+/* Кандидаты на замену. Классы ОБОИХ поколений меню плюс голый button:
+ * mainMenu.js рисует пункт как
+ *   <button class="eft-item" data-action="raid"><span class="eft-item-txt">…
+ * то есть '.efl-menu-item' и '[data-act="raid"]' сегодня не ловят ничего,
+ * и держатся здесь только ради совместимости со старой разметкой. */
+const RAID_ITEM_SELECTOR =
+  '.efl-menu-item, .eft-item, [data-act="raid"], [data-action="raid"], button'
+
+/* Внутренний span подписи: писать надо в него, а не в саму кнопку. */
+const RAID_LABEL_SELECTOR = '.eft-item-txt, .efl-menu-item-txt'
 
 let applied = false
 let clickBound = false
@@ -238,6 +256,55 @@ function bindDelegatedClick() {
   document.addEventListener('click', onDocumentClick, true)
 }
 
+/**
+ * Перекрывает легаси-подпись пункта рейда.
+ *
+ * mainMenu.js держит подпись в захардкоженном MENU_ITEMS
+ * ({ id: 'raid', label: 'ESCAPE FROM TARKOV', primary: true }), поэтому
+ * менять текст в самом модуле меню не требуется: mount() уже положил
+ * разметку в документ, и здесь мы просто переписываем подпись.
+ *
+ * @param {ParentNode} [scope] корень меню; по умолчанию весь документ
+ * @returns {number} сколько подписей заменено
+ */
+export function rebrandRaidLabel(scope) {
+  /* Ищем строго внутри меню, если корень известен: голый селектор button
+   * иначе прошёлся бы по всем кнопкам страницы. */
+  let root = null
+  if (scope && typeof scope.querySelectorAll === 'function') root = scope
+  else if (typeof document !== 'undefined') root = document
+  if (!root) return 0
+
+  const items = root.querySelectorAll(RAID_ITEM_SELECTOR)
+  let hits = 0
+  for (let i = 0; i < items.length; i++) {
+    const item = items[i]
+    if (!item || item.nodeType !== 1) continue
+
+    const text = item.textContent
+    if (!text) continue
+    if (text.replace(/\s+/g, ' ').trim() !== LEGACY_RAID_LABEL) continue
+
+    /* textContent на самой кнопке снёс бы <span class="eft-item-txt">, а с ним
+     * и white-space:nowrap из таблицы стилей меню. Поэтому сначала ищем span
+     * подписи и пишем в него, и только если его нет — в сам узел. */
+    const label =
+      typeof item.querySelector === 'function' ? item.querySelector(RAID_LABEL_SELECTOR) : null
+    if (label) label.textContent = RAID_LABEL
+    else item.textContent = RAID_LABEL
+
+    /* Подсказка и aria-подпись, если меню их проставило. */
+    if (typeof item.getAttribute === 'function' && typeof item.setAttribute === 'function') {
+      if (item.getAttribute('title') === LEGACY_RAID_LABEL) item.setAttribute('title', RAID_LABEL)
+      if (item.getAttribute('aria-label') === LEGACY_RAID_LABEL) {
+        item.setAttribute('aria-label', RAID_LABEL)
+      }
+    }
+    hits++
+  }
+  return hits
+}
+
 export function applyMainMenuBridge() {
   if (applied) return MainMenuSystem
   applied = true
@@ -285,6 +352,9 @@ export function applyMainMenuBridge() {
   if (typeof originalMount === 'function') {
     proto.mount = function patchedMount() {
       const res = originalMount.apply(this, arguments)
+      /* mount() добавляет корень в документ синхронно, так что подпись уже
+       * можно перекрыть — до первого кадра, без мигания старого текста. */
+      rebrandRaidLabel(this && this.root)
       bindDelegatedClick()
       return res
     }
