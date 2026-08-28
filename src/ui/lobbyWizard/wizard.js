@@ -7,6 +7,9 @@
  * Подсистемы берутся только через ctx.peek() — get() бросает исключение на
  * незарегистрированный id, а в меню боевые системы ещё не подняты.
  * Прямых импортов world/raid/ai здесь нет — запрет ARCHITECTURE.md.
+ *
+ * Идентификаторы систем берутся ровно те, под которыми main.js их
+ * регистрирует: инвентарь — 'inventory', а не 'inv'.
  * ========================================================================== */
 
 import { runRaidPrewarm, PREWARM_STAGES } from '../../core/raidPrewarm.js'
@@ -66,6 +69,12 @@ const SLOT_LABELS = [
 	{ slot: 'rig', label: 'РАЗГРУЗКА' },
 	{ slot: 'backpack', label: 'РЮКЗАК' }
 ]
+
+/* Идентификатор инвентаря в реестре движка. main.js регистрирует
+ * InventorySystem строго как 'inventory' — короткое 'inv' в реестре не
+ * существует и всегда давало null, из-за чего ЛАБОРАТОРИЯ навсегда
+ * оставалась под ложной блокировкой «НУЖЕН ПРОПУСК». */
+const INVENTORY_ID = 'inventory'
 
 export class LobbyWizard {
 	constructor(engine, opts) {
@@ -154,7 +163,7 @@ export class LobbyWizard {
 
 	/** Лежит ли предмет на теле — нужно для пропуска в Лабораторию. */
 	_hasItem(id) {
-		const inv = this._peek('inv')
+		const inv = this._peek(INVENTORY_ID)
 		if (!inv || !inv.all) return false
 		const all = inv.all
 		for (let i = 0; i < all.length; i++) {
@@ -623,7 +632,7 @@ export class LobbyWizard {
 	/* ────────────────────── шаг 4: подтверждение ────── */
 
 	_loadoutRows() {
-		const inv = this._peek('inv')
+		const inv = this._peek(INVENTORY_ID)
 		const items = this._peek('items')
 		const out = []
 		if (this.state.faction === 'scav') {
@@ -934,9 +943,19 @@ export class LobbyWizard {
 		const result = await runRaidPrewarm(engine, {
 			onStage: function (id, label, index, total) { self._setStage(id, label, index, total) },
 			onProgress: function (t) { self._setProgress(t) },
+			/*
+			 * Промис raid.start() ОБЯЗАН уехать наружу.
+			 *
+			 * raid.start() полностью асинхронный: он строит геометрию уровня.
+			 * Без return преварм считал хук выполненным сразу и уходил в
+			 * runMaterialHooks(), компилируя шейдерные пайплайны по пустой
+			 * сцене — то есть впустую, а первый выстрел на живой геометрии
+			 * снова давал микрофриз. Теперь runRaidPrewarm() ждёт карту.
+			 */
 			afterTerrain: async function () {
 				const raid = self._peek('raid')
-				if (raid) call(raid, 'start', map.id, faction, night)
+				if (!raid) return null
+				return await call(raid, 'start', map.id, faction, night)
 			}
 		})
 
