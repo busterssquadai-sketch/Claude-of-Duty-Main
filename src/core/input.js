@@ -27,6 +27,8 @@
  * registered:
  *   - `requestPointerLock()` is a no-op, whoever calls it;
  *   - `_onMouseDown()` never auto-locks and never publishes the button;
+ *   - `_onMouseMove()` accumulates no look delta, and `beginFrame()` publishes
+ *     `look` as zero — the camera cannot be moved by an overlay drag;
  *   - `fire` / `firePressed` / `ads` report false.
  *
  * A second, independent guard keys off the DOM: pointer and keyboard events that
@@ -174,6 +176,15 @@ export class Input {
     for (const code of this.down) {
       if (code.startsWith('Mouse')) this._pendingUp.add(code);
     }
+    /* ...nor a look delta. Moves that landed earlier in THIS frame, before the
+     * overlay went up, are already sitting in _rawLook and would be applied by
+     * the next beginFrame() as a kick of exactly the size of the mouse travel
+     * that opened the panel. Drop both the raw accumulator and the published
+     * vector: gameplay may read `look` again before the next beginFrame(). */
+    this._rawLook.x = 0;
+    this._rawLook.y = 0;
+    this.look.x = 0;
+    this.look.y = 0;
     return this._lockSuppressors.size;
   }
 
@@ -250,6 +261,21 @@ export class Input {
 
   _onMouseMove(e) {
     if (!this.enabled || !this.pointerLocked || this.frozen) return;
+    /* The camera reads the suppression set, NOT the DOM's lock state.
+     *
+     * document.exitPointerLock() is asynchronous: `pointerlockchange` lands a
+     * frame or more after an overlay opens, so `pointerLocked` is still true for
+     * the first several moves over an open panel. Each one accumulated into
+     * _rawLook and was applied by the next beginFrame() — i.e. the view snapped
+     * to wherever the player had dragged an item to. The `frozen` check above
+     * masked it only because InventorySystem._open() happens to set that flag as
+     * well; the ESC menu and the settings panel file a suppressor without it and
+     * still moved the camera.
+     *
+     * inUiOverlay() is the second, independent guard: an unlocked cursor moving
+     * over .efl-esc / .efl-set / #eftInv contributes nothing even if the surface
+     * forgot to register itself at all. */
+    if (this.pointerLockSuppressed || inUiOverlay(e.target)) return;
     // movementX/Y is already relative and unaffected by cursor clamping.
     this._rawLook.x += e.movementX ?? 0;
     this._rawLook.y += e.movementY ?? 0;
@@ -291,8 +317,11 @@ export class Input {
     this._pendingUp.clear();
 
     const s = this.config.sensitivity;
-    this.look.x = this.frozen ? 0 : this._rawLook.x * s;
-    this.look.y = this.frozen ? 0 : this._rawLook.y * s * (this.config.invertY ? -1 : 1);
+    /* Suppressed is as dead as frozen for the camera: while a UI surface owns the
+     * cursor the view does not move, whatever managed to reach _rawLook. */
+    const mute = this.frozen || this.pointerLockSuppressed;
+    this.look.x = mute ? 0 : this._rawLook.x * s;
+    this.look.y = mute ? 0 : this._rawLook.y * s * (this.config.invertY ? -1 : 1);
     this._rawLook.x = 0;
     this._rawLook.y = 0;
 
