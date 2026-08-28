@@ -36,6 +36,11 @@ export const FIRE_MODES = ["single", "burst", "auto", "pump", "bolt"];
  *   rv / rh    - вертикальная и горизонтальная отдача в градусах на выстрел
  *   ergo       - эргономика, влияет на скорость вскидки и сведение
  *   pellets    - число дробин в выстреле
+ *   recoilK    - НЕОБЯЗАТЕЛЬНО: жёсткость пружины отдачи для этого ствола
+ *   recoilD    - НЕОБЯЗАТЕЛЬНО: демпфирование пружины отдачи для этого ствола
+ *
+ * recoilK/recoilD переопределяют глобальные RECOIL_K/RECOIL_D и позволяют
+ * компактным стволам садиться обратно быстрее, не трогая остальные.
  */
 export const WEAPONS = {
   ak74m: {
@@ -127,6 +132,46 @@ export const WEAPONS = {
     chamber: 0.6,
     price: 27000,
     suppressor: true,
+  },
+  /*
+   * HK MP7A2. Раньше id жил ТОЛЬКО в src/items/index.js, поэтому стартовый
+   * комплект валил Engine.init через new WeaponInstance("mp7a2").
+   *
+   * Калибр — "9x19", а не "46x30", осознанно: таблица AMMO в
+   * physics/penetration.js, CAL_DEFAULT и START_RESERVE знают только
+   * зарегистрированные калибры, а сам предмет в базе (cal: '9x19',
+   * magId: 'mag_mp7' на 40 патронов) уже описан как 9x19. Любой
+   * незарегистрированный калибр молча свалился бы в ammoForCaliber() -> 0,
+   * то есть в 5.45 ПС, и ствол невозможно было бы перезарядить: _reserveFor()
+   * искал бы патрон, которого нет в разгрузке.
+   *
+   * Отдача: низкий вертикальный подброс (rv ниже, чем у MP5) плюс своя
+   * пружина — жёстче и сильнее задемпфирована глобальной, поэтому камера
+   * возвращается на место заметно быстрее при 950 выстрелах в минуту.
+   *
+   * Вьюмодель: VIEWMODEL_KIND ниже отправляет ствол в компактный набор
+   * "smg" (models/smg.js + WEAPON_DEFS.smg, 9x19, 950 rpm), отдельные меши
+   * не нужны и ничего не грузится вслепую.
+   */
+  mp7a2: {
+    name: "HK MP7A2",
+    cal: "9x19",
+    rpm: 950,
+    modes: ["auto", "burst", "single"],
+    mag: 40,
+    pellets: 1,
+    spread: 0.6,
+    spreadAds: 0.18,
+    rv: 0.58,
+    rh: 0.19,
+    ergo: 66,
+    weight: 2.2,
+    reload: 2.4,
+    chamber: 0.55,
+    price: 61000,
+    suppressor: true,
+    recoilK: 196,
+    recoilD: 27,
   },
   pp19: {
     name: "ПП-19 Витязь",
@@ -268,14 +313,25 @@ const VIEWMODEL_KIND = {
   sv98: "rifle",
   svd: "rifle",
   mp5: "smg",
+  mp7a2: "smg",
   pp19: "smg",
   pm: "pistol",
   glock17: "pistol",
 };
 
+/*
+ * Идентификаторы из src/items/index.js, которых нет в таблице выше,
+ * разрешаются в ближайший зарегистрированный ствол. Без этого лут и
+ * стартовые комплекты уходили в общий фолбэк: дробовик m870 выдавал 5.56,
+ * а мосинка стреляла как карабин.
+ */
 const WEAPON_ALIAS = {
   ak74n: "ak74m",
   glock: "glock17",
+  mp7: "mp7a2",
+  rpk16: "ak74m",
+  mosin: "sv98",
+  m870: "mp133",
 };
 
 /* Патрон по умолчанию для каждого калибра берётся из penetration.js. */
@@ -297,6 +353,8 @@ const MAX_HEAT = 3.2;
  *
  * RECOIL_K   - жёсткость (чем выше, тем быстрее возврат)
  * RECOIL_D   - демпфирование, ~2*sqrt(K) даёт критическое
+ *
+ * Конкретный ствол может переопределить оба значения полями recoilK/recoilD.
  */
 const RECOIL_K = 148;
 const RECOIL_D = 23;
@@ -363,12 +421,77 @@ function makeRng(ctx, label) {
   };
 }
 
+/* Ствол, на который подменяется любой неизвестный идентификатор. */
+export const FALLBACK_WEAPON_ID = "m4a1";
+
+/*
+ * Аварийный профиль на случай, если таблица WEAPONS вообще пуста (мод срезал
+ * её или подменил модуль). Нужен ровно для одного: движок обязан доехать до
+ * первого кадра, а не упасть в чёрный экран.
+ */
+const SAFE_WEAPON_DEF = {
+  name: "—",
+  cal: "9x19",
+  rpm: 600,
+  modes: ["single"],
+  mag: 10,
+  pellets: 1,
+  spread: 1,
+  spreadAds: 0.4,
+  rv: 0.8,
+  rh: 0.3,
+  ergo: 60,
+  weight: 2,
+  reload: 2.5,
+  chamber: 0.6,
+  price: 0,
+  suppressor: false,
+};
+
+/*
+ * Резолвер конфигурации ствола.
+ *
+ * Раньше WeaponInstance бросал исключение на любой незнакомый id, и это
+ * убивало ВСЮ загрузку: InventorySystem._seedStarterKit выдаёт стартовый
+ * комплект до первого кадра, поэтому один незарегистрированный ствол
+ * (mp7a2) валил Engine.init и давал чёрный экран.
+ *
+ * Теперь неизвестный id логируется предупреждением и подменяется на
+ * FALLBACK_WEAPON_ID. Исключений здесь больше нет ни на одном пути.
+ */
+export function resolveWeaponConfig(id) {
+  const key = typeof id === "string" ? id : "";
+  const direct = WEAPONS[key];
+  if (direct) return { id: key, def: direct, fallback: false };
+
+  console.warn(
+    '[weapons] Unknown weapon ID "' +
+      key +
+      '" requested. Automatically falling back to "' +
+      FALLBACK_WEAPON_ID +
+      '" to prevent boot loop crash.',
+  );
+
+  const fallback = WEAPONS[FALLBACK_WEAPON_ID];
+  if (fallback) return { id: FALLBACK_WEAPON_ID, def: fallback, fallback: true };
+
+  const first = Object.keys(WEAPONS)[0];
+  if (first) return { id: first, def: WEAPONS[first], fallback: true };
+
+  return { id: key || "unknown", def: SAFE_WEAPON_DEF, fallback: true };
+}
+
 /* Состояние одного экземпляра ствола. Создаётся только при смене оружия, не в кадре. */
 export class WeaponInstance {
   constructor(id, ammoId) {
-    const def = WEAPONS[id];
-    if (!def) throw new Error('[weapons] неизвестное оружие "' + id + '"');
-    this.id = id;
+    /* Неизвестный id больше НЕ бросает: движок продолжает загрузку на
+     * подменённой конфигурации, а requestedId/isFallback остаются для
+     * дев-оверлея и тестов. */
+    const resolved = resolveWeaponConfig(id);
+    const def = resolved.def;
+    this.id = resolved.id;
+    this.requestedId = typeof id === "string" ? id : null;
+    this.isFallback = resolved.fallback;
     this.def = def;
     this.mode = def.modes[0];
     this.modeIndex = 0;
@@ -1008,11 +1131,13 @@ export class WeaponSystem {
       }
     }
 
-    /* Отдача, нагрев и растущий разброс. Импульс идёт в СКОРОСТЬ пружины. */
+    /* Отдача, нагрев и растущий разброс. Импульс идёт в СКОРОСТЬ пружины.
+     * Жёсткость берём из ствола, если он её переопределяет. */
     const ergoK = clamp(1.35 - def.ergo * 0.007, 0.45, 1.35);
     const adsK = this.ads ? 0.72 : 1;
-    this._kickVelP += def.rv * ergoK * adsK * RECOIL_K * 0.06;
-    this._kickVelY += (this.rng() * 2 - 1) * def.rh * ergoK * adsK * RECOIL_K * 0.06;
+    const springK = def.recoilK ? def.recoilK : RECOIL_K;
+    this._kickVelP += def.rv * ergoK * adsK * springK * 0.06;
+    this._kickVelY += (this.rng() * 2 - 1) * def.rh * ergoK * adsK * springK * 0.06;
     this.bloom = Math.min(this.bloom + def.spread * 0.32, def.spread * 2.6);
     w.heat = Math.min(w.heat + HEAT_PER_SHOT, MAX_HEAT);
     this.shotsFired++;
@@ -1182,10 +1307,15 @@ export class WeaponSystem {
     if (ctx) this.ctx = ctx;
     this.time += dt;
 
-    /* Пружина отдачи: интегрируем и отдаём дельту наружу. */
+    /* Пружина отдачи: интегрируем и отдаём дельту наружу. Жёсткость и
+     * демпфирование берутся из активного ствола, если он их переопределяет:
+     * компактный MP7A2 садится обратно быстрее карабина. */
     if (dt > 0) {
-      const accP = -RECOIL_K * this._kickPitch - RECOIL_D * this._kickVelP;
-      const accY = -RECOIL_K * this._kickYaw - RECOIL_D * this._kickVelY;
+      const sd = this.weapon ? this.weapon.def : null;
+      const kk = sd && sd.recoilK ? sd.recoilK : RECOIL_K;
+      const dd = sd && sd.recoilD ? sd.recoilD : RECOIL_D;
+      const accP = -kk * this._kickPitch - dd * this._kickVelP;
+      const accY = -kk * this._kickYaw - dd * this._kickVelY;
       this._kickVelP += accP * dt;
       this._kickVelY += accY * dt;
       const prevP = this._kickPitch;
