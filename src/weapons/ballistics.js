@@ -12,10 +12,28 @@ import * as THREE from 'three';
  *
  * Owned by WeaponSystem, which steps it from fixedUpdate(). This is not a
  * registry subsystem and deliberately has no static id.
+ *
+ * ORIGIN AND ALIGNMENT (REFACTOR 3)
+ * ---------------------------------
+ * `spawn()` is now always handed a MUZZLE origin by weapons/muzzle.js, never the
+ * camera. Two consequences are load-bearing here:
+ *
+ *   - the tracer payload is emitted from the barrel tip, so it has real
+ *     screen-space velocity and reads as a streak going downrange instead of a
+ *     bar sitting on the near plane;
+ *   - every visual is oriented from `velocity.normalize()`, not from the shot's
+ *     initial direction. Gravity and drag bend the path, so a tracer aligned to
+ *     the launch vector visibly slides sideways on a long flight. The payload
+ *     therefore carries a live `dir` plus a `quaternion` that maps +Z onto that
+ *     direction, and `orientAlongVelocity()` applies it to any mesh.
  */
 
 const GRAVITY = -9.81;
 const MAX_LIVE = 96;
+
+/** +Z is the canonical "forward" for a tracer mesh, matching CylinderGeometry
+ *  rotated onto Z and every look-at convention in three.js. */
+const FORWARD = new THREE.Vector3(0, 0, 1);
 
 /* PhysicsSystem exposes MASK_WORLD / MASK_ACTOR / MASK_ALL as instance fields.
  * There is no phys.MASK.BULLET -- the previous code read that, got undefined,
@@ -26,6 +44,29 @@ function bulletMask(phys) {
   if (phys.MASK && Number.isFinite(phys.MASK.ALL)) return phys.MASK.ALL;
   return 3;
 }
+
+/**
+ * Point an Object3D down a projectile's CURRENT velocity and stretch it to the
+ * segment length. Exported because bots, replays and the dev harness all draw
+ * their own tracer meshes and must not each re-derive this.
+ *
+ * @param {THREE.Object3D} obj
+ * @param {{pos: THREE.Vector3, vel: THREE.Vector3}} p
+ * @param {number} [length] metres; when omitted the object's z scale is left alone
+ */
+export function orientAlongVelocity(obj, p, length) {
+  if (!obj || !p) return obj;
+  const v = p.vel;
+  if (v.lengthSq() < 1e-10) return obj;
+  _dirTmp.copy(v).normalize();
+  obj.position.copy(p.pos);
+  obj.quaternion.setFromUnitVectors(FORWARD, _dirTmp);
+  if (Number.isFinite(length) && length > 0) obj.scale.z = length;
+  obj.updateMatrix();
+  return obj;
+}
+
+const _dirTmp = new THREE.Vector3();
 
 class Projectile {
   constructor() {
@@ -45,6 +86,13 @@ class Projectile {
     this.ammoIndex = 0;
     this.shooter = null;
     this.mask = undefined;
+    this.tracer = false;
+  }
+
+  /** Unit vector down the CURRENT velocity. Written into `out`, no allocation. */
+  heading(out) {
+    if (this.vel.lengthSq() < 1e-10) return out.copy(this.dir);
+    return out.copy(this.vel).normalize();
   }
 }
 
@@ -59,7 +107,25 @@ export class ProjectileSim {
     this._hitDir = new THREE.Vector3();
     this._tracerFrom = new THREE.Vector3();
     this._tracerTo = new THREE.Vector3();
-    this._tracerPayload = { from: this._tracerFrom, to: this._tracerTo, speed: 800, weapon: null };
+    this._tracerDir = new THREE.Vector3(0, 0, -1);
+    this._tracerQuat = new THREE.Quaternion();
+
+    /*
+     * Tracer payload. `from` is the MUZZLE, `dir` is velocity.normalize() and
+     * `quaternion` maps +Z onto it, so a consumer can either emit velocity-
+     * aligned sprites (fx/tracers.js) or drop a mesh straight onto the
+     * trajectory line without recomputing anything.
+     */
+    this._tracerPayload = {
+      from: this._tracerFrom,
+      to: this._tracerTo,
+      dir: this._tracerDir,
+      quaternion: this._tracerQuat,
+      length: 0,
+      speed: 800,
+      weapon: null,
+      fromMuzzle: true,
+    };
 
     /* Преаллоцированный пейлоад попадания. Раньше здесь был объектный
      * литерал на каждое соприкосновение -- прямое нарушение правила
@@ -87,8 +153,9 @@ export class ProjectileSim {
   }
 
   /**
-   * @param {object} o origin, dir (unit), speed, damage, penetration, dragK,
-   *                   maxRange, dropoff, weapon, ammoIndex, shooter, tracer
+   * @param {object} o origin (MUZZLE, see weapons/muzzle.js), dir (unit), speed,
+   *                   damage, penetration, dragK, maxRange, dropoff, weapon,
+   *                   ammoIndex, shooter, tracer
    */
   spawn(o) {
     if (!o || !o.origin || !o.dir) return null;
@@ -129,30 +196,49 @@ export class ProjectileSim {
     p.ammoIndex = Number.isFinite(o.ammoIndex) ? o.ammoIndex : 0;
     p.shooter = o.shooter != null ? o.shooter : null;
     p.mask = o.mask;
+    p.tracer = !!o.tracer;
 
     this.live.push(p);
     this.stats.fired++;
 
-    if (o.tracer) this._emitTracer(p, speed);
+    if (p.tracer) this._emitTracer(p, speed, o.fromMuzzle !== false);
     return p;
   }
 
-  /** One tracer per burst of rounds: muzzle to wherever the round will land. */
-  _emitTracer(p, speed) {
+  /**
+   * One tracer per burst of rounds: MUZZLE to wherever the round will land.
+   *
+   * The direction handed downstream is `velocity.normalize()` — identical to the
+   * launch vector on this first step, but taken from the velocity so the contract
+   * is the same one `orientAlongVelocity()` uses mid-flight.
+   */
+  _emitTracer(p, speed, fromMuzzle) {
     const phys = this.physics;
     this._tracerFrom.copy(p.pos);
+    p.heading(this._tracerDir);
+
     let dist = Math.min(p.maxRange, 260);
     if (phys && typeof phys.raycast === 'function') {
       try {
-        const hit = phys.raycast(p.pos, p.dir, dist, bulletMask(phys));
+        const hit = phys.raycast(p.pos, this._tracerDir, dist, bulletMask(phys));
         if (hit && hit.hit && Number.isFinite(hit.distance)) dist = hit.distance;
       } catch (e) { /* луч трассера не критичен */ }
     }
-    this._tracerTo.copy(p.pos).addScaledVector(p.dir, dist);
-    this._tracerPayload.speed = speed;
-    this._tracerPayload.weapon = p.weapon;
+    if (!(dist > 0.05)) dist = 0.05;
+
+    this._tracerTo.copy(p.pos).addScaledVector(this._tracerDir, dist);
+    /* +Z -> heading. Any mesh using this quaternion extends FORWARD down the
+     * trajectory; it can never end up broadside to the flight path. */
+    this._tracerQuat.setFromUnitVectors(FORWARD, this._tracerDir);
+
+    const pl = this._tracerPayload;
+    pl.length = dist;
+    pl.speed = speed;
+    pl.weapon = p.weapon;
+    pl.fromMuzzle = !!fromMuzzle;
+
     const events = this.ctx && this.ctx.events;
-    if (events && typeof events.emit === 'function') events.emit('bullet:tracer', this._tracerPayload);
+    if (events && typeof events.emit === 'function') events.emit('bullet:tracer', pl);
   }
 
   fixedUpdate(h) {
@@ -176,6 +262,9 @@ export class ProjectileSim {
       const segLen = this._seg.length();
       p.travelled += segLen;
 
+      /* The impact ray uses the direction the round is ACTUALLY travelling on
+       * this step, not its launch vector: after 300 m of drop those differ by
+       * enough to move the impact point. Same vector the visuals align to. */
       if (segLen > 1e-6 && canRay) {
         this._hitDir.copy(this._seg).divideScalar(segLen);
         let hit = null;
@@ -222,10 +311,21 @@ export class ProjectileSim {
     this.stats.live = this.live.length;
   }
 
+  /**
+   * Orient an external mesh onto a live round's trajectory. Thin wrapper so a
+   * caller holding an index does not have to reach into `live`.
+   */
+  orient(obj, index, length) {
+    const p = this.live[index];
+    if (!p) return obj;
+    return orientAlongVelocity(obj, p, length);
+  }
+
   _retire(p) {
     p.alive = false;
     p.weapon = null;
     p.shooter = null;
+    p.tracer = false;
   }
 
   clear() {
