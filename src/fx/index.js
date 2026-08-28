@@ -9,7 +9,7 @@ import { ShellSystem } from './shells.js';
 import { Ambience } from './ambience.js';
 import { spawnImpact } from './impacts.js';
 import { muzzleFlash } from './muzzle.js';
-import { spawnTracer } from './tracers.js';
+import { spawnTracer as spawnTracerSprites } from './tracers.js';
 import { explode } from './explosions.js';
 import { V, cone } from './util.js';
 
@@ -165,7 +165,23 @@ export class FxSystem {
     };
     this._off = [];
     on('bullet:impact', (e) => this.onImpact(e));
-    on('bullet:tracer', (e) => this.tracer(e.from, e.to, e.speed));
+    // The payload handed over by weapons/ballistics.js is preallocated and
+    // carries the round's LIVE heading: `dir` is velocity.normalize(), re-derived
+    // on every fixed step by Projectile.syncHeading(). Forward it.
+    //
+    // Reading only from/to/speed here is what left the streak on the fallback
+    // path in fx/tracers.js, which derives the direction from the from->to
+    // segment. That chord is the trajectory only while the round has not begun to
+    // drop: over a long flight gravity and drag bend the path away from it, so the
+    // streak was drawn at an angle to its own travel — and a round whose velocity
+    // had been flipped drew it pointing back down the barrel at the player.
+    on('bullet:tracer', (e) => {
+      if (!e) return;
+      const o = this._tracerOpts;
+      o.dir = e.dir ?? null;
+      o.warm = e.warm ?? 1;
+      this.spawnTracer(e.from, e.to, e.speed, o);
+    });
     on('weapon:fire', (e) => this.onWeaponFire(e));
     on('weapon:shell', (e) => this.spawnShell(e.position, e.velocity, e));
     on('explosion', (e) => this.explosion(e));
@@ -487,11 +503,45 @@ export class FxSystem {
     this._d2.normalize();
   }
 
-  /** A travelling tracer round. */
-  tracer(from, to, speed) {
+  /**
+   * Opts forwarded to fx/tracers.js, reused for every round.
+   *
+   * ballistics.js hands us a preallocated payload; this is the matching
+   * preallocated opts object, so a tracer still costs zero allocations. Both
+   * fields are overwritten on every emit, and spawnTracerSprites() reads them
+   * synchronously, so there is nothing to alias.
+   */
+  _tracerOpts = { dir: null, warm: 1 };
+
+  /**
+   * A travelling tracer round.
+   *
+   * `opts.dir` MUST be the round's live heading (`velocity.normalize()`) whenever
+   * the caller has it. fx/tracers.js only derives the direction from the
+   * `from`->`to` segment as a fallback, and that chord stops being the trajectory
+   * the moment gravity and drag bend the flight path: the streak then sits at an
+   * angle to its own travel, and a round whose velocity was flipped by a bounce
+   * draws it pointing back at the camera. Passing `dir` locks the sprite
+   * alignment straight down the ACTIVE trajectory line.
+   *
+   * @param {{x:number,y:number,z:number}} from  muzzle position, world space
+   * @param {{x:number,y:number,z:number}} to    where the round is heading
+   * @param {number} speed muzzle velocity, m/s
+   * @param {{dir?: {x:number,y:number,z:number}|null, warm?: number}} [opts]
+   */
+  spawnTracer(from, to, speed, opts) {
     if (!from || !to) return;
     this.now = this.ctx.time.elapsed;
-    spawnTracer(this, from, to, speed);
+    spawnTracerSprites(this, from, to, speed, opts);
+  }
+
+  /**
+   * Legacy alias. The debug staging below and any older call site that only has
+   * a segment still reach the same path — without `dir` they simply get the
+   * segment-derived fallback, which is correct for a straight staged shot.
+   */
+  tracer(from, to, speed, opts) {
+    return this.spawnTracer(from, to, speed, opts);
   }
 
   /** Full explosion: fireball, shockwave, debris, smoke column, light, scorch. */
