@@ -1,896 +1,118 @@
 /* ==========================================================================
  * Escape-From-Larpov · src/ui/lobbyWizard.js
  *
- * Визард высадки: линейная цепочка «убежище → рейд» из пяти шагов с
- * навигацией ДАЛЕЕ / НАЗАД. Модуль владеет своим оверлеем и своими стилями
- * и никогда не рисует поверх чужих корней (.efl-esc, .efl-set, #eftInv).
+ * Визард выхода в рейд: от главного меню до высадки, 5 шагов.
  *
- * ШАГИ
- *   1. Выбор персонажа     — ДИКИЙ / ЧВК
- *   2. Выбор локации       — карточки карт + сжатые часы 1:9
- *   3. Тренировочный режим — чекбокс + модалка настроек ИИ
- *   4. Подтверждение       — силуэт снаряжения и кнопка ГОТОВ
- *   5. Высадка             — прогрев под экраном загрузки
+ *   1. ВЫБЕРИТЕ ПЕРСОНАЖА        — ДИКИЙ / ЧВК
+ *   2. ВЫБЕРИТЕ МЕСТО ДИСЛОКАЦИИ  — локации + сжатые часы 1:9
+ *   3. ТРЕНИРОВОЧНЫЙ РЕЖИМ ИГРЫ     — чекбокс + модалка шестерёнки
+ *   4. ПОДТВЕРЖДЕНИЕ              — силуэт во всю высоту + ГОТОВ
+ *   5. ВЫСАДКА НА МЕСТО ДИСЛОКАЦИИ — преварм перед STATE.GAMEPLAY
  *
- * ПОРЯДОК СОСТОЯНИЙ — главное в этом файле.
+ * Шаг 5 НЕ дублирует логику преварма: src/core/raidPrewarm.js уже умеет
+ * пред-пулить трассеры, прогревать геометрию оружия и компилировать шейдерные
+ * конвейеры — визард лишь даёт ему экран и хуки прогресса.
  *
- * engine.startRaid() сознательно НЕ используется: он зовёт enterGameplay()
- * сразу после raid.start(), то есть STATE.GAMEPLAY встал бы ДО компиляции
- * шейдеров и ДО роста пула трассеров — ровно те микрофризы, которые шаг 5
- * обязан убрать. Поэтому цепочка собрана вручную:
+ * ВАЖНО про порядок: engine.startRaid() сознательно НЕ используется. Он
+ * уходит в enterGameplay() сразу после raid.start(), то есть до компиляции
+ * шейдеров — ровно тот фриз при первом выстреле, от которого мы избавляемся.
+ * Поэтому цепочка собрана вручную: enterLoading → raid.start внутри
+ * afterTerrain → преварм докрутился → enterGameplay.
  *
- *   engine.enterLoading()                   → STATE.LOADING
- *   runRaidPrewarm(engine, {
- *     afterTerrain: () => raid.start(...)    → world.buildMap(), лут, здоровье
- *   })
- *        ├─ shaders : compile обеих сцен по УЖЕ собранной карте
- *        ├─ weapons : прогон каждого набора вьюмодели (первый кадр со стволом)
- *        └─ tracers : пул частиц вырастает до боевого размера
- *   engine.enterGameplay()                  → STATE.GAMEPLAY, только теперь
- *
- * Сам прогрев живёт в src/core/raidPrewarm.js (собственность лида) и уже
- * умеет всё, что требует шаг 5: пре-пул трассеров, прогрев геометрии оружия
- * и компиляцию шейдерных конвейеров. Дублировать его здесь запрещено.
- *
- * АКТИВАЦИЯ. main.js про этот модуль не знает, поэтому мост ставится сам при
- * импорте и делает это идемпотентно. Достаточно одной строки в src/ui/index.js:
- *     import './lobbyWizard.js'
- * либо явного вызова applyLobbyWizardBridge().
- *
- * ARCHITECTURE.md: чужие подсистемы не импортируются, только ctx.peek(id).
- * Каталог карт продублирован ниже как ПРЕЗЕНТАЦИОННЫЕ данные и обязан
- * совпадать с таблицей MAPS из src/world/index.js.
+ * Подсистемы берутся только через ctx.peek() — get() бросает исключение на
+ * незарегистрированный id, а в меню боевые системы ещё не подняты.
+ * Прямых импортов world/raid/ai здесь нет — запрет ARCHITECTURE.md.
  * ========================================================================== */
 
 import { STATE } from '../core/engine.js'
 import { runRaidPrewarm, PREWARM_STAGES } from '../core/raidPrewarm.js'
+import {
+	BRAND,
+	rebrandText,
+	applyGlobalRebranding,
+	FACTIONS,
+	findFaction,
+	MAP_CATALOGUE,
+	REAL_SECONDS_PER_GAME_MINUTE,
+	CLOCK_FACTOR,
+	HALF_DAY_SECONDS,
+	gameClockSeconds,
+	formatClock,
+	isNightSeconds,
+	formatDuration,
+	formatStopwatch,
+	AI_COUNT_OPTIONS,
+	AI_DIFFICULTY_OPTIONS,
+	AI_COUNT_SCALE,
+	AI_DIFFICULTY_SCALE,
+	optionLabel,
+	defaultOfflineConfig
+} from './lobbyWizard/data.js'
+import { NS, ensureStyles, removeStyles } from './lobbyWizard/style.js'
+import {
+	el,
+	button,
+	svg,
+	call,
+	silhouetteSvg,
+	mapThumbSvg,
+	deployBackdropSvg,
+	gearIcon,
+	clockIcon,
+	peopleIcon,
+	gridIcon,
+	alertIcon,
+	daylightIcon
+} from './lobbyWizard/art.js'
 
-/* ------------------------------------------------------------------ бренд */
+/* ------------------------------------------------------------------- шаги */
 
-export const BRAND = Object.freeze({
-	ru: 'Побег из Ларпова',
-	ruUpper: 'ПОБЕГ ИЗ ЛАРПОВА',
-	city: 'Ларпов',
-	cityUpper: 'ЛАРПОВ',
-	en: 'Escape from Larpov',
-	shortEn: 'Larpov',
-	zone: 'PVE ZONE',
-	pmc: 'AMSEC/TAIGA'
-})
-
-/* Таблица глобального ребрендинга. Порядок важен: длинные формы идут раньше
- * коротких, иначе «Побег из Таркова» распадётся на два независимых куска. */
-const REBRAND_RULES = [
-	[/Escape\s+from\s+Tarkov/gi, BRAND.en],
-	[/Побег\s+из\s+Таркова/gi, BRAND.ru],
-	[/ТАРКОВА/g, 'ЛАРПОВА'],
-	[/ТАРКОВ/g, 'ЛАРПОВ'],
-	[/Таркова/g, 'Ларпова'],
-	[/Таркове/g, 'Ларпове'],
-	[/Таркову/g, 'Ларпову'],
-	[/Тарков/g, 'Ларпов'],
-	[/таркова/g, 'ларпова'],
-	[/тарков/g, 'ларпов'],
-	[/TARKOV/g, 'LARPOV'],
-	[/Tarkov/g, 'Larpov'],
-	[/tarkov/g, 'larpov'],
-	[/\bUSEC\b/g, 'AMSEC'],
-	[/\bBEAR\b/g, 'TAIGA']
+const STEPS = [
+	{ id: 'character', title: 'ВЫБЕРИТЕ ПЕРСОНАЖА' },
+	{ id: 'location', title: 'ВЫБЕРИТЕ МЕСТО ДИСЛОКАЦИИ' },
+	{ id: 'training', title: 'ТРЕНИРОВОЧНЫЙ РЕЖИМ ИГРЫ' },
+	{ id: 'confirm', title: 'ПОДТВЕРЖДЕНИЕ' },
+	{ id: 'deploy', title: 'ВЫСАДКА НА МЕСТО ДИСЛОКАЦИИ' }
 ]
 
-const SKIP_TAGS = { SCRIPT: 1, STYLE: 1, TEXTAREA: 1, CANVAS: 1, CODE: 1, PRE: 1 }
+const SLOT_LABELS = [
+	{ slot: 'primary', label: 'ОСНОВНОЕ ОРУЖИЕ' },
+	{ slot: 'secondary', label: 'ВТОРИЧНОЕ ОРУЖИЕ' },
+	{ slot: 'holster', label: 'КОБУРА' },
+	{ slot: 'helmet', label: 'ШЛЕМ' },
+	{ slot: 'armor', label: 'БРОНЕЖИЛЕТ' },
+	{ slot: 'rig', label: 'РАЗГРУЗКА' },
+	{ slot: 'backpack', label: 'РЮКЗАК' }
+]
 
-/** Ребрендинг одной строки. Чистая функция, безопасна для пустого ввода. */
-export function rebrandText(input) {
-	if (input == null) return ''
-	let out = String(input)
-	for (let i = 0; i < REBRAND_RULES.length; i++) {
-		out = out.replace(REBRAND_RULES[i][0], REBRAND_RULES[i][1])
-	}
-	return out
-}
+/* Корни чужих оверлеев — клики внутри них визард не перехватывает. */
+const SKIP_ROOTS = '.efl-esc, .efl-set, #eftInv, .' + NS
+const MENU_SELECTORS = ['.efl-mm', '.efl-menu', '#eflMainMenu', '[data-efl-main-menu]']
+const LAUNCH_RE = /побег\s+из\s+ларпова|escape\s+from\s+larpov|побег\s+из\s+таркова/i
+const LAUNCH_ACTS = /^(play|raid|deploy|start|startraid|launch|escape)$/i
+const MAX_WALK = 8
 
 /**
- * Глобальный ребрендинг живого DOM: заголовок документа и все текстовые узлы
- * поддерева. Пишем только когда строка реально изменилась — иначе каждый
- * проход дёргал бы reflow на всём меню.
+ * Ищет контейнер главного меню, который надо крутить.
+ * MainMenuSystem монтируется в document.body из main.js, поэтому сначала смотрим
+ * поля инстанса, потом поднимаемся от кликнутого узла до прямого
+ * ребёнка body, и только потом пробуем селекторы.
  */
-export function applyGlobalRebranding(root) {
-	if (typeof document === 'undefined') return 0
-
-	const title = rebrandText(document.title)
-	if (title !== document.title) document.title = title
-	if (/OVERWATCH|Tactical Shooter/i.test(document.title)) {
-		document.title = BRAND.ru + ' · ' + BRAND.en
-	}
-
-	const scope = root || document.body
-	if (!scope || typeof document.createTreeWalker !== 'function') return 0
-
-	const walker = document.createTreeWalker(scope, NodeFilter.SHOW_TEXT, {
-		acceptNode(node) {
-			const parent = node.parentNode
-			if (!parent || SKIP_TAGS[parent.nodeName]) return NodeFilter.FILTER_REJECT
-			if (!node.nodeValue || node.nodeValue.length < 4) return NodeFilter.FILTER_REJECT
-			return NodeFilter.FILTER_ACCEPT
-		}
-	})
-
-	let touched = 0
-	let node = walker.nextNode()
-	while (node) {
-		const next = rebrandText(node.nodeValue)
-		if (next !== node.nodeValue) {
-			node.nodeValue = next
-			touched++
-		}
-		node = walker.nextNode()
-	}
-	return touched
-}
-
-/* ------------------------------------------------------------------ фракции */
-
-const FACTIONS = [
-	{
-		id: 'scav',
-		label: 'ДИКИЙ',
-		tag: 'SCAV',
-		desc: 'Участвуйте в рейде Диким, местным бандитом с неизвестным стартовым снаряжением. Это ваш Ларпов и ваши правила!',
-		primary: false
-	},
-	{
-		id: 'pmc',
-		label: 'ЧВК',
-		tag: 'ВАШ ОСНОВНОЙ ПЕРСОНАЖ',
-		desc: 'Отправляйтесь в рейд вашим главным персонажем - оператором ЧВК ' + BRAND.pmc + ' и сделайте все возможное, чтобы совершить Побег из Ларпова живым.',
-		primary: true
-	}
-]
-
-/* ------------------------------------------------------------------ карты */
-
-/*
- * Презентационный каталог локаций.
- *
- * id и duration зеркалят таблицу MAPS из src/world/index.js — она и решает,
- * что реально соберётся в buildMap(). Прямой импорт запрещён ARCHITECTURE.md
- * («Never import another subsystem's module»), поэтому таблица дублируется
- * здесь и сверяется с рантаймом в _syncCatalogue().
- *
- * available:false — у карты нет билдера в движке. БЕРЕГ отрисуется как
- * «НЕДОСТУПНО» (как ТЕРМИНАЛ в оригинале) и не даст уйти на шаг 3, вместо
- * того чтобы уронить рейд исключением из buildMap().
- */
-const MAP_CATALOGUE = [
-	{
-		id: 'factory',
-		label: 'ЗАВОД',
-		en: 'Factory',
-		duration: 25 * 60,
-		size: 96,
-		players: '7-8',
-		available: true,
-		needCard: null,
-		palette: ['#4a3c28', '#12100c', '#8b7346'],
-		desc: 'Территория и производственные помещения химического комбината №16 были незаконно сданы компании TerraGroup. В период Контрактных Войн здесь проходили бои между подразделениями ' + BRAND.pmc + ', определяющие контроль за заводским районом города Ларпова.'
-	},
-	{
-		id: 'customs',
-		label: 'ТАМОЖНЯ',
-		en: 'Customs',
-		duration: 35 * 60,
-		size: 150,
-		players: '9-12',
-		available: true,
-		needCard: null,
-		palette: ['#4f4632', '#100f0b', '#9a8a5c'],
-		desc: 'Промышленная зона и таможенный терминал на выезде из Ларпова. Через эти склады уходил весь контрабандный поток TerraGroup, поэтому за ржавые ангары и общежития до сих пор идёт самая плотная перестрелка.'
-	},
-	{
-		id: 'woods',
-		label: 'ЛЕС',
-		en: 'Woods',
-		duration: 40 * 60,
-		size: 190,
-		players: '8-14',
-		available: true,
-		needCard: null,
-		palette: ['#2f3a26', '#0c0f0a', '#5f7444'],
-		desc: 'Лесной массив западнее Ларпова с заброшенной лесопилкой в центре. Огромные дистанции, минимум укрытий на просеках и снайперы на высотах — самая медленная и самая нервная локация.'
-	},
-	{
-		id: 'shoreline',
-		label: 'БЕРЕГ',
-		en: 'Shoreline',
-		duration: 45 * 60,
-		size: 0,
-		players: '10-13',
-		available: false,
-		needCard: null,
-		palette: ['#2b3b44', '#0a0e11', '#4f7080'],
-		desc: 'Санаторный комплекс на побережье и подходы к нему. Локация зарезервирована: билдер берега в движке ещё не собран, поэтому высадка сюда заблокирована.'
-	},
-	{
-		id: 'lab',
-		label: 'ЛАБОРАТОРИЯ',
-		en: 'The Lab',
-		duration: 30 * 60,
-		size: 110,
-		players: '6-8',
-		available: true,
-		needCard: 'tgcard',
-		palette: ['#3d3f4a', '#0b0c0f', '#7d8598'],
-		desc: 'Закрытый исследовательский комплекс TerraGroup под центром Ларпова. Вход только по пропуску, охрана усилена, а выходы открываются лишь после включения общей тревоги.'
-	},
-	{
-		id: 'interchange',
-		label: 'РАЗВЯЗКА',
-		en: 'Interchange',
-		duration: 35 * 60,
-		size: 160,
-		players: '9-14',
-		available: true,
-		needCard: null,
-		palette: ['#463a3a', '#100d0d', '#8b6f6f'],
-		desc: 'Торговый центр «Ультра» и транспортная развязка над ним. Тесные торговые ряды, темнота внутри и самый жирный лут на квадратный метр во всём Ларпове.'
-	}
-]
-
-/* ------------------------------------------------------- сжатые часы 1:9 */
-
-/*
- * Одна минута игрового времени = ровно 9 секунд реального.
- * Отсюда множитель 60 / 9 = 6.666… игровых секунд на каждую реальную.
- * Вторая карточка времени — та же шкала со сдвигом на 12 часов.
- */
-const REAL_SECONDS_PER_GAME_MINUTE = 9
-const CLOCK_FACTOR = 60 / REAL_SECONDS_PER_GAME_MINUTE
-const DAY_SECONDS = 86400
-const HALF_DAY_SECONDS = 43200
-const NIGHT_FROM_HOUR = 21
-const NIGHT_TO_HOUR = 5
-
-export function gameClockSeconds(nowMs, offsetSeconds) {
-	const real = (Number(nowMs) || 0) / 1000
-	const shifted = real * CLOCK_FACTOR + (Number(offsetSeconds) || 0)
-	const wrapped = shifted % DAY_SECONDS
-	return wrapped < 0 ? wrapped + DAY_SECONDS : wrapped
-}
-
-function pad2(n) {
-	const v = Math.floor(Math.abs(n))
-	return v < 10 ? '0' + v : String(v)
-}
-
-export function formatClock(totalSeconds) {
-	const s = Math.floor(totalSeconds) % DAY_SECONDS
-	const h = Math.floor(s / 3600)
-	const m = Math.floor((s % 3600) / 60)
-	return pad2(h) + ':' + pad2(m) + ':' + pad2(s % 60)
-}
-
-function isNightSeconds(totalSeconds) {
-	const hour = Math.floor((Math.floor(totalSeconds) % DAY_SECONDS) / 3600)
-	return hour >= NIGHT_FROM_HOUR || hour < NIGHT_TO_HOUR
-}
-
-function formatDuration(seconds) {
-	const total = Math.max(0, Math.floor(Number(seconds) || 0))
-	return Math.floor(total / 60) + ' MIN'
-}
-
-function formatStopwatch(ms) {
-	const total = Math.max(0, Math.floor((Number(ms) || 0) / 1000))
-	return pad2(Math.floor(total / 60)) + ':' + pad2(total % 60)
-}
-
-/* ------------------------------------------- тренировочный режим (шаг 3) */
-
-const AI_COUNT_OPTIONS = [
-	{ value: 'asonline', label: 'Как в онлайне' },
-	{ value: 'low', label: 'Мало' },
-	{ value: 'high', label: 'Много' },
-	{ value: 'horde', label: 'Очень много' }
-]
-
-const AI_DIFFICULTY_OPTIONS = [
-	{ value: 'asonline', label: 'Как в онлайне' },
-	{ value: 'easy', label: 'Легко' },
-	{ value: 'normal', label: 'Нормально' },
-	{ value: 'hard', label: 'Сложно' },
-	{ value: 'impossible', label: 'Невозможно' }
-]
-
-const AI_COUNT_SCALE = { asonline: 1, low: 0.5, high: 1.6, horde: 2.4 }
-const AI_DIFFICULTY_SCALE = { asonline: 1, easy: 0.6, normal: 1, hard: 1.4, impossible: 2 }
-
-function defaultOfflineConfig() {
-	return {
-		aiCount: 'asonline',
-		aiDifficulty: 'asonline',
-		bosses: true,
-		noDrain: false
-	}
-}
-
-/* ------------------------------------------------------------------ стили */
-
-const STYLE_ID = 'efl-lobby-wizard-style'
-const NS = 'efl-lw'
-const Z_INDEX = 9600
-
-const CSS = `
-.${NS}-menu-rotate {
-	transition: transform 620ms cubic-bezier(.22,.61,.36,1), opacity 620ms ease, filter 620ms ease;
-	transform-origin: 50% 50%;
-	will-change: transform, opacity;
-}
-.${NS}-menu-rotate.${NS}-menu-out {
-	transform: rotate(-90deg) scale(.82);
-	opacity: 0;
-	filter: blur(6px) saturate(.4);
-	pointer-events: none;
-}
-
-.${NS} {
-	position: fixed;
-	inset: 0;
-	z-index: ${Z_INDEX};
-	display: flex;
-	flex-direction: column;
-	font-family: 'Bender', 'Oswald', 'Inter', 'Helvetica Neue', Arial, sans-serif;
-	color: #c8c3b6;
-	background:
-		radial-gradient(120% 90% at 50% 0%, rgba(28,32,36,.92) 0%, rgba(9,10,11,.97) 55%, rgba(4,4,5,.99) 100%),
-		repeating-linear-gradient(0deg, rgba(255,255,255,.014) 0 1px, rgba(0,0,0,0) 1px 3px);
-	-webkit-font-smoothing: antialiased;
-	user-select: none;
-	opacity: 0;
-	transition: opacity 320ms ease;
-	cursor: default;
-}
-.${NS}.${NS}-in { opacity: 1; }
-.${NS} * { box-sizing: border-box; }
-
-.${NS}-head {
-	flex: 0 0 auto;
-	padding: 34px 48px 10px;
-	text-align: center;
-}
-.${NS}-title {
-	font-size: 40px;
-	letter-spacing: .16em;
-	text-transform: uppercase;
-	font-weight: 400;
-	color: #e8e3d6;
-	text-shadow: 0 3px 22px rgba(0,0,0,.85);
-}
-.${NS}-zone {
-	margin-top: 6px;
-	font-size: 12px;
-	letter-spacing: .42em;
-	color: #6f6a5e;
-}
-.${NS}-steps {
-	display: flex;
-	gap: 10px;
-	justify-content: center;
-	margin-top: 18px;
-}
-.${NS}-pip {
-	width: 46px;
-	height: 3px;
-	background: rgba(255,255,255,.1);
-	position: relative;
-	overflow: hidden;
-}
-.${NS}-pip.on { background: #9a8a5c; }
-.${NS}-pip.done { background: rgba(154,138,92,.45); }
-
-.${NS}-body {
-	flex: 1 1 auto;
-	min-height: 0;
-	padding: 8px 48px;
-	overflow-y: auto;
-	overflow-x: hidden;
-	scrollbar-width: thin;
-	scrollbar-color: rgba(154,138,92,.5) transparent;
-}
-.${NS}-body::-webkit-scrollbar { width: 8px; }
-.${NS}-body::-webkit-scrollbar-thumb { background: rgba(154,138,92,.45); }
-
-.${NS}-foot {
-	flex: 0 0 auto;
-	padding: 14px 48px 34px;
-	display: flex;
-	flex-direction: column;
-	align-items: center;
-	gap: 4px;
-}
-.${NS}-nav {
-	background: none;
-	border: 0;
-	color: #cfc9bb;
-	font: inherit;
-	font-size: 27px;
-	letter-spacing: .14em;
-	text-transform: uppercase;
-	padding: 5px 26px;
-	cursor: pointer;
-	transition: color 140ms ease, text-shadow 140ms ease, transform 140ms ease;
-}
-.${NS}-nav:hover { color: #fff8e2; text-shadow: 0 0 20px rgba(214,190,122,.5); }
-.${NS}-nav:disabled { color: #4a473f; cursor: not-allowed; text-shadow: none; }
-.${NS}-nav.primary { color: #e6dcc0; }
-.${NS}-hint {
-	min-height: 16px;
-	font-size: 12px;
-	letter-spacing: .12em;
-	color: #8d5f4a;
-	text-transform: uppercase;
-}
-
-/* ------------------------------------------------- шаг 1: персонаж */
-.${NS}-chars {
-	display: grid;
-	grid-template-columns: repeat(2, minmax(240px, 460px));
-	gap: 26px;
-	justify-content: center;
-	align-items: stretch;
-	padding-top: 6px;
-}
-.${NS}-char {
-	position: relative;
-	display: flex;
-	flex-direction: column;
-	align-items: center;
-	padding: 18px 20px 22px;
-	border: 1px solid rgba(255,255,255,.07);
-	background: linear-gradient(180deg, rgba(255,255,255,.035), rgba(0,0,0,.32));
-	cursor: pointer;
-	transition: border-color 160ms ease, background 160ms ease, transform 160ms ease;
-}
-.${NS}-char:hover { border-color: rgba(214,190,122,.4); transform: translateY(-2px); }
-.${NS}-char.sel { border-color: #9a8a5c; background: linear-gradient(180deg, rgba(214,190,122,.1), rgba(0,0,0,.4)); }
-.${NS}-char-art { width: 100%; height: 300px; display: flex; align-items: flex-end; justify-content: center; }
-.${NS}-char-art svg { height: 100%; width: auto; }
-.${NS}-char-name {
-	margin-top: 14px;
-	font-size: 26px;
-	letter-spacing: .2em;
-	color: #ddd6c4;
-	text-transform: uppercase;
-}
-.${NS}-char.sel .${NS}-char-name {
-	background: #cfc4a4;
-	color: #1a1712;
-	padding: 3px 26px;
-}
-.${NS}-char-tag { margin-top: 7px; font-size: 10px; letter-spacing: .24em; color: #7d7768; text-transform: uppercase; }
-.${NS}-char-desc {
-	margin-top: 14px;
-	font-size: 13px;
-	line-height: 1.55;
-	color: #a49e91;
-	background: rgba(0,0,0,.55);
-	padding: 12px 14px;
-	text-align: left;
-}
-
-/* ------------------------------------------------- шаг 2: локация */
-.${NS}-loc { display: grid; grid-template-columns: 1fr 400px; gap: 30px; align-items: start; }
-.${NS}-maps { display: grid; grid-template-columns: repeat(auto-fill, minmax(196px, 1fr)); gap: 14px; }
-.${NS}-map {
-	position: relative;
-	text-align: left;
-	padding: 12px 14px;
-	border: 1px solid rgba(255,255,255,.07);
-	background: linear-gradient(180deg, rgba(255,255,255,.03), rgba(0,0,0,.34));
-	color: #bdb7a9;
-	font: inherit;
-	cursor: pointer;
-	transition: border-color 150ms ease, transform 150ms ease, color 150ms ease;
-}
-.${NS}-map:hover:not(.locked) { border-color: rgba(214,190,122,.45); transform: translateY(-2px); color: #efe8d6; }
-.${NS}-map.sel { border-color: #9a8a5c; background: linear-gradient(180deg, rgba(214,190,122,.12), rgba(0,0,0,.42)); color: #f3ecd9; }
-.${NS}-map.locked { cursor: not-allowed; opacity: .42; }
-.${NS}-map-name { font-size: 17px; letter-spacing: .13em; text-transform: uppercase; }
-.${NS}-map-sub { margin-top: 5px; font-size: 10px; letter-spacing: .2em; color: #7b7566; text-transform: uppercase; }
-.${NS}-map-lock { position: absolute; top: 11px; right: 12px; font-size: 9px; letter-spacing: .16em; color: #8d5f4a; }
-
-.${NS}-detail { border: 1px solid rgba(255,255,255,.08); background: rgba(0,0,0,.42); padding: 16px; }
-.${NS}-detail-title { font-size: 12px; letter-spacing: .3em; color: #6f6a5e; text-transform: uppercase; }
-.${NS}-thumb { margin-top: 12px; width: 100%; aspect-ratio: 16 / 9; overflow: hidden; border: 1px solid rgba(255,255,255,.08); background: #08090a; }
-.${NS}-thumb svg { width: 100%; height: 100%; display: block; }
-.${NS}-detail-name { margin-top: 14px; font-size: 30px; letter-spacing: .08em; color: #ece5d2; text-transform: uppercase; }
-.${NS}-detail-desc { margin-top: 12px; font-size: 12.5px; line-height: 1.6; color: #9d978a; }
-.${NS}-detail-meta { margin-top: 16px; display: flex; flex-wrap: wrap; gap: 18px; padding-top: 13px; border-top: 1px solid rgba(255,255,255,.08); }
-.${NS}-chip { display: flex; align-items: center; gap: 7px; font-size: 11.5px; letter-spacing: .14em; color: #ada699; text-transform: uppercase; }
-.${NS}-chip svg { width: 14px; height: 14px; opacity: .75; }
-
-.${NS}-clock-head { margin-top: 26px; font-size: 11px; letter-spacing: .28em; color: #6f6a5e; text-transform: uppercase; }
-.${NS}-clocks { margin-top: 11px; display: flex; gap: 14px; flex-wrap: wrap; }
-.${NS}-clock {
-	flex: 1 1 168px;
-	display: flex;
-	align-items: center;
-	gap: 12px;
-	padding: 12px 14px;
-	border: 1px solid rgba(255,255,255,.08);
-	background: rgba(0,0,0,.4);
-	color: #cbc5b7;
-	font: inherit;
-	cursor: pointer;
-	transition: border-color 150ms ease, background 150ms ease;
-}
-.${NS}-clock:hover { border-color: rgba(214,190,122,.45); }
-.${NS}-clock.sel { border-color: #9a8a5c; background: rgba(214,190,122,.1); }
-.${NS}-box {
-	flex: 0 0 auto;
-	width: 15px;
-	height: 15px;
-	border: 1px solid #8b8474;
-	position: relative;
-	background: rgba(0,0,0,.5);
-}
-.${NS}-clock.sel .${NS}-box::after,
-.${NS}-check.on .${NS}-box::after {
-	content: '';
-	position: absolute;
-	inset: 3px;
-	background: #d6be7a;
-}
-.${NS}-clock-val { font-size: 25px; letter-spacing: .06em; font-variant-numeric: tabular-nums; color: #ece5d2; }
-.${NS}-clock-tag { margin-left: auto; font-size: 9.5px; letter-spacing: .18em; color: #7b7566; text-transform: uppercase; }
-.${NS}-clock-note { margin-top: 10px; font-size: 10.5px; letter-spacing: .1em; color: #635e54; text-transform: uppercase; }
-
-/* ------------------------------------------------- шаг 3: тренировка */
-.${NS}-offline { max-width: 940px; margin: 0 auto; }
-.${NS}-lede { font-size: 13.5px; line-height: 1.62; color: #a09a8d; }
-.${NS}-toggle-row { margin-top: 22px; display: flex; align-items: center; gap: 18px; }
-.${NS}-check {
-	display: flex;
-	align-items: center;
-	gap: 11px;
-	padding: 11px 15px;
-	border: 1px solid rgba(255,255,255,.08);
-	background: rgba(0,0,0,.36);
-	color: #cbc5b7;
-	font: inherit;
-	font-size: 15px;
-	letter-spacing: .06em;
-	cursor: pointer;
-	transition: border-color 150ms ease;
-}
-.${NS}-check:hover { border-color: rgba(214,190,122,.45); }
-.${NS}-check.on { border-color: #9a8a5c; }
-.${NS}-gear {
-	display: flex;
-	align-items: center;
-	gap: 9px;
-	background: none;
-	border: 0;
-	color: #cbc5b7;
-	font: inherit;
-	font-size: 14px;
-	letter-spacing: .14em;
-	text-transform: uppercase;
-	cursor: pointer;
-	transition: color 140ms ease, opacity 140ms ease;
-}
-.${NS}-gear:hover { color: #fff8e2; }
-.${NS}-gear:disabled { opacity: .35; cursor: not-allowed; }
-.${NS}-gear svg { width: 17px; height: 17px; }
-
-.${NS}-rows { margin-top: 20px; border-top: 1px solid rgba(255,255,255,.07); }
-.${NS}-row {
-	display: flex;
-	align-items: center;
-	justify-content: space-between;
-	gap: 20px;
-	padding: 11px 4px;
-	border-bottom: 1px solid rgba(255,255,255,.05);
-	font-size: 13.5px;
-	color: #9b9588;
-}
-.${NS}-row.dim { opacity: .42; }
-.${NS}-row-val { color: #cbc5b7; letter-spacing: .08em; }
-
-.${NS}-warn {
-	margin-top: 24px;
-	display: flex;
-	gap: 14px;
-	align-items: flex-start;
-	padding: 14px 16px;
-	background: linear-gradient(90deg, rgba(150,26,26,.92), rgba(96,18,18,.82));
-	color: #f4e7e3;
-	font-size: 12.5px;
-	line-height: 1.55;
-}
-.${NS}-warn b { display: block; margin-bottom: 3px; letter-spacing: .06em; }
-.${NS}-warn-i { flex: 0 0 auto; width: 22px; height: 22px; }
-
-/* модалка настроек ИИ */
-.${NS}-modal-wrap {
-	position: absolute;
-	inset: 0;
-	z-index: 4;
-	display: flex;
-	align-items: center;
-	justify-content: center;
-	background: rgba(3,4,5,.72);
-	backdrop-filter: blur(3px);
-}
-.${NS}-modal {
-	width: min(760px, 92vw);
-	border: 1px solid rgba(255,255,255,.12);
-	background: linear-gradient(180deg, #14161a, #0b0c0e);
-	box-shadow: 0 30px 90px rgba(0,0,0,.8);
-}
-.${NS}-modal-bar {
-	display: flex;
-	align-items: center;
-	justify-content: space-between;
-	padding: 9px 12px;
-	background: #1d2026;
-	font-size: 11.5px;
-	letter-spacing: .16em;
-	color: #a9a396;
-	text-transform: uppercase;
-}
-.${NS}-x {
-	background: #7a1d1d;
-	border: 0;
-	color: #f2e6e6;
-	width: 22px;
-	height: 18px;
-	line-height: 1;
-	font: inherit;
-	font-size: 12px;
-	cursor: pointer;
-}
-.${NS}-modal-in { padding: 22px 24px 26px; }
-.${NS}-modal-h { font-size: 19px; letter-spacing: .1em; color: #e2dbc8; text-transform: uppercase; margin-bottom: 14px; }
-.${NS}-field { display: flex; align-items: center; gap: 16px; padding: 9px 0; }
-.${NS}-field-l { flex: 0 0 210px; font-size: 13.5px; color: #9b9588; }
-.${NS}-sel {
-	flex: 0 0 auto;
-	min-width: 200px;
-	padding: 7px 10px;
-	border: 1px solid rgba(255,255,255,.14);
-	background: #0e1013;
-	color: #d4cebf;
-	font: inherit;
-	font-size: 13px;
-	cursor: pointer;
-}
-.${NS}-sel:focus { outline: 1px solid #9a8a5c; }
-
-/* ------------------------------------------------- шаг 4: снаряжение */
-.${NS}-confirm { display: grid; grid-template-columns: 300px 1fr 300px; gap: 26px; align-items: stretch; min-height: 100%; }
-.${NS}-silhouette { display: flex; flex-direction: column; align-items: center; justify-content: flex-end; position: relative; }
-.${NS}-silhouette::after {
-	content: '';
-	position: absolute;
-	left: 50%;
-	bottom: 16px;
-	transform: translateX(-50%);
-	width: 260px;
-	height: 34px;
-	background: radial-gradient(50% 50% at 50% 50%, rgba(0,0,0,.85), rgba(0,0,0,0));
-}
-.${NS}-silhouette svg { height: min(62vh, 560px); width: auto; position: relative; z-index: 1; filter: drop-shadow(0 22px 40px rgba(0,0,0,.85)); }
-.${NS}-nick { margin-top: 12px; font-size: 15px; letter-spacing: .2em; color: #cdc7b9; text-transform: uppercase; z-index: 1; }
-.${NS}-panel { border: 1px solid rgba(255,255,255,.08); background: rgba(0,0,0,.4); padding: 15px; align-self: start; }
-.${NS}-panel-h { font-size: 11px; letter-spacing: .26em; color: #6f6a5e; text-transform: uppercase; margin-bottom: 11px; }
-.${NS}-kv { display: flex; justify-content: space-between; gap: 14px; padding: 7px 0; border-bottom: 1px solid rgba(255,255,255,.05); font-size: 12.5px; }
-.${NS}-kv span:first-child { color: #85806f; }
-.${NS}-kv span:last-child { color: #ccc6b8; text-align: right; }
-
-/* ------------------------------------------------- шаг 5: высадка */
-.${NS}-deploy { position: absolute; inset: 0; display: flex; flex-direction: column; }
-.${NS}-deploy-bg { position: absolute; inset: 0; overflow: hidden; }
-.${NS}-deploy-bg svg { width: 100%; height: 100%; opacity: .3; filter: saturate(.5) contrast(1.1); }
-.${NS}-deploy-bg::after {
-	content: '';
-	position: absolute;
-	inset: 0;
-	background:
-		linear-gradient(180deg, rgba(4,5,6,.62), rgba(4,5,6,.93)),
-		repeating-linear-gradient(0deg, rgba(0,0,0,.28) 0 2px, rgba(0,0,0,0) 2px 4px);
-}
-.${NS}-deploy-in { position: relative; z-index: 1; flex: 1 1 auto; display: flex; flex-direction: column; padding: 46px 56px; }
-.${NS}-deploy-h { font-size: 32px; letter-spacing: .14em; color: #e9e2cf; text-transform: uppercase; }
-.${NS}-deploy-sub { margin-top: 8px; font-size: 12px; letter-spacing: .28em; color: #6f6a5e; text-transform: uppercase; }
-.${NS}-deploy-grid { margin-top: auto; display: grid; grid-template-columns: 1fr 340px; gap: 34px; align-items: end; }
-.${NS}-stages { display: flex; flex-direction: column; gap: 6px; }
-.${NS}-stage { display: flex; align-items: center; gap: 11px; font-size: 12.5px; letter-spacing: .12em; color: #5d584f; text-transform: uppercase; transition: color 180ms ease; }
-.${NS}-stage.on { color: #e5dcc2; }
-.${NS}-stage.done { color: #8a8474; }
-.${NS}-stage-dot { width: 7px; height: 7px; border: 1px solid currentColor; }
-.${NS}-stage.on .${NS}-stage-dot { background: #d6be7a; border-color: #d6be7a; }
-.${NS}-stage.done .${NS}-stage-dot { background: currentColor; }
-.${NS}-status { margin-top: 20px; font-size: 15px; letter-spacing: .18em; color: #ddd4bb; text-transform: uppercase; min-height: 20px; }
-.${NS}-bar { margin-top: 12px; height: 3px; background: rgba(255,255,255,.09); overflow: hidden; }
-.${NS}-bar-fill { height: 100%; width: 0%; background: linear-gradient(90deg, #9a8a5c, #d6be7a); transition: width 260ms ease; }
-.${NS}-watch { font-size: 13px; letter-spacing: .2em; color: #8a8474; font-variant-numeric: tabular-nums; text-transform: uppercase; }
-.${NS}-sum { border-left: 1px solid rgba(255,255,255,.1); padding-left: 22px; }
-.${NS}-err { margin-top: 16px; color: #d98a72; font-size: 13px; letter-spacing: .08em; }
-
-@media (max-width: 1100px) {
-	.${NS}-loc { grid-template-columns: 1fr; }
-	.${NS}-confirm { grid-template-columns: 1fr; }
-	.${NS}-deploy-grid { grid-template-columns: 1fr; }
-	.${NS}-head { padding: 22px 22px 8px; }
-	.${NS}-body { padding: 8px 22px; }
-	.${NS}-foot { padding: 12px 22px 24px; }
-}
-`
-
-function ensureStyles() {
-	if (typeof document === 'undefined') return
-	if (document.getElementById(STYLE_ID)) return
-	const tag = document.createElement('style')
-	tag.id = STYLE_ID
-	tag.textContent = CSS
-	document.head.appendChild(tag)
-}
-
-/* ------------------------------------------------------------ DOM хелперы */
-
-function el(tag, cls, text) {
-	const node = document.createElement(tag)
-	if (cls) node.className = cls
-	if (text != null) node.textContent = text
-	return node
-}
-
-function svg(markup) {
-	const holder = document.createElement('div')
-	holder.innerHTML = markup
-	return holder.firstElementChild
-}
-
-/** Безопасный вызов чужого метода: отсутствующий хук — это не ошибка. */
-function call(target, method) {
-	if (!target || typeof target[method] !== 'function') return undefined
-	const args = Array.prototype.slice.call(arguments, 2)
-	try {
-		return target[method].apply(target, args)
-	} catch (err) {
-		if (typeof console !== 'undefined') console.warn('[EFL/lobby] ' + method + '() упал', err)
-		return undefined
-	}
-}
-
-/* ------------------------------------------------------------ процедурный арт */
-
-/* Ни одного внешнего файла: всё рисуется инлайновым SVG (ARCHITECTURE.md,
- * пункт про отсутствие внешних ассетов). */
-
-function silhouetteSvg(factionId, accent) {
-	const gun = factionId === 'scav'
-		? "<path d='M92 150 L188 138 L188 150 L150 156 L150 166 L136 166 L136 158 L92 162 Z' fill='#0d0f10' opacity='.92'/><rect x='120' y='166' width='10' height='26' fill='#0d0f10' opacity='.92'/>"
-		: "<path d='M96 146 L196 132 L196 146 L156 152 L156 164 L140 164 L140 154 L96 158 Z' fill='#0d0f10' opacity='.92'/><rect x='124' y='164' width='11' height='30' fill='#0d0f10' opacity='.92'/><rect x='168' y='126' width='26' height='6' fill='#0d0f10' opacity='.9'/>"
-	return "<svg viewBox='0 0 260 620' xmlns='http://www.w3.org/2000/svg' role='img' aria-label='силуэт оперативника'>" +
-		"<defs>" +
-		"<linearGradient id='lwBody" + factionId + "' x1='0' y1='0' x2='0' y2='1'>" +
-		"<stop offset='0' stop-color='#3b3f44'/><stop offset='.45' stop-color='#23262a'/><stop offset='1' stop-color='#101214'/>" +
-		"</linearGradient>" +
-		"<linearGradient id='lwRim" + factionId + "' x1='0' y1='0' x2='1' y2='0'>" +
-		"<stop offset='0' stop-color='" + accent + "' stop-opacity='.85'/><stop offset='.35' stop-color='" + accent + "' stop-opacity='0'/>" +
-		"</linearGradient>" +
-		"</defs>" +
-		"<g fill='url(#lwBody" + factionId + "')'>" +
-		"<ellipse cx='130' cy='58' rx='31' ry='36'/>" +
-		"<path d='M112 92 L148 92 L156 116 L104 116 Z'/>" +
-		"<path d='M86 116 L174 116 L186 214 L180 300 L80 300 L74 214 Z'/>" +
-		"<path d='M74 130 L58 146 L52 226 L74 232 L82 150 Z'/>" +
-		"<path d='M186 130 L202 146 L208 226 L186 232 L178 150 Z'/>" +
-		"<path d='M92 300 L124 300 L126 434 L118 546 L92 546 L88 430 Z'/>" +
-		"<path d='M136 300 L168 300 L172 430 L168 546 L142 546 L134 434 Z'/>" +
-		"<path d='M82 546 L122 546 L124 566 L78 566 Z'/>" +
-		"<path d='M138 546 L178 546 L182 566 L136 566 Z'/>" +
-		"</g>" +
-		"<path d='M96 128 L164 128 L170 196 L90 196 Z' fill='#191c1f' opacity='.9'/>" +
-		"<rect x='104' y='140' width='52' height='13' fill='" + accent + "' opacity='.35'/>" +
-		"<rect x='104' y='160' width='38' height='11' fill='" + accent + "' opacity='.22'/>" +
-		"<ellipse cx='130' cy='54' rx='24' ry='15' fill='#0e1113' opacity='.85'/>" +
-		"<path d='M86 116 L174 116 L178 150 L82 150 Z' fill='url(#lwRim" + factionId + ")'/>" +
-		gun +
-		"</svg>"
-}
-
-function mapThumbSvg(map) {
-	const p = map.palette
-	const id = 'lwT' + map.id
-	let shapes = ''
-	if (map.id === 'woods' || map.id === 'shoreline') {
-		for (let i = 0; i < 11; i++) {
-			const x = 12 + i * 26
-			const h = 34 + ((i * 37) % 40)
-			shapes += "<path d='M" + x + ' ' + (150 - h) + ' L' + (x + 13) + ' 150 L' + (x - 13) + " 150 Z' fill='" + p[1] + "' opacity='.85'/>"
-		}
-	} else {
-		for (let i = 0; i < 8; i++) {
-			const x = 8 + i * 34
-			const h = 40 + ((i * 53) % 58)
-			shapes += "<rect x='" + x + "' y='" + (150 - h) + "' width='26' height='" + h + "' fill='" + p[1] + "' opacity='.88'/>"
-			shapes += "<rect x='" + (x + 5) + "' y='" + (156 - h) + "' width='5' height='5' fill='" + p[2] + "' opacity='.5'/>"
-			shapes += "<rect x='" + (x + 15) + "' y='" + (166 - h) + "' width='5' height='5' fill='" + p[2] + "' opacity='.35'/>"
-		}
-	}
-	return "<svg viewBox='0 0 280 158' xmlns='http://www.w3.org/2000/svg' role='img' aria-label='превью локации'>" +
-		"<defs><linearGradient id='" + id + "' x1='0' y1='0' x2='0' y2='1'>" +
-		"<stop offset='0' stop-color='" + p[0] + "'/><stop offset='1' stop-color='" + p[1] + "'/>" +
-		"</linearGradient></defs>" +
-		"<rect width='280' height='158' fill='url(#" + id + ")'/>" +
-		"<circle cx='232' cy='34' r='15' fill='" + p[2] + "' opacity='.3'/>" +
-		shapes +
-		"<rect y='150' width='280' height='8' fill='" + p[1] + "'/>" +
-		"<rect width='280' height='158' fill='none' stroke='rgba(0,0,0,.55)' stroke-width='2'/>" +
-		"</svg>"
-}
-
-function gearSvg() {
-	return "<svg viewBox='0 0 24 24' fill='none' stroke='currentColor' stroke-width='1.6' aria-hidden='true'>" +
-		"<circle cx='12' cy='12' r='3.2'/>" +
-		"<path d='M12 3.6v2.2M12 18.2v2.2M4.6 12H2.4M21.6 12h-2.2M6.7 6.7 5.2 5.2M18.8 18.8l-1.5-1.5M17.3 6.7l1.5-1.5M5.2 18.8l1.5-1.5'/>" +
-		"</svg>"
-}
-
-function clockIconSvg() {
-	return "<svg viewBox='0 0 24 24' fill='none' stroke='currentColor' stroke-width='1.7' aria-hidden='true'>" +
-		"<circle cx='12' cy='12' r='8.4'/><path d='M12 7.2V12l3.4 2.1'/></svg>"
-}
-
-function peopleIconSvg() {
-	return "<svg viewBox='0 0 24 24' fill='none' stroke='currentColor' stroke-width='1.7' aria-hidden='true'>" +
-		"<circle cx='9' cy='8' r='3.1'/><path d='M3.4 19.4c0-3.1 2.5-5.6 5.6-5.6s5.6 2.5 5.6 5.6'/>" +
-		"<circle cx='17.4' cy='8.6' r='2.4'/><path d='M16 13.9c2.6-.3 4.7 1.7 4.7 4.3'/></svg>"
-}
-
-function sunIconSvg() {
-	return "<svg viewBox='0 0 24 24' fill='none' stroke='currentColor' stroke-width='1.7' aria-hidden='true'>" +
-		"<circle cx='12' cy='12' r='4.2'/><path d='M12 2.6v2.4M12 19v2.4M2.6 12H5M19 12h2.4M5.6 5.6 7.3 7.3M16.7 16.7l1.7 1.7M18.4 5.6l-1.7 1.7M7.3 16.7l-1.7 1.7'/></svg>"
-}
-
-function moonIconSvg() {
-	return "<svg viewBox='0 0 24 24' fill='none' stroke='currentColor' stroke-width='1.7' aria-hidden='true'>" +
-		"<path d='M20 14.4A8.4 8.4 0 0 1 9.6 4a8.4 8.4 0 1 0 10.4 10.4Z'/></svg>"
-}
-
-function alertSvg() {
-	return "<svg class='" + NS + "-warn-i' viewBox='0 0 24 24' fill='none' stroke='currentColor' stroke-width='1.8' aria-hidden='true'>" +
-		"<path d='M12 3.2 22 20.4H2Z'/><path d='M12 9.4v5'/><circle cx='12' cy='17.4' r='.9' fill='currentColor'/></svg>"
-}
-
-/* ------------------------------------------------------------ корень меню */
-
-const MENU_SELECTORS = ['.efl-menu', '.efl-mm', '#eflMainMenu', '#eflMenu', '[data-efl-menu]', '.eft-menu', '#eftMenu']
-
-/**
- * Контейнер главного меню. Инстанс MainMenuSystem не обязан звать своё
- * поле root, поэтому идём по трём путям: известные поля, известные
- * селекторы и, самое надёжное, подъём от нажатой кнопки до прямого ребёнка
- * точки монтирования (main.js монтирует меню в document.body).
- */
-function resolveMenuRoot(instance, fromNode) {
+export function resolveMenuRoot(instance, fromNode) {
 	const fields = ['root', 'el', 'node', 'container', 'dom', 'wrap', 'overlay']
 	for (let i = 0; i < fields.length; i++) {
 		const candidate = instance ? instance[fields[i]] : null
 		if (candidate && candidate.nodeType === 1) return candidate
 	}
-
-	if (fromNode && fromNode.nodeType === 1) {
+	if (fromNode && fromNode.nodeType === 1 && document.body) {
 		let node = fromNode
-		while (node && node.parentElement && node.parentElement !== document.body) {
-			node = node.parentElement
+		let guard = 0
+		while (node && node.parentNode && node.parentNode !== document.body && guard < 24) {
+			node = node.parentNode
+			guard++
 		}
-		if (node && node.nodeType === 1 && node !== document.body) return node
+		if (node && node.nodeType === 1 && node.parentNode === document.body) return node
 	}
-
 	for (let i = 0; i < MENU_SELECTORS.length; i++) {
 		const found = document.querySelector(MENU_SELECTORS[i])
 		if (found) return found
@@ -898,21 +120,22 @@ function resolveMenuRoot(instance, fromNode) {
 	return null
 }
 
-/* ============================================================ LobbyWizard */
+/* ====================================================================== */
+/*                              LobbyWizard                               */
+/* ====================================================================== */
 
 export class LobbyWizard {
-	constructor(options) {
-		const o = options || {}
-		this.engine = o.engine || (typeof window !== 'undefined' ? window.__ENGINE__ : null) || null
-		this.ctx = o.ctx || (this.engine ? this.engine.ctx : null) || null
-		this.mount = o.mount || (typeof document !== 'undefined' ? document.body : null)
+	constructor(engine, opts) {
+		const o = opts || {}
+		this.engine = engine || null
+		this.ctx = engine && engine.ctx ? engine.ctx : null
 		this.menuRoot = o.menuRoot || null
+		this.mount = o.mount || document.body
 
-		this.open = false
-		this.stepIndex = 0
-		this.deploying = false
-
-		this.maps = MAP_CATALOGUE.map((m) => Object.assign({}, m))
+		this.index = 0
+		this.busy = false
+		this.deployed = false
+		this.destroyed = false
 
 		this.state = {
 			faction: 'pmc',
@@ -923,137 +146,148 @@ export class LobbyWizard {
 			offline: defaultOfflineConfig()
 		}
 
-		this.rootEl = null
+		this.catalogue = MAP_CATALOGUE.map(function (m) { return Object.assign({}, m) })
+
+		this.root = null
 		this.bodyEl = null
-		this.hintEl = null
-		this.nextEl = null
-		this.backEl = null
+		this.titleEl = null
 		this.pips = []
-		this.modalEl = null
+		this.nextBtn = null
+		this.backBtn = null
+		this.hintEl = null
+		this.modal = null
 
-		this._clockRaf = 0
-		this._clockNodes = null
-		this._clockCache = ['', '']
-		this._watchTimer = 0
-		this._watchStart = 0
-		this._watchEl = null
-		this._statusEl = null
-		this._barEl = null
-		this._stageEls = null
-		this._onKeyDown = null
+		this.clockNodes = []
+		this.clockRaf = 0
+		this.clockCache = ['', '']
+		this.watchTimer = 0
+		this.watchStart = 0
+		this.watchEl = null
+		this.stageNodes = {}
+		this.statusEl = null
+		this.fillEl = null
 
-		this.steps = [
-			{ id: 'character', title: 'ВЫБЕРИТЕ ПЕРСОНАЖА', render: () => this._stepCharacter() },
-			{ id: 'location', title: 'ВЫБЕРИТЕ МЕСТО ДИСЛОКАЦИИ', render: () => this._stepLocation() },
-			{ id: 'training', title: 'ТРЕНИРОВОЧНЫЙ РЕЖИМ ИГРЫ', render: () => this._stepTraining() },
-			{ id: 'confirm', title: 'ПОДТВЕРЖДЕНИЕ', render: () => this._stepConfirm() },
-			{ id: 'deploy', title: 'ВЫСАДКА НА МЕСТО ДИСЛОКАЦИИ', render: () => this._stepDeploy() }
-		]
+		this._onKeyDown = this._onKeyDown.bind(this)
+		this._tickClock = this._tickClock.bind(this)
 	}
 
-	/* --------------------------------------------------------- подсистемы */
+	/* ------------------------------------------------------- доступ к данным */
 
-	/* registry.get() бросает для незарегистрированного id, peek() — нет. */
 	_peek(id) {
-		const ctx = this.ctx
-		if (!ctx) return null
-		if (typeof ctx.peek === 'function') {
-			try {
-				return ctx.peek(id) || null
-			} catch (err) {
-				return null
-			}
+		if (!this.ctx || typeof this.ctx.peek !== 'function') return null
+		try {
+			return this.ctx.peek(id) || null
+		} catch (err) {
+			return null
 		}
-		return null
 	}
 
-	/* Карта доступна, если у движка есть билдер и в инвентаре лежит пропуск. */
+	/**
+	 * Сверяет презентационный каталог с реальной таблицей карт движка.
+	 * Если у локации нет билдера — она гаснет как НЕДОСТУПНО, а не роняет рейд.
+	 */
 	_syncCatalogue() {
 		const world = this._peek('world')
-		const table = world && world.constructor && world.constructor.MAPS ? world.constructor.MAPS : (world ? world.MAPS : null)
-		const inv = this._peek('inventory')
-
-		for (let i = 0; i < this.maps.length; i++) {
-			const map = this.maps[i]
-			const def = table ? table[map.id] : null
-			if (def) {
-				map.available = true
-				if (Number(def.duration) > 0) map.duration = Number(def.duration)
-				if (Number(def.size) > 0) map.size = Number(def.size)
-				if (def.needCard !== undefined) map.needCard = def.needCard || null
+		const table = world ? (world.constructor && world.constructor.MAPS ? world.constructor.MAPS : world.MAPS) : null
+		if (table) {
+			for (let i = 0; i < this.catalogue.length; i++) {
+				const entry = this.catalogue[i]
+				const real = table[entry.id]
+				entry.available = entry.available && !!real
+				if (real && typeof real.dur === 'number') entry.duration = real.dur
+				if (real && typeof real.duration === 'number') entry.duration = real.duration
 			}
-			map.locked = !map.available
-			map.lockNote = map.available ? '' : 'НЕДОСТУПНО'
-
-			if (map.available && map.needCard) {
-				const has = this._hasItem(inv, map.needCard)
-				if (!has) {
-					map.locked = true
-					map.lockNote = 'НУЖЕН ПРОПУСК'
+		}
+		if (!this._unlocked(this._map())) {
+			for (let i = 0; i < this.catalogue.length; i++) {
+				if (this._unlocked(this.catalogue[i])) {
+					this.state.mapId = this.catalogue[i].id
+					break
 				}
 			}
 		}
-
-		const current = this._map(this.state.mapId)
-		if (!current || current.locked) {
-			const first = this.maps.find((m) => !m.locked)
-			if (first) this.state.mapId = first.id
-		}
 	}
 
-	_hasItem(inv, id) {
-		if (!inv || !inv.all || !id) return false
-		try {
-			for (let i = 0; i < inv.all.length; i++) {
-				const it = inv.all[i]
-				if (!it || it.id !== id) continue
-				if (typeof inv.onBody !== 'function') return true
-				if (inv.onBody(it)) return true
-			}
-		} catch (err) {
-			return false
+	/** Лежит ли предмет на теле — нужно для пропуска в Лабораторию. */
+	_hasItem(id) {
+		const inv = this._peek('inv')
+		if (!inv || !inv.all) return false
+		const all = inv.all
+		for (let i = 0; i < all.length; i++) {
+			const it = all[i]
+			if (!it || it.id !== id) continue
+			if (typeof inv.onBody === 'function' && !inv.onBody(it)) continue
+			return true
 		}
 		return false
 	}
 
-	_map(id) {
-		return this.maps.find((m) => m.id === id) || null
+	_unlocked(map) {
+		if (!map || !map.available) return false
+		if (map.needCard && !this._hasItem(map.needCard)) return false
+		return true
+	}
+
+	_map() {
+		for (let i = 0; i < this.catalogue.length; i++) {
+			if (this.catalogue[i].id === this.state.mapId) return this.catalogue[i]
+		}
+		return this.catalogue[0]
 	}
 
 	_faction() {
-		return FACTIONS.find((f) => f.id === this.state.faction) || FACTIONS[1]
+		return findFaction(this.state.faction)
 	}
 
-	/* -------------------------------------------------------- жизненный цикл */
+	_clockSeconds(slot) {
+		return gameClockSeconds(Date.now(), slot === 1 ? HALF_DAY_SECONDS : 0)
+	}
 
-	async show(opts) {
-		if (this.open) return this
-		if (typeof document === 'undefined') return this
+	/* ---------------------------------------------------------------- показ */
 
-		const o = opts || {}
+	async show() {
+		if (this.destroyed || this.root) return this
 		ensureStyles()
-
-		if (o.menuRoot) this.menuRoot = o.menuRoot
-		if (!this.menuRoot) {
-			const instance = this.engine ? this.engine.mainMenu : null
-			this.menuRoot = resolveMenuRoot(instance, o.fromNode || null)
-		}
-
-		this.open = true
-		this.stepIndex = 0
-		this.deploying = false
 		this._syncCatalogue()
-		this._syncClockNight()
-
 		await this._rotateMenuOut()
+		if (this.destroyed) return this
 		this._buildShell()
 		this._renderStep()
-
-		/* Ребрендинг гоняем по уже собранному оверлею и по меню под ним. */
-		applyGlobalRebranding(this.rootEl)
-		if (this.menuRoot) applyGlobalRebranding(this.menuRoot)
-
 		return this
+	}
+
+	/** Поворот меню на 90° влево. Ждём transitionend, но с таймаутом. */
+	_rotateMenuOut() {
+		const root = this.menuRoot
+		if (!root || !root.classList) return Promise.resolve()
+		root.classList.add(NS + '-menu-rotate')
+		/* Раздельные кадры, иначе браузер склеит оба класса и анимации не будет. */
+		return new Promise(function (resolve) {
+			requestAnimationFrame(function () {
+				requestAnimationFrame(function () {
+					let settled = false
+					const finish = function () {
+						if (settled) return
+						settled = true
+						root.removeEventListener('transitionend', finish)
+						resolve()
+					}
+					root.addEventListener('transitionend', finish)
+					setTimeout(finish, 760)
+					root.classList.add(NS + '-menu-out')
+				})
+			})
+		})
+	}
+
+	_rotateMenuIn() {
+		const root = this.menuRoot
+		if (!root || !root.classList) return
+		root.classList.remove(NS + '-menu-out')
+		const cls = NS + '-menu-rotate'
+		setTimeout(function () {
+			if (root.classList) root.classList.remove(cls)
+		}, 700)
 	}
 
 	_buildShell() {
@@ -1062,43 +296,814 @@ export class LobbyWizard {
 		root.setAttribute('aria-modal', 'true')
 
 		const head = el('div', NS + '-head')
-		this.titleEl = el('div', NS + '-title', this.steps[0].title)
+		this.titleEl = el('div', NS + '-title', STEPS[0].title)
 		head.appendChild(this.titleEl)
-		head.appendChild(el('div', NS + '-zone', BRAND.zone))
+		head.appendChild(el('div', NS + '-zone', BRAND.ruUpper + ' · ' + BRAND.zone))
 
-		const pips = el('div', NS + '-steps')
+		const steps = el('div', NS + '-steps')
 		this.pips = []
-		for (let i = 0; i < this.steps.length; i++) {
+		for (let i = 0; i < STEPS.length; i++) {
 			const pip = el('div', NS + '-pip')
-			pips.appendChild(pip)
+			steps.appendChild(pip)
 			this.pips.push(pip)
 		}
-		head.appendChild(pips)
+		head.appendChild(steps)
 
 		this.bodyEl = el('div', NS + '-body')
 
 		const foot = el('div', NS + '-foot')
-		this.hintEl = el('div', NS + '-hint')
-		this.nextEl = el('button', NS + '-nav primary', 'ДАЛЕЕ')
-		this.nextEl.type = 'button'
-		this.nextEl.addEventListener('click', () => this.next())
-		this.backEl = el('button', NS + '-nav', 'НАЗАД')
-		this.backEl.type = 'button'
-		this.backEl.addEventListener('click', () => this.back())
+		this.hintEl = el('div', NS + '-hint', '')
+		const self = this
+		this.nextBtn = button(NS + '-nav primary', 'ДАЛЕЕ', function () { self.next() })
+		this.backBtn = button(NS + '-nav', 'НАЗАД', function () { self.back() })
 		foot.appendChild(this.hintEl)
-		foot.appendChild(this.nextEl)
-		foot.appendChild(this.backEl)
+		foot.appendChild(this.nextBtn)
+		foot.appendChild(this.backBtn)
 
 		root.appendChild(head)
 		root.appendChild(this.bodyEl)
 		root.appendChild(foot)
 
-		this.rootEl = root
+		this.root = root
 		this.mount.appendChild(root)
+		document.addEventListener('keydown', this._onKeyDown, true)
 
-		/* Один кадр на применение начальной opacity, иначе transition не сыграет. */
-		requestAnimationFrame(() => {
-			if (this.rootEl) this.rootEl.classList.add(NS + '-in')
+		/* Глобальный ребрендинг по живому DOM меню и визарда. */
+		applyGlobalRebranding(this.menuRoot || document.body)
+
+		requestAnimationFrame(function () {
+			if (self.root) self.root.classList.add(NS + '-in')
+		})
+	}
+
+	_onKeyDown(e) {
+		if (!this.root || this.busy) return
+		if (e.key === 'Escape') {
+			e.preventDefault()
+			e.stopPropagation()
+			if (this.modal) this._closeOfflineModal()
+			else this.close({ restoreMenu: true })
+			return
+		}
+		if (this.modal) return
+		if (e.key === 'Enter') {
+			e.preventDefault()
+			this.next()
+		}
+	}
+
+	/* -------------------------------------------------------------- рендер */
+
+	_renderStep() {
+		if (!this.root) return
+		const step = STEPS[this.index]
+		this._stopClock()
+		this.titleEl.textContent = step.title
+		this.bodyEl.textContent = ''
+		this.bodyEl.scrollTop = 0
+		this.hintEl.textContent = ''
+
+		for (let i = 0; i < this.pips.length; i++) {
+			this.pips[i].className = NS + '-pip' + (i === this.index ? ' on' : i < this.index ? ' done' : '')
+		}
+
+		if (step.id === 'character') this._stepCharacter()
+		else if (step.id === 'location') this._stepLocation()
+		else if (step.id === 'training') this._stepTraining()
+		else if (step.id === 'confirm') this._stepConfirm()
+		else this._stepDeploy()
+
+		const last = step.id === 'deploy'
+		const confirm = step.id === 'confirm'
+		this.nextBtn.style.display = last ? 'none' : ''
+		this.backBtn.style.display = last ? 'none' : ''
+		this.nextBtn.textContent = confirm ? 'ГОТОВ' : 'ДАЛЕЕ'
+		this.nextBtn.className = NS + '-nav primary' + (confirm ? ' ready' : '')
+		this.nextBtn.disabled = !this._canAdvance()
+	}
+
+	/* ──────────────────────────────── шаг 1: персонаж ────── */
+
+	_stepCharacter() {
+		const wrap = el('div', NS + '-chars')
+		const self = this
+		for (let i = 0; i < FACTIONS.length; i++) {
+			const f = FACTIONS[i]
+			const card = button(NS + '-char' + (f.id === this.state.faction ? ' sel' : ''), null, function () {
+				if (self.state.faction === f.id) return
+				self.state.faction = f.id
+				self._renderStep()
+			})
+			const art = el('div', NS + '-char-art')
+			art.appendChild(svg(silhouetteSvg(f.id, f.accent)))
+			card.appendChild(art)
+			card.appendChild(el('div', NS + '-char-name', f.label))
+			card.appendChild(el('div', NS + '-char-tag', f.tag))
+			card.appendChild(el('div', NS + '-char-desc', rebrandText(f.desc)))
+			wrap.appendChild(card)
+		}
+		this.bodyEl.appendChild(wrap)
+	}
+
+	/* ───────────────────────── шаг 2: локация и время ────── */
+
+	_stepLocation() {
+		const wrap = el('div', NS + '-loc')
+		const maps = el('div', NS + '-maps')
+		const self = this
+
+		for (let i = 0; i < this.catalogue.length; i++) {
+			const map = this.catalogue[i]
+			const unlocked = this._unlocked(map)
+			const cls = NS + '-map' + (map.id === this.state.mapId ? ' sel' : '') + (unlocked ? '' : ' locked')
+			const card = button(cls, null, function () {
+				if (!unlocked) {
+					self.hintEl.textContent = map.available ? 'ДЛЯ ВЫСАДКИ НУЖЕН ПРОПУСК' : 'ЛОКАЦИЯ ВРЕМЕННО НЕДОСТУПНА'
+					return
+				}
+				self.state.mapId = map.id
+				self._renderStep()
+			})
+			card.appendChild(el('div', NS + '-map-name', map.label))
+			card.appendChild(el('div', NS + '-map-sub', map.en + ' · ' + formatDuration(map.duration)))
+			if (!map.available) card.appendChild(el('div', NS + '-map-lock', 'НЕДОСТУПНО'))
+			else if (map.needCard && !this._hasItem(map.needCard)) card.appendChild(el('div', NS + '-map-lock', 'НУЖЕН ПРОПУСК'))
+			maps.appendChild(card)
+		}
+
+		const detail = el('div', NS + '-detail')
+		wrap.appendChild(maps)
+		wrap.appendChild(detail)
+		this.bodyEl.appendChild(wrap)
+		this._renderMapDetail(detail)
+	}
+
+	/** При клике на локацию впрыскивается превью, длительность и метаданные. */
+	_renderMapDetail(host) {
+		const map = this._map()
+		host.textContent = ''
+		host.appendChild(el('div', NS + '-detail-title', 'Настройки сервера'))
+
+		const thumb = el('div', NS + '-thumb')
+		thumb.appendChild(svg(mapThumbSvg(map)))
+		host.appendChild(thumb)
+
+		host.appendChild(el('div', NS + '-detail-name', map.label))
+		host.appendChild(el('div', NS + '-detail-desc', rebrandText(map.desc)))
+
+		const meta = el('div', NS + '-detail-meta')
+		const rows = [
+			[clockIcon(), formatDuration(map.duration)],
+			[daylightIcon(this.state.night), map.weather],
+			[peopleIcon(), map.players],
+			[gridIcon(), map.size ? map.size + ' М' : '—']
+		]
+		for (let i = 0; i < rows.length; i++) {
+			const chip = el('div', NS + '-chip')
+			chip.appendChild(svg(rows[i][0]))
+			chip.appendChild(el('span', null, rows[i][1]))
+			meta.appendChild(chip)
+		}
+		host.appendChild(meta)
+
+		host.appendChild(el('div', NS + '-clock-head', 'ВЫБЕРИТЕ ВРЕМЯ СУТОК:'))
+		const clocks = el('div', NS + '-clocks')
+		this.clockNodes = []
+		this.clockCache = ['', '']
+		const self = this
+
+		for (let slot = 0; slot < 2; slot++) {
+			const captured = slot
+			const seconds = this._clockSeconds(captured)
+			const night = isNightSeconds(seconds)
+			const card = button(NS + '-clock' + (captured === this.state.clockSlot ? ' sel' : ''), null, function () {
+				self.state.clockSlot = captured
+				self.state.night = isNightSeconds(self._clockSeconds(captured))
+				self._renderStep()
+			})
+			card.appendChild(el('div', NS + '-box'))
+			const val = el('div', NS + '-clock-val', formatClock(seconds))
+			card.appendChild(val)
+			const tag = el('div', NS + '-clock-tag')
+			const icon = svg(daylightIcon(night))
+			tag.appendChild(icon)
+			const tagText = el('span', null, night ? 'НОЧЬ' : 'ДЕНЬ')
+			tag.appendChild(tagText)
+			card.appendChild(tag)
+			clocks.appendChild(card)
+			this.clockNodes.push({ slot: captured, val: val, tag: tagText, icon: icon, host: tag, night: night })
+		}
+
+		host.appendChild(clocks)
+		host.appendChild(el(
+			'div',
+			NS + '-clock-note',
+			'Сжатие времени 1:' + REAL_SECONDS_PER_GAME_MINUTE + ' · 1 минута в рейде = ' +
+				REAL_SECONDS_PER_GAME_MINUTE + ' секунд реального времени (×' + CLOCK_FACTOR.toFixed(2) + ')'
+		))
+
+		this.state.night = isNightSeconds(this._clockSeconds(this.state.clockSlot))
+		this._startClock()
+	}
+
+	_startClock() {
+		if (this.clockRaf || !this.clockNodes.length) return
+		this.clockRaf = requestAnimationFrame(this._tickClock)
+	}
+
+	_stopClock() {
+		if (this.clockRaf) cancelAnimationFrame(this.clockRaf)
+		this.clockRaf = 0
+		this.clockNodes = []
+	}
+
+	/** Тик часов. Запись в DOM только когда строка изменилась — нуль аллокаций впустую. */
+	_tickClock() {
+		if (!this.root || !this.clockNodes.length) {
+			this.clockRaf = 0
+			return
+		}
+		const now = Date.now()
+		for (let i = 0; i < this.clockNodes.length; i++) {
+			const node = this.clockNodes[i]
+			const seconds = gameClockSeconds(now, node.slot === 1 ? HALF_DAY_SECONDS : 0)
+			const text = formatClock(seconds)
+			if (text !== this.clockCache[i]) {
+				this.clockCache[i] = text
+				node.val.textContent = text
+				const night = isNightSeconds(seconds)
+				if (night !== node.night) {
+					node.night = night
+					node.tag.textContent = night ? 'НОЧЬ' : 'ДЕНЬ'
+					const fresh = svg(daylightIcon(night))
+					node.host.replaceChild(fresh, node.icon)
+					node.icon = fresh
+					if (node.slot === this.state.clockSlot) this.state.night = night
+				}
+			}
+		}
+		this.clockRaf = requestAnimationFrame(this._tickClock)
+	}
+
+	/* ─────────────────── шаг 3: тренировочный режим ────── */
+
+	_stepTraining() {
+		const wrap = el('div', NS + '-offline')
+		const cfg = this.state.offline
+		const self = this
+
+		wrap.appendChild(el(
+			'div',
+			NS + '-lede',
+			'Тренировочный режим запускает рейд локально, без сетевых игроков. Настройки ниже влияют только на эту высадку.'
+		))
+
+		const row = el('div', NS + '-toggle-row')
+		const check = button(NS + '-check' + (this.state.training ? ' on' : ''), null, function () {
+			self.state.training = !self.state.training
+			self._renderStep()
+		})
+		check.appendChild(el('span', NS + '-box'))
+		check.appendChild(el('span', null, 'Включить тренировочный режим для этого рейда'))
+		row.appendChild(check)
+
+		const gear = button(NS + '-gear', null, function () { self._openOfflineModal() })
+		gear.appendChild(svg(gearIcon()))
+		gear.appendChild(el('span', null, 'НАСТРОЙКИ РЕЙДА'))
+		gear.disabled = !this.state.training
+		row.appendChild(gear)
+		wrap.appendChild(row)
+
+		const rows = el('div', NS + '-rows')
+		const dim = this.state.training ? '' : ' dim'
+		const summary = [
+			['Кооперативный режим', this.state.training ? 'Выключен' : '—'],
+			['Количество ИИ', optionLabel(AI_COUNT_OPTIONS, cfg.aiCount)],
+			['Сложность ИИ', optionLabel(AI_DIFFICULTY_OPTIONS, cfg.aiDifficulty)],
+			['Вкл. Боссов', cfg.bosses ? 'Да' : 'Нет'],
+			['Отключить расход воды и энергии', cfg.noDrain ? 'Да' : 'Нет'],
+			['Время', formatClock(this._clockSeconds(this.state.clockSlot)) + ' · ' + (this.state.night ? 'Ночь' : 'День')],
+			['Течение времени', '×' + CLOCK_FACTOR.toFixed(2) + ' — как в онлайне'],
+			['Локация', this._map().label]
+		]
+		for (let i = 0; i < summary.length; i++) {
+			const line = el('div', NS + '-row' + (i > 0 && i < 5 ? dim : ''))
+			line.appendChild(el('span', null, summary[i][0]))
+			line.appendChild(el('span', NS + '-row-val', summary[i][1]))
+			rows.appendChild(line)
+		}
+		wrap.appendChild(rows)
+
+		if (this.state.training) {
+			const warn = el('div', NS + '-warn')
+			warn.appendChild(svg(alertIcon()))
+			const text = el('div')
+			text.appendChild(el('b', null, 'Внимание!'))
+			text.appendChild(el('span', null, 'В тренировочном режиме не предусмотрено сохранение прогресса!'))
+			warn.appendChild(text)
+			wrap.appendChild(warn)
+		}
+
+		this.bodyEl.appendChild(wrap)
+	}
+
+	_openOfflineModal() {
+		if (this.modal || !this.state.training) return
+		const cfg = this.state.offline
+		const self = this
+
+		const wrap = el('div', NS + '-modal-wrap')
+		const modal = el('div', NS + '-modal')
+		const bar = el('div', NS + '-modal-bar')
+		bar.appendChild(el('span', null, 'Настройки тренировочного режима'))
+		bar.appendChild(button(NS + '-x', '×', function () { self._closeOfflineModal() }))
+		modal.appendChild(bar)
+
+		const inner = el('div', NS + '-modal-in')
+		inner.appendChild(el('div', NS + '-modal-h', 'Настройки ИИ'))
+
+		const select = function (label, options, current, onPick) {
+			const field = el('div', NS + '-field')
+			field.appendChild(el('div', NS + '-field-l', label))
+			const sel = el('select', NS + '-sel')
+			for (let i = 0; i < options.length; i++) {
+				const opt = document.createElement('option')
+				opt.value = options[i].value
+				opt.textContent = options[i].label
+				if (options[i].value === current) opt.selected = true
+				sel.appendChild(opt)
+			}
+			sel.addEventListener('change', function () { onPick(sel.value) })
+			field.appendChild(sel)
+			return field
+		}
+
+		const toggle = function (label, current, onPick) {
+			const field = el('div', NS + '-field')
+			field.appendChild(el('div', NS + '-field-l', label))
+			const btn = button(NS + '-check' + (current ? ' on' : ''), null, function () {
+				const next = !btn.classList.contains('on')
+				btn.classList.toggle('on', next)
+				onPick(next)
+			})
+			btn.appendChild(el('span', NS + '-box'))
+			btn.appendChild(el('span', null, current ? 'Включено' : 'Выключено'))
+			field.appendChild(btn)
+			return field
+		}
+
+		inner.appendChild(select('Количество ИИ', AI_COUNT_OPTIONS, cfg.aiCount, function (v) { cfg.aiCount = v }))
+		inner.appendChild(select('Сложность ИИ', AI_DIFFICULTY_OPTIONS, cfg.aiDifficulty, function (v) { cfg.aiDifficulty = v }))
+		inner.appendChild(toggle('Вкл. Боссов', cfg.bosses, function (v) { cfg.bosses = v }))
+		inner.appendChild(toggle('Отключить расход воды и энергии', cfg.noDrain, function (v) { cfg.noDrain = v }))
+
+		modal.appendChild(inner)
+		wrap.appendChild(modal)
+		wrap.addEventListener('click', function (e) {
+			if (e.target === wrap) self._closeOfflineModal()
 		})
 
-		this._onKey
+		this.root.appendChild(wrap)
+		this.modal = wrap
+	}
+
+	_closeOfflineModal() {
+		if (!this.modal) return
+		if (this.modal.parentNode) this.modal.parentNode.removeChild(this.modal)
+		this.modal = null
+		this._renderStep()
+	}
+
+	/* ────────────────────── шаг 4: подтверждение ────── */
+
+	_loadoutRows() {
+		const inv = this._peek('inv')
+		const items = this._peek('items')
+		const out = []
+		if (this.state.faction === 'scav') {
+			out.push(['Снаряжение', 'Случайный набор Дикого'])
+			out.push(['Выдача', 'На точке высадки'])
+			return out
+		}
+		if (!inv || typeof inv.slotItem !== 'function') {
+			out.push(['Снаряжение', 'Стандартный набор ЧВК'])
+			return out
+		}
+		for (let i = 0; i < SLOT_LABELS.length; i++) {
+			const entry = SLOT_LABELS[i]
+			const it = call(inv, 'slotItem', entry.slot)
+			if (!it) continue
+			const name = it.name || it.title || it.id || '—'
+			out.push([entry.label, rebrandText(name)])
+		}
+		if (!out.length) out.push(['Снаряжение', 'Слоты пусты'])
+		if (items && typeof items.price === 'function' && inv.all) {
+			let total = 0
+			for (let i = 0; i < inv.all.length; i++) {
+				const it = inv.all[i]
+				if (!it) continue
+				if (typeof inv.onBody === 'function' && !inv.onBody(it)) continue
+				const price = call(items, 'price', it.id)
+				if (typeof price === 'number') total += price
+			}
+			if (total > 0) out.push(['Страховая ценность', Math.round(total).toLocaleString('ru-RU') + ' ₽'])
+		}
+		return out
+	}
+
+	_stepConfirm() {
+		const faction = this._faction()
+		const map = this._map()
+		const wrap = el('div', NS + '-confirm')
+
+		const left = el('div')
+		const raidPanel = el('div', NS + '-panel')
+		raidPanel.appendChild(el('div', NS + '-panel-h', 'Параметры рейда'))
+		const raidRows = [
+			['Локация', map.label],
+			['Длительность', formatDuration(map.duration)],
+			['Игроков', map.players],
+			['Тренировка', this.state.training ? 'Включена' : 'Выключена'],
+			['Сложность ИИ', optionLabel(AI_DIFFICULTY_OPTIONS, this.state.offline.aiDifficulty)],
+			['Боссы', this.state.offline.bosses ? 'Да' : 'Нет']
+		]
+		for (let i = 0; i < raidRows.length; i++) {
+			const kv = el('div', NS + '-kv')
+			kv.appendChild(el('span', null, raidRows[i][0]))
+			kv.appendChild(el('span', null, raidRows[i][1]))
+			raidPanel.appendChild(kv)
+		}
+		left.appendChild(raidPanel)
+
+		const middle = el('div', NS + '-silhouette')
+		const meta = this._peek('meta')
+		const level = meta && meta.P && typeof meta.P.lvl === 'number' ? meta.P.lvl : 42
+		const mainMenu = this.engine ? this.engine.mainMenu : null
+		const nickRaw = mainMenu && mainMenu.opts && mainMenu.opts.nickname
+			? mainMenu.opts.nickname
+			: mainMenu && mainMenu.nickname ? mainMenu.nickname : BRAND.shortEn
+		middle.appendChild(el('div', NS + '-badge', String(level)))
+		middle.appendChild(svg(silhouetteSvg(faction.id, faction.accent)))
+		middle.appendChild(el('div', NS + '-nick', rebrandText(String(nickRaw)) + ' · ' + faction.label))
+
+		const right = el('div')
+		const kitPanel = el('div', NS + '-panel')
+		kitPanel.appendChild(el('div', NS + '-panel-h', 'Снаряжение'))
+		const kit = this._loadoutRows()
+		for (let i = 0; i < kit.length; i++) {
+			const kv = el('div', NS + '-kv')
+			kv.appendChild(el('span', null, kit[i][0]))
+			kv.appendChild(el('span', null, kit[i][1]))
+			kitPanel.appendChild(kv)
+		}
+		right.appendChild(kitPanel)
+
+		const status = el('div', NS + '-status-bar')
+		const loc = el('div')
+		loc.appendChild(el('span', null, 'ТЕКУЩАЯ ЛОКАЦИЯ:'))
+		loc.appendChild(el('b', null, map.label))
+		const time = el('div')
+		time.appendChild(el('span', null, 'ТЕКУЩЕЕ ВРЕМЯ В ИГРЕ:'))
+		time.appendChild(el('b', null, formatClock(this._clockSeconds(this.state.clockSlot))))
+		const weather = el('div')
+		weather.appendChild(el('span', null, 'ТЕКУЩИЕ ПОГОДНЫЕ УСЛОВИЯ:'))
+		weather.appendChild(svg(daylightIcon(this.state.night)))
+		status.appendChild(loc)
+		status.appendChild(time)
+		status.appendChild(weather)
+
+		wrap.appendChild(left)
+		wrap.appendChild(middle)
+		wrap.appendChild(right)
+		wrap.appendChild(status)
+		this.bodyEl.appendChild(wrap)
+	}
+
+	/* ────────────────────────── шаг 5: высадка ────── */
+
+	_stepDeploy() {
+		const map = this._map()
+		const deploy = el('div', NS + '-deploy')
+
+		const bg = el('div', NS + '-deploy-bg')
+		bg.appendChild(svg(deployBackdropSvg(map)))
+		deploy.appendChild(bg)
+
+		const inner = el('div', NS + '-deploy-in')
+		inner.appendChild(el('div', NS + '-deploy-h', 'ВЫСАДКА НА МЕСТО ДИСЛОКАЦИИ'))
+		inner.appendChild(el(
+			'div',
+			NS + '-deploy-sub',
+			map.label + ' · ' + this._faction().label + ' · ' + formatClock(this._clockSeconds(this.state.clockSlot)) +
+				' · ' + (this.state.night ? 'НОЧЬ' : 'ДЕНЬ')
+		))
+
+		const grid = el('div', NS + '-deploy-grid')
+
+		const left = el('div')
+		const stages = el('div', NS + '-stages')
+		this.stageNodes = {}
+		for (let i = 0; i < PREWARM_STAGES.length; i++) {
+			const stage = PREWARM_STAGES[i]
+			const line = el('div', NS + '-stage')
+			line.appendChild(el('div', NS + '-stage-dot'))
+			line.appendChild(el('span', null, rebrandText(stage.label || stage.id)))
+			stages.appendChild(line)
+			this.stageNodes[stage.id] = line
+		}
+		left.appendChild(stages)
+
+		this.statusEl = el('div', NS + '-status', 'ЗАГРУЗКА ДАННЫХ...')
+		left.appendChild(this.statusEl)
+
+		const bar = el('div', NS + '-bar')
+		this.fillEl = el('div', NS + '-bar-fill')
+		bar.appendChild(this.fillEl)
+		left.appendChild(bar)
+
+		this.watchEl = el('div', NS + '-watch', 'ЗАГРУЗКА: 00:00')
+		left.appendChild(this.watchEl)
+
+		const sum = el('div', NS + '-sum')
+		sum.appendChild(el('div', NS + '-panel-h', 'Сводка локации'))
+		const sumRows = [
+			['Локация', map.label + ' / ' + map.en],
+			['Длительность', formatDuration(map.duration)],
+			['Погода', map.weather],
+			['Сжатие времени', '1:' + REAL_SECONDS_PER_GAME_MINUTE + ' (×' + CLOCK_FACTOR.toFixed(2) + ')'],
+			['Тренировка', this.state.training ? 'Включена' : 'Выключена']
+		]
+		for (let i = 0; i < sumRows.length; i++) {
+			const kv = el('div', NS + '-kv')
+			kv.appendChild(el('span', null, sumRows[i][0]))
+			kv.appendChild(el('span', null, sumRows[i][1]))
+			sum.appendChild(kv)
+		}
+		sum.appendChild(el('div', NS + '-detail-desc', rebrandText(map.desc)))
+
+		grid.appendChild(left)
+		grid.appendChild(sum)
+		inner.appendChild(grid)
+		deploy.appendChild(inner)
+		this.bodyEl.appendChild(deploy)
+
+		this._startStopwatch()
+	}
+
+	_setStage(id, label, index, total) {
+		if (this.statusEl) this.statusEl.textContent = rebrandText(label || 'ЗАГРУЗКА ДАННЫХ...')
+		const keys = Object.keys(this.stageNodes)
+		for (let i = 0; i < keys.length; i++) {
+			const node = this.stageNodes[keys[i]]
+			if (keys[i] === id) node.className = NS + '-stage on'
+			else if (node.className.indexOf('on') >= 0) node.className = NS + '-stage done'
+		}
+		if (typeof index === 'number' && typeof total === 'number' && total > 0) {
+			this._setProgress(index / total)
+		}
+	}
+
+	_setProgress(t) {
+		if (!this.fillEl) return
+		const clamped = Math.max(0, Math.min(1, Number(t) || 0))
+		this.fillEl.style.width = (clamped * 100).toFixed(1) + '%'
+	}
+
+	_startStopwatch() {
+		const self = this
+		this.watchStart = Date.now()
+		this._stopStopwatch()
+		this.watchTimer = setInterval(function () {
+			if (!self.watchEl) return
+			self.watchEl.textContent = 'ЗАГРУЗКА: ' + formatStopwatch(Date.now() - self.watchStart)
+		}, 250)
+	}
+
+	_stopStopwatch() {
+		if (this.watchTimer) clearInterval(this.watchTimer)
+		this.watchTimer = 0
+	}
+
+	/* ─────────────────── навигация и запуск ────── */
+
+	_canAdvance() {
+		const step = STEPS[this.index]
+		if (this.busy) return false
+		if (step.id === 'location') return this._unlocked(this._map())
+		return true
+	}
+
+	next() {
+		if (this.busy || !this.root) return
+		if (!this._canAdvance()) {
+			const map = this._map()
+			this.hintEl.textContent = map.available ? 'ДЛЯ ВЫСАДКИ НУЖЕН ПРОПУСК' : 'ВЫБЕРИТЕ ДОСТУПНУЮ ЛОКАЦИЮ'
+			return
+		}
+		if (STEPS[this.index].id === 'confirm') {
+			this.index++
+			this._renderStep()
+			this._deploy()
+			return
+		}
+		if (this.index >= STEPS.length - 1) return
+		this.index++
+		this._renderStep()
+	}
+
+	back() {
+		if (this.busy || !this.root) return
+		if (this.index === 0) {
+			this.close({ restoreMenu: true })
+			return
+		}
+		this.index--
+		this._renderStep()
+	}
+
+	/** Прокидывает настройки тренировки в подсистемы через опциональные сеттеры. */
+	_applyOfflineConfig() {
+		const cfg = this.state.offline
+		const engine = this.engine
+		if (engine) {
+			engine.__eflOffline = {
+				training: this.state.training,
+				aiCount: cfg.aiCount,
+				aiDifficulty: cfg.aiDifficulty,
+				bosses: cfg.bosses,
+				noDrain: cfg.noDrain,
+				mapId: this.state.mapId,
+				faction: this.state.faction,
+				night: this.state.night
+			}
+		}
+		if (!this.state.training) return
+
+		const ai = this._peek('ai')
+		if (ai) {
+			const countScale = AI_COUNT_SCALE[cfg.aiCount] || 1
+			if (typeof ai.setBotBudget === 'function') call(ai, 'setBotBudget', countScale)
+			else call(ai, 'setBotCount', countScale)
+			call(ai, 'setDifficulty', AI_DIFFICULTY_SCALE[cfg.aiDifficulty] || 1)
+			call(ai, 'setBossesEnabled', !!cfg.bosses)
+		}
+		const health = this._peek('health')
+		if (health) call(health, 'setSurvivalDrain', !cfg.noDrain)
+	}
+
+	/**
+	 * Цепочка высадки.
+	 *
+	 * enterLoading() → runRaidPrewarm() → raid.start() внутри afterTerrain →
+	 * закрытие меню → enterGameplay(). Компиляция шейдеров, пул трассеров и
+	 * прогрев геометрии оружия гарантированно завершаются ДО того, как
+	 * состояние станет STATE.GAMEPLAY — иначе первый выстрел и первая
+	 * очередь бота давали бы тот самый микрофриз.
+	 */
+	async _deploy() {
+		if (this.busy || this.deployed) return
+		this.busy = true
+		this.deployed = true
+
+		const engine = this.engine
+		const map = this._map()
+		const faction = this.state.faction
+		const night = this.state.night
+		const self = this
+
+		this._applyOfflineConfig()
+
+		/* Скаву выдаётся случайный кит через детерминированный rng движка. */
+		if (faction === 'scav') {
+			const meta = this._peek('meta')
+			const rng = this.ctx && this.ctx.rng ? call(this.ctx.rng, 'fork') || this.ctx.rng : null
+			if (meta && rng) call(meta, 'equipScavKit', rng)
+		}
+
+		call(engine, 'enterLoading')
+
+		const result = await runRaidPrewarm(engine, {
+			onStage: function (id, label, index, total) { self._setStage(id, label, index, total) },
+			onProgress: function (t) { self._setProgress(t) },
+			afterTerrain: async function () {
+				const raid = self._peek('raid')
+				if (raid) call(raid, 'start', map.id, faction, night)
+			}
+		})
+
+		if (this.destroyed) return
+
+		this._setProgress(1)
+		this._stopStopwatch()
+
+		if (result && result.ok === false && this.statusEl) {
+			this.statusEl.textContent = 'ЗАГРУЗКА ЗАВЕРШЕНА С ОГРАНИЧЕНИЯМИ'
+			const err = el('div', NS + '-err', 'Преварм не дошёл до конца: ' + rebrandText(String(result.reason || 'неизвестная причина')))
+			if (this.statusEl.parentNode) this.statusEl.parentNode.appendChild(err)
+		}
+
+		/* Главное меню гасим без destroy — оно понадобится после рейда. */
+		if (engine && engine.mainMenu) call(engine.mainMenu, 'close', { fade: 700, destroy: false })
+
+		call(engine, 'enterGameplay')
+		call(engine, 'requestPointerLock')
+
+		this.busy = false
+		this.close({ restoreMenu: false })
+	}
+
+	/* -------------------------------------------------------------- теардаун */
+
+	close(opts) {
+		const o = opts || {}
+		if (o.restoreMenu !== false) this._rotateMenuIn()
+		this.dispose()
+	}
+
+	dispose() {
+		if (this.destroyed) return
+		this.destroyed = true
+		this._stopClock()
+		this._stopStopwatch()
+		document.removeEventListener('keydown', this._onKeyDown, true)
+		if (this.modal && this.modal.parentNode) this.modal.parentNode.removeChild(this.modal)
+		this.modal = null
+		if (this.root && this.root.parentNode) this.root.parentNode.removeChild(this.root)
+		this.root = null
+		this.bodyEl = null
+		this.titleEl = null
+		this.pips = []
+		this.nextBtn = null
+		this.backBtn = null
+		this.hintEl = null
+		this.statusEl = null
+		this.fillEl = null
+		this.watchEl = null
+		this.stageNodes = {}
+		if (activeWizard === this) activeWizard = null
+	}
+}
+
+/* ====================================================================== */
+/*                        открытие и мост в меню                         */
+/* ====================================================================== */
+
+let activeWizard = null
+let bridgeInstalled = false
+
+/** Открывает визард. Повторный вызов возвращает живой экземпляр. */
+export function openLobbyWizard(engine, opts) {
+	if (activeWizard && !activeWizard.destroyed) return activeWizard
+	const resolved = engine || (typeof window !== 'undefined' ? window.__ENGINE__ : null)
+	if (!resolved) return null
+	if (resolved.state && resolved.state !== STATE.MENU && resolved.state !== STATE.BOOT) return null
+	activeWizard = new LobbyWizard(resolved, opts)
+	activeWizard.show()
+	return activeWizard
+}
+
+export function closeLobbyWizard() {
+	if (activeWizard && !activeWizard.destroyed) activeWizard.close({ restoreMenu: true })
+	activeWizard = null
+}
+
+function looksLikeLaunch(node) {
+	if (!node || node.nodeType !== 1) return false
+	const text = (node.textContent || '').trim()
+	if (text && text.length < 60 && LAUNCH_RE.test(text)) return true
+	const attrs = ['data-act', 'data-action', 'data-nav', 'data-screen', 'data-menu', 'data-role', 'data-view', 'id', 'aria-label']
+	for (let i = 0; i < attrs.length; i++) {
+		const raw = node.getAttribute ? node.getAttribute(attrs[i]) : null
+		if (!raw) continue
+		if (LAUNCH_ACTS.test(raw.trim())) return true
+		if (LAUNCH_RE.test(raw)) return true
+	}
+	return false
+}
+
+/**
+ * Ставит делегированный обработчик на клик по «ПОБЕГ ИЗ ЛАРПОВА».
+ *
+ * Обработчик висит на фазе перехвата, чтобы опередить штатный хендлер
+ * меню, который ушёл бы в startRaid() без преварма. main.js не импортирует
+ * этот модуль и правится лидом, поэтому мост ставится сам при импорте.
+ */
+export function applyLobbyWizardBridge() {
+	if (bridgeInstalled || typeof document === 'undefined') return false
+	bridgeInstalled = true
+
+	document.addEventListener('click', function (e) {
+		if (activeWizard && !activeWizard.destroyed) return
+		const target = e.target
+		if (!target || target.nodeType !== 1) return
+		if (target.closest && target.closest(SKIP_ROOTS)) return
+
+		let node = target
+		let hit = null
+		for (let i = 0; i < MAX_WALK && node && node !== document.body; i++) {
+			if (looksLikeLaunch(node)) {
+				hit = node
+				break
+			}
+			node = node.parentNode
+		}
