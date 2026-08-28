@@ -24,6 +24,7 @@ def({ id: 'aks74u', n: 'AKS-74U', t: 'weapon', cls: 'rifle', w: 4, h: 2, kg: 2.7
 def({ id: 'rpk16', n: 'RPK-16', t: 'weapon', cls: 'lmg', w: 6, h: 2, kg: 4.7, px: 56000, cal: '545', rpm: 600, modes: ['single', 'auto'], ergo: 38, vr: 120, hr: 390, cap: 45, spread: 0.0036, magId: 'mag_ak45' });
 def({ id: 'm4a1', n: 'Colt M4A1', t: 'weapon', cls: 'rifle', w: 5, h: 2, kg: 3.1, px: 44000, cal: '556', rpm: 800, modes: ['single', 'auto'], ergo: 47, vr: 126, hr: 342, cap: 30, spread: 0.003, magId: 'mag_stanag' });
 def({ id: 'mp5', n: 'HK MP5', t: 'weapon', cls: 'smg', w: 4, h: 2, kg: 2.6, px: 27000, cal: '9x19', rpm: 800, modes: ['single', 'auto'], ergo: 60, vr: 78, hr: 230, cap: 30, spread: 0.0038, magId: 'mag_mp5' });
+def({ id: 'mp7a2', n: 'HK MP7A2', t: 'weapon', cls: 'smg', w: 4, h: 2, kg: 2.2, px: 61000, cal: '9x19', rpm: 950, modes: ['single', 'auto'], ergo: 66, vr: 62, hr: 196, cap: 40, spread: 0.0035, magId: 'mag_mp7' });
 def({ id: 'sv98', n: 'SV-98', t: 'weapon', cls: 'sniper', w: 6, h: 2, kg: 5.6, px: 48000, cal: '762x54', rpm: 60, modes: ['single'], ergo: 30, vr: 180, hr: 520, cap: 10, zoom: 4, spread: 0.0012 });
 def({ id: 'mosin', n: 'Mosin', t: 'weapon', cls: 'sniper', w: 6, h: 2, kg: 4.2, px: 21000, cal: '762x54', rpm: 50, modes: ['single'], ergo: 34, vr: 196, hr: 560, cap: 5, zoom: 2.6, spread: 0.0016 });
 def({ id: 'm870', n: 'M870', t: 'weapon', cls: 'shotgun', w: 5, h: 2, kg: 3.6, px: 23000, cal: '12x70', rpm: 75, modes: ['single'], ergo: 40, vr: 220, hr: 600, cap: 7, pellets: 8, spread: 0.03 });
@@ -55,6 +56,7 @@ MG('mag_ak30', 'AK 5.45 30-round', '545', 30, 2600, 0);
 MG('mag_ak45', 'RPK 5.45 45-round', '545', 45, 9000, -3, 1, 3, 0.5);
 MG('mag_stanag', 'STANAG 5.56 30-round', '556', 30, 5200, 0);
 MG('mag_mp5', 'MP5 30-round', '9x19', 30, 4200, 0);
+MG('mag_mp7', 'MP7 40-round', '9x19', 40, 7400, 0, 1, 2, 0.24);
 MG('mag_pm', 'PM 8-round', '9x18', 8, 900, 2, 1, 1, 0.1);
 MG('mag_glock', 'Glock 17-round', '9x19', 17, 2400, 1, 1, 1, 0.14);
 
@@ -74,11 +76,35 @@ def({ id: 'rig_bankrobber', n: 'Bank Robber', t: 'rig', w: 3, h: 3, kg: 1.1, px:
 def({ id: 'backpack_smb', n: 'Scav Backpack', t: 'backpack', w: 4, h: 4, kg: 1.8, px: 21000, grid: { w: 5, h: 6 } });
 def({ id: 'secure_alpha', n: 'Alpha Container', t: 'secure', w: 2, h: 2, kg: 0.4, px: 0, grid: { w: 2, h: 2 } });
 
+/*
+ * PMC equipment for the doll slots.
+ *
+ * SLOTS below has always declared melee / headset / glasses / face, but no item
+ * in the database carried those types, so four of the sockets could never be
+ * filled by anything and rendered as permanently empty decoration. `armband`
+ * and `dogtag` were missing entirely. These defs give every socket on the
+ * character doll something real to hold.
+ */
+def({ id: 'headset_proflex', n: 'ProFlex Ear-Plugs', t: 'headset', w: 2, h: 2, kg: 0.2, px: 12000 });
+def({ id: 'headset_comtac', n: 'ComTac IV', t: 'headset', w: 2, h: 2, kg: 0.6, px: 38000 });
+def({ id: 'helmet_ronin', n: 'Ronin Respirator', t: 'helmet', w: 2, h: 2, kg: 3.4, px: 62000, armor: 4, dur: 180 });
+def({ id: 'face_shroud', n: 'Shroud Half-Mask', t: 'face', w: 1, h: 1, kg: 0.1, px: 5400, dur: 30 });
+def({ id: 'glasses_crossbow', n: 'Crossbow Glasses', t: 'glasses', w: 2, h: 1, kg: 0.15, px: 7300, dur: 20 });
+def({ id: 'armband_obereg', n: 'Obereg Armband', t: 'armband', w: 1, h: 1, kg: 0.05, px: 4100 });
+def({ id: 'dogtag_usec', n: 'USEC Dogtag', t: 'dogtag', w: 1, h: 1, kg: 0.01, px: 0 });
+def({ id: 'melee_m2', n: 'M-2 Bayonet', t: 'melee', w: 2, h: 1, kg: 0.6, px: 9500 });
+def({ id: 'rig_fcpc', n: 'FCPC V5', t: 'rig', w: 3, h: 3, kg: 4.2, px: 96000, armor: 4, dur: 197, grid: { w: 4, h: 3 } });
+def({ id: 'backpack_beta2', n: 'Beta 2 Backpack', t: 'backpack', w: 4, h: 5, kg: 1.4, px: 72000, grid: { w: 5, h: 6 } });
+def({ id: 'secure_epsilon', n: 'Epsilon Container', t: 'secure', w: 2, h: 3, kg: 0.9, px: 0, grid: { w: 3, h: 3 } });
+
 /* medicine / food */
 def({ id: 'bandage', n: 'Bandage', t: 'med', w: 1, h: 1, kg: 0.08, px: 1500, uses: 1, stopsBleed: 1, time: 1.5 });
 def({ id: 'salewa', n: 'Salewa', t: 'med', w: 1, h: 2, kg: 0.5, px: 14000, uses: 3, hp: 45, stopsBleed: 2, time: 2.8 });
 def({ id: 'splint', n: 'Splint', t: 'med', w: 1, h: 1, kg: 0.15, px: 3200, uses: 1, splint: 1, time: 2.2 });
 def({ id: 'analgin', n: 'Analgin', t: 'med', w: 1, h: 1, kg: 0.05, px: 2600, uses: 4, hp: 8, time: 1.6 });
+def({ id: 'ifak', n: 'IFAK', t: 'med', w: 1, h: 1, kg: 0.5, px: 23000, uses: 3, hp: 60, stopsBleed: 2, time: 2.4 });
+def({ id: 'afak', n: 'AFAK', t: 'med', w: 1, h: 1, kg: 0.6, px: 31000, uses: 4, hp: 70, stopsBleed: 2, time: 2.6 });
+def({ id: 'calokb', n: 'CALOK-B', t: 'med', w: 1, h: 1, kg: 0.06, px: 12000, uses: 1, stopsBleed: 2, time: 1.4 });
 def({ id: 'water', n: 'Water 0.6L', t: 'food', w: 1, h: 2, kg: 0.65, px: 2200, uses: 2, hydra: 35, time: 1.8 });
 def({ id: 'crackers', n: 'Crackers', t: 'food', w: 1, h: 1, kg: 0.12, px: 900, uses: 1, energy: 22, hydra: -6, time: 1.6 });
 
@@ -105,16 +131,24 @@ export const MOD_SLOTS = [
   ['stock', 'Stock'],
 ];
 
+/*
+ * Canonical slot set for the character doll: id, English data-layer label, and
+ * the item types the socket accepts. Russian captions and on-screen geometry are
+ * the presentation layer's business and live in inventory/index.js, which
+ * mirrors these ids.
+ */
 export const SLOTS = [
+  ['headset', 'Headset', ['headset']],
+  ['helmet', 'Helmet', ['helmet']],
+  ['face', 'Face', ['face']],
+  ['armband', 'Armband', ['armband']],
+  ['armor', 'Armor', ['armor']],
+  ['glasses', 'Glasses', ['glasses']],
+  ['dogtag', 'Dogtag', ['dogtag']],
+  ['holster', 'Holster', ['weapon']],
   ['primary', 'Primary', ['weapon']],
   ['secondary', 'Secondary', ['weapon']],
-  ['holster', 'Holster', ['weapon']],
   ['melee', 'Melee', ['melee']],
-  ['armor', 'Armor', ['armor']],
-  ['helmet', 'Helmet', ['helmet']],
-  ['headset', 'Headset', ['headset']],
-  ['glasses', 'Glasses', ['glasses']],
-  ['face', 'Face', ['face']],
   ['rig', 'Rig', ['rig']],
   ['backpack', 'Backpack', ['backpack']],
   ['secure', 'Secure', ['secure']],
@@ -124,7 +158,7 @@ export const LOOT = {
   crate: [['bolts', 22], ['wires', 14], ['gunpowder', 6], ['bandage', 14], ['crackers', 12], ['water', 10], ['545ps', 12], ['milmodule', 4], ['gpu', 1], ['rub', 16]],
   safe: [['rub', 26], ['usd', 14], ['key_cellar', 6], ['ledx', 2], ['gpu', 4], ['tgdocs', 8], ['btc', 2], ['tgcard', 2]],
   jacket: [['rub', 22], ['crackers', 14], ['bandage', 12], ['analgin', 6], ['usd', 6], ['wires', 8]],
-  med: [['bandage', 24], ['splint', 12], ['analgin', 8], ['salewa', 6], ['ledx', 1]],
+  med: [['bandage', 24], ['splint', 12], ['analgin', 8], ['salewa', 6], ['ifak', 5], ['calokb', 4], ['ledx', 1]],
   gun: [['pm', 16], ['aks74u', 10], ['m870', 8], ['ak74n', 7], ['mosin', 6], ['545ps', 16], ['12x70buck', 12], ['mag_ak30', 10], ['dtk74', 4]],
   tool: [['bolts', 24], ['wires', 18], ['gunpowder', 8], ['milmodule', 6], ['gpu', 2], ['mag_stanag', 5]],
 };
