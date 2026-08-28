@@ -1,6 +1,7 @@
 import { Engine, STATE } from './core/engine.js';
 import { createConfig } from './core/config.js';
 import { MainMenuSystem } from './ui/mainMenu.js';
+import { applyMainMenuBridge } from './ui/mainMenuBridge.js';
 
 import { RenderSystem } from './render/index.js';
 import { MaterialSystem } from './materials/index.js';
@@ -39,6 +40,16 @@ const config = createConfig({
 });
 
 const engine = new Engine({ canvas: document.getElementById('game'), config });
+
+/* Движок публикуется СРАЗУ, а не в конце модуля.
+ *
+ * ui/mainMenuBridge.js ищет живое меню через window.__ENGINE__.mainMenu, а
+ * стартовый экран монтируется и становится кликабельным до `await
+ * prewarm(engine)` — то есть за секунды до конца этого файла. Пока __ENGINE__
+ * не выставлен, делегированный клик не находит ни инстанса меню, ни состояния
+ * движка и молча уходит в никуда: ровно тот баг, из-за которого «НАСТРОЙКИ» не
+ * открывали панель. */
+window.__ENGINE__ = engine;
 
 const ALL_STATES = [STATE.MENU, STATE.LOADING, STATE.GAMEPLAY, STATE.PAUSED, STATE.RESULTS];
 const GAMEPLAY = [STATE.GAMEPLAY];
@@ -80,6 +91,14 @@ try {
   throw err;
 }
 
+/* Мост «НАСТРОЙКИ» -> UiSystem.settingsMenu. Ставится ДО new MainMenuSystem()
+ * и до mount(): applyMainMenuBridge() патчит прототип (openSettings,
+ * showSettings, settingsMenuInstance) и оборачивает mount(), чтобы навесить
+ * делегированный слушатель в фазе capture. Экземпляр, созданный раньше патча,
+ * получил бы непропатченный mount, и слушатель бы так и не встал. Вызов
+ * идемпотентен — повторные заходы (HMR) ничего не ломают. */
+applyMainMenuBridge();
+
 const mainMenu = new MainMenuSystem({
   engine,
   ctx: engine.ctx,
@@ -116,5 +135,4 @@ if (lockstep) {
   requestAnimationFrame(probe);
 }
 
-window.__ENGINE__ = engine;
 if (import.meta.hot) import.meta.hot.dispose(() => engine.dispose());

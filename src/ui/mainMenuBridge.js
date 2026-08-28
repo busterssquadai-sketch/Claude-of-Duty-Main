@@ -16,6 +16,12 @@
  *   3. аккуратно отходит в сторону, когда клик пришёл из ESC-меню или из
  *      самой панели настроек — там свои обработчики.
  *
+ * ВАЖНО: модуль не самоприменяется. applyMainMenuBridge() обязан быть вызван
+ * из точки входа (src/main.js) ДО new MainMenuSystem() и до mount(), иначе
+ * прототип останется непропатченным, слушатель не встанет, и «НАСТРОЙКИ»
+ * снова будут молчать — именно так этот файл однажды и оказался мёртвым кодом,
+ * на который никто не ссылался.
+ *
  * Импорты НАМЕРЕННО неймспейсные: промах именованного импорта в ESM —
  * это ошибка СВЯЗЫВАНИЯ, которая роняет весь бандл. Слой мостов не имеет
  * права ронять загрузку игры.
@@ -49,23 +55,30 @@ function attrOf(node, name) {
   return v == null ? null : String(v).toLowerCase()
 }
 
+/** Значение совпадает с токеном настроек ЦЕЛИКОМ. */
+function tokenHit(value) {
+  if (value == null) return false
+  const v = String(value).toLowerCase().trim()
+  if (!v || v.length > 24) return false
+  return SETTINGS_TOKENS.indexOf(v) >= 0
+}
+
 function looksLikeSettings(node) {
   if (!node || node.nodeType !== 1) return false
 
-  const attrs = [
-    attrOf(node, 'data-act'),
-    attrOf(node, 'data-action'),
-    attrOf(node, 'data-nav'),
-    attrOf(node, 'data-screen'),
-    attrOf(node, 'data-menu'),
-    attrOf(node, 'data-tab'),
-    attrOf(node, 'data-role'),
-    attrOf(node, 'data-view'),
-    node.id ? String(node.id).toLowerCase() : null,
-  ]
-  for (let i = 0; i < attrs.length; i++) {
-    if (attrs[i] && SETTINGS_TOKENS.indexOf(attrs[i]) >= 0) return true
+  /* Раньше здесь был фиксированный список data-атрибутов (data-act, data-nav,
+   * data-tab, ...). Шестерёнка в правой колонке меню сквозь него проваливалась:
+   * в TABS_RIGHT это { id: 'settings', icon: 'gear' } — подписи нет вообще
+   * (label: ''), а под каким именно атрибутом меню разложит свой id, мост знать
+   * не должен. Поэтому сверяем ВСЕ атрибуты узла, но только по полному
+   * совпадению значения: 'settings' ловим, 'settings-hint' — нет. */
+  const attrs = node.attributes
+  if (attrs) {
+    for (let i = 0; i < attrs.length; i++) {
+      if (tokenHit(attrs[i].value)) return true
+    }
   }
+  if (tokenHit(node.id)) return true
 
   const label = attrOf(node, 'aria-label')
   if (label && SETTINGS_TEXT.test(label.trim())) return true
