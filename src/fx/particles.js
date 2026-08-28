@@ -143,7 +143,7 @@ void main() {
     // component -- and deliberately NOT with length( velView ), the full 3D
     // speed. A 900 m/s round travelling down the view axis has an enormous 3D
     // speed and almost no screen-space velocity. Scaling by the 3D speed gave
-    // it a multi-metre streak, and because `along` then degenerated (d ~ 0) the
+    // it a multi-metre streak, and because 'along' then degenerated (d ~ 0) the
     // shader drew that streak along an arbitrary fallback axis: a vertical bar
     // planted across the near plane, i.e. a bullet apparently flying at the
     // camera's face. Motion blur is a screen-space phenomenon; treat it as one.
